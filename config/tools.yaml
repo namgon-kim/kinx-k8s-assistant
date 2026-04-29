@@ -1,0 +1,28 @@
+# kubectl-ai custom tools 설정
+# helm, kustomize를 kubectl-ai ReAct 루프에서 사용할 수 있도록 등록합니다.
+# 경로: ~/.config/kubectl-ai/tools.yaml
+
+- name: helm
+  description: |
+    Helm - Kubernetes 패키지 매니저.
+    Helm 차트 설치, 업그레이드, 삭제, 상태 확인에 사용합니다.
+    예시:
+      helm list -A
+      helm install <release> <chart> -n <namespace>
+      helm upgrade <release> <chart> -n <namespace>
+      helm uninstall <release> -n <namespace>
+      helm status <release> -n <namespace>
+      helm history <release> -n <namespace>
+  command: helm
+  args: []
+
+- name: kustomize
+  description: |
+    Kustomize - Kubernetes 매니페스트 커스터마이즈 도구.
+    kustomization.yaml을 기반으로 리소스를 생성하거나 적용합니다.
+    예시:
+      kustomize build <dir>
+      kustomize build <dir> | kubectl apply -f -
+      kustomize build <dir> --dry-run=client
+  command: kustomize
+  args: []

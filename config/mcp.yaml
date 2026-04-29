@@ -1,0 +1,17 @@
+# kubectl-ai MCP 클라이언트 설정
+# 경로: ~/.config/kubectl-ai/mcp.yaml
+
+servers:
+  # log-analyzer MCP 서버
+  # 실행 방법: ./bin/log-analyzer-server --port 9090 --log-dir /var/log/filebeat
+  - name: log-analyzer
+    url: http://localhost:9090/mcp
+    use_streaming: true
+    timeout: 60
+
+  # sequential-thinking (기본 포함, 복잡한 추론 지원)
+  - name: sequential-thinking
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-sequential-thinking"

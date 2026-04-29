@@ -1,0 +1,26 @@
+# 빌드 산출물
+bin/
+
+# Go 테스트/프로파일
+*.test
+*.out
+*.prof
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code 로컬 설정
+.claude/
+
+# 대화 로그 (--log-file 옵션)
+*.log
+
+# kubeconfig (보안)
+kubeconfig
+*.kubeconfig
