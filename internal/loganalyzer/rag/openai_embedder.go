@@ -6,10 +6,11 @@ import (
 
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/packages/param"
 )
 
 type OpenAIEmbedder struct {
-	client *openai.Client
+	client openai.Client
 	model  string
 }
 
@@ -26,10 +27,10 @@ func NewOpenAIEmbedder(apiKey string, model string) *OpenAIEmbedder {
 
 func (e *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	embeddings, err := e.client.Embeddings.New(ctx, openai.EmbeddingNewParams{
-		Input: openai.F[openai.EmbeddingNewParamsInputUnion](
-			openai.EmbeddingNewParamsInputUnionString(text),
-		),
-		Model: openai.F(e.model),
+		Input: openai.EmbeddingNewParamsInputUnion{
+			OfString: param.NewOpt(text),
+		},
+		Model: e.model,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("OpenAI embedding failed: %w", err)
@@ -39,7 +40,7 @@ func (e *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float32, err
 		return nil, fmt.Errorf("no embeddings returned")
 	}
 
-	return embeddings.Data[0].Embedding, nil
+	return float64ToFloat32(embeddings.Data[0].Embedding), nil
 }
 
 func (e *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
@@ -48,10 +49,10 @@ func (e *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 	}
 
 	embeddings, err := e.client.Embeddings.New(ctx, openai.EmbeddingNewParams{
-		Input: openai.F[openai.EmbeddingNewParamsInputUnion](
-			openai.EmbeddingNewParamsInputUnionArrayOfString(texts),
-		),
-		Model: openai.F(e.model),
+		Input: openai.EmbeddingNewParamsInputUnion{
+			OfArrayOfStrings: texts,
+		},
+		Model: e.model,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("OpenAI batch embedding failed: %w", err)
@@ -59,7 +60,15 @@ func (e *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 
 	result := make([][]float32, len(embeddings.Data))
 	for i, emb := range embeddings.Data {
-		result[i] = emb.Embedding
+		result[i] = float64ToFloat32(emb.Embedding)
 	}
 	return result, nil
+}
+
+func float64ToFloat32(values []float64) []float32 {
+	converted := make([]float32, len(values))
+	for i, v := range values {
+		converted[i] = float32(v)
+	}
+	return converted
 }

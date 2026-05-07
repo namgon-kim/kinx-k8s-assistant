@@ -25,9 +25,77 @@ type AgentWrapper struct {
 	outputCh chan *api.Message // Output() 호출 시 한 번만 생성
 }
 
+// setupProviderEnv는 gollm이 읽을 프로바이더별 환경변수를 설정합니다.
+// applyEnvironmentOverrides가 cfg.APIKey/Endpoint에 집약한 값을 env로 내보냅니다.
+func setupProviderEnv(cfg *config.Config) {
+	switch cfg.LLMProvider {
+	case "anthropic":
+		if cfg.APIKey != "" {
+			os.Setenv("ANTHROPIC_API_KEY", cfg.APIKey)
+		}
+
+	case "gemini":
+		if cfg.APIKey != "" {
+			os.Setenv("GEMINI_API_KEY", cfg.APIKey)
+		}
+
+	case "vertexai":
+		if cfg.GCPProject != "" {
+			os.Setenv("GOOGLE_CLOUD_PROJECT", cfg.GCPProject)
+		}
+		if cfg.GCPLocation != "" {
+			os.Setenv("GOOGLE_CLOUD_LOCATION", cfg.GCPLocation)
+		}
+
+	case "openai", "openai-compatible":
+		if cfg.APIKey != "" {
+			os.Setenv("OPENAI_API_KEY", cfg.APIKey)
+		}
+		if cfg.Endpoint != "" {
+			os.Setenv("OPENAI_ENDPOINT", cfg.Endpoint)
+		}
+
+	case "azopenai":
+		if cfg.APIKey != "" {
+			os.Setenv("AZURE_OPENAI_API_KEY", cfg.APIKey)
+		}
+		if cfg.Endpoint != "" {
+			os.Setenv("AZURE_OPENAI_ENDPOINT", cfg.Endpoint)
+		}
+
+	case "grok":
+		if cfg.APIKey != "" {
+			os.Setenv("GROK_API_KEY", cfg.APIKey)
+		}
+		if cfg.Endpoint != "" {
+			os.Setenv("GROK_ENDPOINT", cfg.Endpoint)
+		}
+
+	case "ollama":
+		if cfg.OllamaHost != "" {
+			os.Setenv("OLLAMA_HOST", cfg.OllamaHost)
+		}
+
+	case "llamacpp":
+		if cfg.LlamaCppHost != "" {
+			os.Setenv("LLAMACPP_HOST", cfg.LlamaCppHost)
+		}
+
+	case "bedrock":
+		// AWS SDK 자동 처리
+	}
+
+	if cfg.SkipVerifySSL {
+		os.Setenv("LLM_SKIP_VERIFY_SSL", "1")
+	}
+}
+
 // NewAgentWrapper는 Config를 기반으로 AgentWrapper를 생성합니다.
 func NewAgentWrapper(cfg *config.Config) (*AgentWrapper, error) {
 	ctx := context.Background()
+
+	// 프로바이더별 환경변수 설정
+	setupProviderEnv(cfg)
 
 	// LLM 클라이언트 생성
 	llmClient, err := gollm.NewClient(ctx, cfg.LLMProvider)
@@ -95,10 +163,11 @@ func (w *AgentWrapper) Start(ctx context.Context, initialQuery string) error {
 		return fmt.Errorf("agent 초기화 실패: %w", err)
 	}
 
-	if err := w.agent.Run(agentCtx, initialQuery); err != nil {
-		cancel()
-		return fmt.Errorf("agent 루프 시작 실패: %w", err)
-	}
+	go func() {
+		if err := w.agent.Run(agentCtx, initialQuery); err != nil {
+			klog.Warningf("agent 루프 오류: %v", err)
+		}
+	}()
 
 	return nil
 }

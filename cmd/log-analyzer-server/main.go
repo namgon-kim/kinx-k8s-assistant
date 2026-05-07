@@ -42,7 +42,7 @@ func main() {
 
 func loadRunbooks(ctx context.Context, store loganalyzer.VectorStore, runbookDir string) error {
 	if runbookDir == "" {
-		runbookDir = filepath.Join(filepath.Dir(os.Args[0]), "..", "..", "internal", "loganalyzer", "rag", "runbooks")
+		runbookDir = defaultRunbookDir()
 	}
 
 	var cases []loganalyzer.SimilarCase
@@ -61,6 +61,22 @@ func loadRunbooks(ctx context.Context, store loganalyzer.VectorStore, runbookDir
 
 	fmt.Printf("loaded %d runbook cases\n", len(cases))
 	return nil
+}
+
+func defaultRunbookDir() string {
+	candidates := []string{
+		filepath.Join(filepath.Dir(os.Args[0]), "..", "internal", "loganalyzer", "rag", "runbooks"),
+		filepath.Join(filepath.Dir(os.Args[0]), "..", "..", "internal", "loganalyzer", "rag", "runbooks"),
+		filepath.Join("internal", "loganalyzer", "rag", "runbooks"),
+	}
+
+	for _, candidate := range candidates {
+		if _, err := os.Stat(filepath.Join(candidate, "default.yaml")); err == nil {
+			return candidate
+		}
+	}
+
+	return candidates[0]
 }
 
 func loadYAMLRunbooks(path string, cases *[]loganalyzer.SimilarCase) error {

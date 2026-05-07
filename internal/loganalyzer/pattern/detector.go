@@ -1,6 +1,7 @@
 package pattern
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
@@ -170,7 +171,7 @@ func generateSummary(patterns []loganalyzer.DetectedPattern, podName string) str
 	sb.WriteString(podName + " Pod에서 ")
 	sb.WriteString(time.Now().Format("2006-01-02 15:04:05"))
 	sb.WriteString(" 기준 ")
-	sb.WriteString(string(rune(len(patterns))))
+	sb.WriteString(strconv.Itoa(len(patterns)))
 	sb.WriteString("개의 이상 패턴이 감지되었습니다: ")
 
 	typeNames := make([]string, len(patterns))

@@ -1,0 +1,144 @@
+# K8s-Assistant Configuration
+# Place this file at ~/.k8s-assistant/config.yaml
+# Environment variables take priority over config.yaml values
+
+# LLM Provider configuration
+# Supported providers: gemini (default), vertexai, openai, openai-compatible, azopenai, grok, bedrock, ollama, llamacpp, anthropic
+llmprovider: gemini           # LLM provider to use
+model: gemini-2.0-flash       # Model name for the provider
+
+# ===== Provider-Specific Credentials =====
+
+# Anthropic Claude
+anthropic_apikey: ""          # or set ANTHROPIC_API_KEY env var
+
+# Google Gemini
+gemini_apikey: ""             # or set GEMINI_API_KEY env var
+
+# OpenAI / OpenAI-Compatible
+openai_apikey: ""             # or set OPENAI_API_KEY env var
+openai_endpoint: ""           # or set OPENAI_ENDPOINT env var (optional, defaults to https://api.openai.com/v1)
+
+# Azure OpenAI
+azopenai_apikey: ""           # or set AZURE_OPENAI_API_KEY env var
+azopenai_endpoint: ""         # or set AZURE_OPENAI_ENDPOINT env var (required for azopenai provider)
+
+# Grok (X.AI)
+grok_apikey: ""               # or set GROK_API_KEY env var
+
+# Google Cloud (VertexAI)
+gcp_project: ""               # or set GOOGLE_CLOUD_PROJECT env var
+gcp_location: ""              # or set GOOGLE_CLOUD_LOCATION env var (default: us-central1)
+
+# Ollama (Local)
+ollama_host: ""               # or set OLLAMA_HOST env var (default: http://127.0.0.1:11434)
+
+# llama.cpp (Local)
+llamacpp_host: ""             # or set LLAMACPP_HOST env var (default: http://127.0.0.1:8080)
+
+# AWS Bedrock
+# Note: Bedrock uses AWS SDK auto-detection
+# Authenticate via: aws sso login --profile <profile>
+# Or set: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION env vars
+
+# ===== Kubernetes Configuration =====
+
+kubeconfig: ~/.kube/config    # Path to kubeconfig file (default: ~/.kube/config)
+
+# ===== Session and Behavior Settings =====
+
+maxiterations: 20             # Maximum iterations for agent loop
+sessionbackend: memory        # Session backend: memory, filesystem, redis, etc.
+showtooloutput: true          # Show tool execution output in console
+skipverifyssl: false          # Skip SSL verification (not recommended for production)
+enabletoolshim: false         # Enable tool use shim for models that don't support function calling
+
+# ===== Advanced Settings =====
+
+mcp_client: false             # Enable MCP client support (for log-analyzer integration, etc.)
+prompttemplatefile: ""        # Path to custom system prompt template (optional)
+
+# ===== Logging =====
+
+logfile: ""                   # Conversation log file path (optional)
+
+# ===== Example Configurations =====
+
+# --- Google Gemini (Recommended) ---
+# llmprovider: gemini
+# model: gemini-2.0-flash
+# gemini_apikey: your-api-key
+# Environment variable: export GEMINI_API_KEY=your-api-key
+
+# --- OpenAI ---
+# llmprovider: openai
+# model: gpt-4o
+# openai_apikey: sk-...
+# openai_endpoint: https://api.openai.com/v1
+# Environment variables:
+#   export OPENAI_API_KEY=sk-...
+#   export OPENAI_ENDPOINT=https://api.openai.com/v1
+
+# --- OpenAI-Compatible (e.g., Azure, local server) ---
+# llmprovider: openai-compatible
+# model: gpt-4
+# openai_apikey: your-api-key
+# openai_endpoint: https://your-server/v1
+# Environment variables:
+#   export OPENAI_API_KEY=your-api-key
+#   export OPENAI_ENDPOINT=https://your-server/v1
+
+# --- Azure OpenAI ---
+# llmprovider: azopenai
+# model: gpt-4
+# azopenai_apikey: your-azure-api-key
+# azopenai_endpoint: https://your-resource.openai.azure.com/
+# Environment variables:
+#   export AZURE_OPENAI_API_KEY=your-azure-api-key
+#   export AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+
+# --- Anthropic Claude ---
+# llmprovider: anthropic
+# model: claude-3-5-sonnet-20241022
+# anthropic_apikey: sk-ant-...
+# Environment variable: export ANTHROPIC_API_KEY=sk-ant-...
+
+# --- Google Vertex AI ---
+# llmprovider: vertexai
+# model: gemini-2.0-flash
+# gcp_project: your-gcp-project
+# gcp_location: us-central1
+# Environment variables:
+#   export GOOGLE_CLOUD_PROJECT=your-gcp-project
+#   export GOOGLE_CLOUD_LOCATION=us-central1
+
+# --- Grok (X.AI) ---
+# llmprovider: grok
+# model: grok-2-1212
+# grok_apikey: your-grok-api-key
+# Environment variable: export GROK_API_KEY=your-grok-api-key
+
+# --- AWS Bedrock ---
+# llmprovider: bedrock
+# model: us.anthropic.claude-sonnet-4-20250514-v1:0
+# Authenticate via: aws sso login --profile <profile>
+# Or set env vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+
+# --- Ollama (Local) ---
+# llmprovider: ollama
+# model: llama2
+# ollama_host: http://127.0.0.1:11434
+# Environment variable: export OLLAMA_HOST=http://127.0.0.1:11434
+
+# --- llama.cpp (Local) ---
+# llmprovider: llamacpp
+# model: default
+# llamacpp_host: http://127.0.0.1:8080
+# Environment variable: export LLAMACPP_HOST=http://127.0.0.1:8080
+
+# ===== Available Meta Commands =====
+# /config              - Show current configuration
+# /model               - Change LLM model
+# /kubeconfig          - Set kubeconfig file path
+# /kube-context        - Manage Kubernetes contexts
+# /save                - Save configuration to ~/.k8s-assistant/config.yaml

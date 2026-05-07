@@ -4,11 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
-	"time"
 
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/orchestrator"
@@ -18,11 +19,118 @@ import (
 
 var version = "dev"
 
+// preloadEnvFromConfig는 config.yaml의 API 키를 env var로 설정 후 재실행합니다.
+// gollm이 OPENAI_API_KEY 등을 init()에서 캐시하기 때문에, main() 진입 전에
+// env var가 설정되어야 합니다. 재실행된 프로세스에서 gollm init()이 올바른 값을 읽습니다.
+func preloadEnvFromConfig() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".k8s-assistant", "config.yaml"))
+	if err != nil {
+		return
+	}
+
+	provider := getRawConfigValue(data, "llmprovider")
+	if provider == "" {
+		provider = os.Getenv("LLM_PROVIDER")
+	}
+	if provider == "" {
+		provider = "gemini"
+	}
+	if p := extractFlagValue("--llm-provider"); p != "" {
+		provider = p
+	}
+
+	changed := false
+	switch provider {
+	case "openai", "openai-compatible":
+		key := firstNonEmpty(extractFlagValue("--api-key"), getRawConfigValue(data, "openai_apikey"))
+		ep := firstNonEmpty(extractFlagValue("--endpoint"), getRawConfigValue(data, "openai_endpoint"))
+		if setEnvIfMissing("OPENAI_API_KEY", key) {
+			changed = true
+		}
+		if setEnvIfMissing("OPENAI_ENDPOINT", ep) {
+			changed = true
+		}
+	case "anthropic":
+		key := firstNonEmpty(extractFlagValue("--api-key"), getRawConfigValue(data, "anthropic_apikey"))
+		if setEnvIfMissing("ANTHROPIC_API_KEY", key) {
+			changed = true
+		}
+	}
+
+	if !changed {
+		return
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	// 재실행: 새 프로세스의 init()이 설정된 env var를 읽습니다
+	_ = syscall.Exec(exe, os.Args, os.Environ())
+}
+
+// getRawConfigValue는 YAML 파싱 없이 config 파일에서 특정 키의 값을 추출합니다.
+func getRawConfigValue(data []byte, key string) string {
+	prefix := key + ":"
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, prefix) {
+			val := strings.TrimSpace(line[len(prefix):])
+			if idx := strings.Index(val, "#"); idx != -1 {
+				val = strings.TrimSpace(val[:idx])
+			}
+			return strings.Trim(val, `"'`)
+		}
+	}
+	return ""
+}
+
+func setEnvIfMissing(key, value string) bool {
+	if value == "" || os.Getenv(key) != "" {
+		return false
+	}
+	os.Setenv(key, value)
+	return true
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func extractFlagValue(flag string) string {
+	args := os.Args[1:]
+	for i, arg := range args {
+		if strings.HasPrefix(arg, flag+"=") {
+			return strings.TrimPrefix(arg, flag+"=")
+		}
+		if arg == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
 func main() {
+	// gollm은 OPENAI_API_KEY 등을 init()에서 캐시합니다 (main() 실행 전).
+	// config.yaml의 API 키를 env var로 설정한 뒤 재실행하여 gollm init()이 읽게 합니다.
+	preloadEnvFromConfig()
+
 	cfg := config.NewConfig()
 
-	// klog를 파일로 리다이렉트 (콘솔 출력 억제)
-	setupKlog(cfg.AppDir)
+	// klog 출력 억제
+	setupKlog()
 
 	rootCmd := &cobra.Command{
 		Use:   "k8s-assistant [query]",
@@ -51,8 +159,12 @@ func main() {
 		"LLM 프로바이더 (openai, gemini, anthropic, ...)")
 	f.StringVar(&cfg.Model, "model", cfg.Model,
 		"사용할 LLM 모델 (예: gpt-4o, claude-sonnet-4-5, gemini-2.0-flash)")
+	f.StringVar(&cfg.APIKey, "api-key", cfg.APIKey,
+		"LLM API 키 (환경변수 OPENAI_API_KEY가 우선)")
+	f.StringVar(&cfg.Endpoint, "endpoint", cfg.Endpoint,
+		"LLM API 엔드포인트 (환경변수 OPENAI_ENDPOINT가 우선)")
 	f.StringVar(&cfg.Kubeconfig, "kubeconfig", cfg.Kubeconfig,
-		"kubeconfig 파일 경로 (기본: KUBECONFIG 환경변수 또는 ~/.kube/config)")
+		"kubeconfig 파일 경로 (기본: ~/.kube/config)")
 	f.BoolVar(&cfg.SkipVerifySSL, "skip-verify-ssl", cfg.SkipVerifySSL,
 		"LLM 프로바이더 SSL 인증서 검증 생략")
 	f.BoolVar(&cfg.EnableToolUseShim, "enable-tool-use-shim", cfg.EnableToolUseShim,
@@ -88,24 +200,31 @@ func main() {
 	}
 }
 
-// setupKlog는 klog 출력을 ~/.k8s-assistant/logs/에 리다이렉트하고
-// 콘솔(stderr) 출력을 억제합니다.
-func setupKlog(appDir string) {
-	if appDir == "" {
+// setupKlog는 klog 콘솔 출력을 억제하고 파일에 로그를 저장합니다
+func setupKlog() {
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		klog.SetOutput(io.Discard)
 		return
 	}
-	logDir := filepath.Join(appDir, "logs")
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return
-	}
-	logFilePath := filepath.Join(logDir, "k8s-assistant-"+time.Now().Format("20060102")+".log")
 
-	fs := flag.NewFlagSet("klog", flag.ContinueOnError)
+	logDir := filepath.Join(home, ".k8s-assistant", "logs")
+	os.MkdirAll(logDir, 0o755)
+
+	logFile := filepath.Join(logDir, "debug.log")
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		klog.SetOutput(io.Discard)
+		return
+	}
+
+	klog.SetOutput(f)
+
+	// flag를 사용해서 로그 레벨 설정
+	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	klog.InitFlags(fs)
-	_ = fs.Set("logtostderr", "false")
-	_ = fs.Set("alsologtostderr", "false")
-	_ = fs.Set("v", "0")
-	_ = fs.Set("log_file", logFilePath)
+	fs.Set("logtostderr", "false")
+	fs.Set("alsologtostderr", "false")
 }
 
 func run(ctx context.Context, cfg *config.Config, initialQuery string) error {
