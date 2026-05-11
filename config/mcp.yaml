@@ -9,6 +9,13 @@ servers:
     use_streaming: true
     timeout: 60
 
+  # trouble-shooting MCP 서버
+  # 실행 방법: ./bin/trouble-shooting-server --port 9091
+  - name: trouble-shooting
+    url: http://localhost:9091/mcp
+    use_streaming: true
+    timeout: 60
+
   # sequential-thinking (기본 포함, 복잡한 추론 지원)
   - name: sequential-thinking
     command: npx

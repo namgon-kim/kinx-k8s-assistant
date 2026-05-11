@@ -727,6 +727,7 @@ trouble_shooting:
 
   rag:
     enabled: true
+    provider: local            # local|endpoint
     mode: hybrid              # keyword|vector|hybrid
     top_k: 5
     min_score: 0.65
@@ -760,6 +761,11 @@ trouble_shooting:
       enabled: true
       index_dir: ~/.k8s-assistant/troubleshooting/keyword
       language: ko
+
+    endpoint:
+      url: ""                  # provider=endpoint일 때 search_knowledge POST 대상
+      api_key: ""              # Bearer token, 선택
+      timeout_seconds: 30
 
   issue_export:
     enabled: true

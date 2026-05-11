@@ -13,8 +13,8 @@ type Config struct {
 	// LLM 설정
 	LLMProvider string `json:"llmprovider"`
 	Model       string `json:"model"`
-	APIKey      string `json:"apikey"`           // 하위 호환성 (deprecated)
-	Endpoint    string `json:"endpoint"`         // 하위 호환성 (deprecated)
+	APIKey      string `json:"apikey"`   // 하위 호환성 (deprecated)
+	Endpoint    string `json:"endpoint"` // 하위 호환성 (deprecated)
 
 	// Provider별 인증 (환경변수가 config 값보다 우선)
 	AnthropicAPIKey     string `json:"anthropic_apikey,omitempty"`
@@ -47,6 +47,11 @@ type Config struct {
 
 	// 대화 로그
 	LogFile string `json:"logfile,omitempty"`
+
+	// 시스템 로그
+	SystemLogDir  string `json:"systemlogdir,omitempty"`
+	LogLevel      int    `json:"loglevel"`
+	ShowLogOutput bool   `json:"showlogoutput"`
 }
 
 // NewConfig는 기본값이 설정된 Config를 반환합니다.
@@ -57,6 +62,7 @@ func NewConfig() *Config {
 		Model:          "gemini-2.0-flash",
 		MaxIterations:  20,
 		SessionBackend: "memory",
+		LogLevel:       0,
 	}
 
 	home, _ := os.UserHomeDir()
@@ -65,6 +71,7 @@ func NewConfig() *Config {
 	if home != "" {
 		cfg.AppDir = filepath.Join(home, ".k8s-assistant")
 		cfg.HistoryFile = filepath.Join(cfg.AppDir, "history")
+		cfg.SystemLogDir = filepath.Join(cfg.AppDir, "logs")
 
 		// Config 파일 로드 시도
 		configFile := filepath.Join(cfg.AppDir, "config.yaml")
@@ -75,6 +82,11 @@ func NewConfig() *Config {
 					cfg.Kubeconfig = expandHome(cfg.Kubeconfig, home)
 				} else {
 					cfg.Kubeconfig = filepath.Join(home, ".kube", "config")
+				}
+				if cfg.SystemLogDir == "" {
+					cfg.SystemLogDir = filepath.Join(cfg.AppDir, "logs")
+				} else {
+					cfg.SystemLogDir = expandHome(cfg.SystemLogDir, home)
 				}
 				applyEnvironmentOverrides(cfg)
 				return cfg

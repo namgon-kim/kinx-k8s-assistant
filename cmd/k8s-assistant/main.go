@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/orchestrator"
@@ -46,8 +47,8 @@ func preloadEnvFromConfig() {
 	changed := false
 	switch provider {
 	case "openai", "openai-compatible":
-		key := firstNonEmpty(extractFlagValue("--api-key"), getRawConfigValue(data, "openai_apikey"))
-		ep := firstNonEmpty(extractFlagValue("--endpoint"), getRawConfigValue(data, "openai_endpoint"))
+		key := getRawConfigValue(data, "openai_apikey")
+		ep := getRawConfigValue(data, "openai_endpoint")
 		if setEnvIfMissing("OPENAI_API_KEY", key) {
 			changed = true
 		}
@@ -55,8 +56,46 @@ func preloadEnvFromConfig() {
 			changed = true
 		}
 	case "anthropic":
-		key := firstNonEmpty(extractFlagValue("--api-key"), getRawConfigValue(data, "anthropic_apikey"))
+		key := getRawConfigValue(data, "anthropic_apikey")
 		if setEnvIfMissing("ANTHROPIC_API_KEY", key) {
+			changed = true
+		}
+	case "gemini":
+		key := getRawConfigValue(data, "gemini_apikey")
+		if setEnvIfMissing("GEMINI_API_KEY", key) {
+			changed = true
+		}
+	case "azopenai":
+		key := getRawConfigValue(data, "azopenai_apikey")
+		ep := getRawConfigValue(data, "azopenai_endpoint")
+		if setEnvIfMissing("AZURE_OPENAI_API_KEY", key) {
+			changed = true
+		}
+		if setEnvIfMissing("AZURE_OPENAI_ENDPOINT", ep) {
+			changed = true
+		}
+	case "grok":
+		key := getRawConfigValue(data, "grok_apikey")
+		if setEnvIfMissing("GROK_API_KEY", key) {
+			changed = true
+		}
+	case "ollama":
+		host := getRawConfigValue(data, "ollama_host")
+		if setEnvIfMissing("OLLAMA_HOST", host) {
+			changed = true
+		}
+	case "llamacpp":
+		host := getRawConfigValue(data, "llamacpp_host")
+		if setEnvIfMissing("LLAMACPP_HOST", host) {
+			changed = true
+		}
+	case "vertexai":
+		project := getRawConfigValue(data, "gcp_project")
+		location := getRawConfigValue(data, "gcp_location")
+		if setEnvIfMissing("GOOGLE_CLOUD_PROJECT", project) {
+			changed = true
+		}
+		if setEnvIfMissing("GOOGLE_CLOUD_LOCATION", location) {
 			changed = true
 		}
 	}
@@ -100,15 +139,6 @@ func setEnvIfMissing(key, value string) bool {
 	return true
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
 func extractFlagValue(flag string) string {
 	args := os.Args[1:]
 	for i, arg := range args {
@@ -129,15 +159,18 @@ func main() {
 
 	cfg := config.NewConfig()
 
-	// klog 출력 억제
-	setupKlog()
-
 	rootCmd := &cobra.Command{
 		Use:   "k8s-assistant [query]",
 		Short: "Kubernetes AI 어시스턴트",
 		Long:  "자연어로 Kubernetes 클러스터를 조작하고 트러블슈팅하는 AI 어시스턴트입니다.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			closeLog, err := setupKlog(cfg)
+			if err != nil {
+				return err
+			}
+			defer closeLog()
+
 			query := ""
 			if len(args) > 0 {
 				query = args[0]
@@ -159,10 +192,6 @@ func main() {
 		"LLM 프로바이더 (openai, gemini, anthropic, ...)")
 	f.StringVar(&cfg.Model, "model", cfg.Model,
 		"사용할 LLM 모델 (예: gpt-4o, claude-sonnet-4-5, gemini-2.0-flash)")
-	f.StringVar(&cfg.APIKey, "api-key", cfg.APIKey,
-		"LLM API 키 (환경변수 OPENAI_API_KEY가 우선)")
-	f.StringVar(&cfg.Endpoint, "endpoint", cfg.Endpoint,
-		"LLM API 엔드포인트 (환경변수 OPENAI_ENDPOINT가 우선)")
 	f.StringVar(&cfg.Kubeconfig, "kubeconfig", cfg.Kubeconfig,
 		"kubeconfig 파일 경로 (기본: ~/.kube/config)")
 	f.BoolVar(&cfg.SkipVerifySSL, "skip-verify-ssl", cfg.SkipVerifySSL,
@@ -181,6 +210,12 @@ func main() {
 		"세션 저장 방식 (memory, filesystem)")
 	f.StringVar(&cfg.LogFile, "log-file", cfg.LogFile,
 		"대화 로그 파일 경로 (미설정 시 로깅 안 함)")
+	f.StringVar(&cfg.SystemLogDir, "log-dir", cfg.SystemLogDir,
+		"k8s-assistant 시스템 로그 디렉토리")
+	f.IntVar(&cfg.LogLevel, "log-level", cfg.LogLevel,
+		"k8s-assistant 시스템 로그 레벨 (기본: 0=info)")
+	f.BoolVar(&cfg.ShowLogOutput, "show-log-output", cfg.ShowLogOutput,
+		"k8s-assistant 시스템 로그를 콘솔에도 출력")
 
 	// Ctrl+C / SIGTERM 처리
 	ctx, cancel := context.WithCancel(context.Background())
@@ -200,31 +235,48 @@ func main() {
 	}
 }
 
-// setupKlog는 klog 콘솔 출력을 억제하고 파일에 로그를 저장합니다
-func setupKlog() {
-	home, _ := os.UserHomeDir()
-	if home == "" {
+// setupKlog는 klog 콘솔 출력을 기본 비활성화하고 파일에 info 레벨 로그를 저장합니다.
+func setupKlog(cfg *config.Config) (func(), error) {
+	logDir := cfg.SystemLogDir
+	if logDir == "" {
+		if cfg.AppDir != "" {
+			logDir = filepath.Join(cfg.AppDir, "logs")
+		} else if home, _ := os.UserHomeDir(); home != "" {
+			logDir = filepath.Join(home, ".k8s-assistant", "logs")
+		}
+	}
+	if logDir == "" {
 		klog.SetOutput(io.Discard)
-		return
+		return func() {}, nil
 	}
 
-	logDir := filepath.Join(home, ".k8s-assistant", "logs")
-	os.MkdirAll(logDir, 0o755)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return func() {}, fmt.Errorf("시스템 로그 디렉토리 생성 실패 (%s): %w", logDir, err)
+	}
 
-	logFile := filepath.Join(logDir, "debug.log")
+	logFile := filepath.Join(logDir, "k8s-assistant-"+time.Now().Format("20060102")+".log")
 	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		klog.SetOutput(io.Discard)
-		return
+		return func() {}, fmt.Errorf("시스템 로그 파일 열기 실패 (%s): %w", logFile, err)
 	}
 
-	klog.SetOutput(f)
+	var out io.Writer = f
+	if cfg.ShowLogOutput {
+		out = io.MultiWriter(f, os.Stderr)
+	}
+	klog.SetOutput(out)
 
-	// flag를 사용해서 로그 레벨 설정
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	klog.InitFlags(fs)
-	fs.Set("logtostderr", "false")
-	fs.Set("alsologtostderr", "false")
+	_ = fs.Set("logtostderr", "false")
+	_ = fs.Set("alsologtostderr", "false")
+	_ = fs.Set("v", fmt.Sprintf("%d", cfg.LogLevel))
+
+	klog.Infof("k8s-assistant log started: %s", logFile)
+	return func() {
+		klog.Flush()
+		_ = f.Close()
+	}, nil
 }
 
 func run(ctx context.Context, cfg *config.Config, initialQuery string) error {

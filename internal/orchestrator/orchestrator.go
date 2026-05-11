@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -19,8 +18,6 @@ import (
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/k8s"
 	"k8s.io/klog/v2"
 )
-
-const sessionTimeout = 5 * time.Minute
 
 // loadHistory는 히스토리 파일에서 입력 히스토리를 로드합니다
 func loadHistory(historyFile string) []string {
@@ -262,11 +259,23 @@ func getInputWithUI(prompt, historyFile string) (string, error) {
 	return model.result, nil
 }
 
+func getInputWithUIEcho(prompt, historyFile string) (string, error) {
+	input, err := getInputWithUI(prompt, historyFile)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(input) != "" {
+		fmt.Printf("%s%s\n", prompt, input)
+	}
+	return input, nil
+}
+
 // Orchestrator는 kubectl-ai Agent를 래핑하여
 // 컨텍스트 관리, 마스킹, 포맷팅, propose/commit 플로우를 처리합니다.
 type Orchestrator struct {
 	cfg            *config.Config
 	agentWrap      *agent.AgentWrapper
+	outputCh       <-chan *api.Message
 	agentInitErr   error // agent 초기화 실패 원인 저장
 	ctx            *ConversationContext
 	formatter      *Formatter
@@ -342,98 +351,39 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 // Run은 대화 루프를 시작합니다.
 // initialQuery가 비어 있으면 인터랙티브 모드로 동작합니다.
 func (o *Orchestrator) Run(ctx context.Context, initialQuery string) error {
-	ctx, cancel := context.WithTimeout(ctx, sessionTimeout)
-	defer cancel()
-
-	// 1단계: 배너 출력 (빠름)
 	PrintBanner(o.kubeconfigInfo, o.cfg.Kubeconfig)
 
-	// 2단계: agent 생성 (지연 초기화 - 이 시점에서 kubectl-ai 로드)
-	klog.Info("agent 초기화 중...")
-
-	// goroutine에서 agent 생성 (블로킹 방지)
-	agentCh := make(chan *agent.AgentWrapper)
-	errCh := make(chan error)
-
-	go func() {
-		klog.Info("→ LLM 클라이언트 로드 중...")
-		agentWrap, err := agent.NewAgentWrapper(o.cfg)
-		if err != nil {
-			errCh <- err
-		} else {
-			agentCh <- agentWrap
-		}
-	}()
-
-	// agent 생성 대기
-	select {
-	case agentWrap := <-agentCh:
-		klog.Info("✓ agent 준비 완료")
-		o.agentWrap = agentWrap
-	case err := <-errCh:
-		o.agentInitErr = err
-		fmt.Printf("%s✗ agent 생성 실패: %v%s\n", colorBrightRed, err, colorReset)
-		fmt.Printf("%s메타 명령만 사용 가능합니다%s\n", colorYellow, colorReset)
-		return o.runMetaCommandOnly()
-	case <-ctx.Done():
-		return fmt.Errorf("agent 생성 중 타임아웃")
-	}
-
-	// 3단계: agent 시작
-	if err := o.agentWrap.Start(ctx, initialQuery); err != nil {
-		klog.Warningf("agent 시작 실패: %v", err)
-		return o.runMetaCommandOnly()
-	}
-
-	outputCh := o.agentWrap.Output()
-
-	// initialQuery가 없으면 첫 입력 대기 (bubbletea 사용)
-	// 재귀 호출 대신 루프 사용: 빈 입력·메타 명령 시 배너 재출력 방지
-	for initialQuery == "" {
-		o.printStatusWarnings(true)
-		promptText := o.buildPrompt(true)
-
-		input, err := getInputWithUI(promptText, o.cfg.HistoryFile)
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("👋 종료합니다.")
-				return nil
-			}
-			return fmt.Errorf("입력 오류: %w", err)
-		}
-
-		input = strings.TrimSpace(input)
-		if input == "" {
-			continue
-		}
-		if input == "exit" {
-			fmt.Println("👋 종료합니다.")
+	initialQuery = strings.TrimSpace(initialQuery)
+	if initialQuery != "" {
+		if inputIsQuit(initialQuery) {
+			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
 			return nil
 		}
+		if err := o.startAgent(ctx, initialQuery); err != nil {
+			return err
+		}
+	}
 
-		// "/" 입력 시 명령어 실행 후 배너 없이 재프롬프트
-		if strings.HasPrefix(input, "/") {
-			if err := o.selectMetaCommand(input); err != nil && err != io.EOF {
-				fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
+	for {
+		if o.agentWrap == nil {
+			if err := o.readAndDispatchInput(ctx); err != nil {
+				if err == io.EOF {
+					return nil
+				}
+				return err
 			}
 			continue
 		}
 
-		o.logEntry("user_input", input)
-		initialQuery = input
-		o.agentWrap.SendInput(&api.UserInputResponse{Query: input})
-	}
-
-	// 4단계: 메인 루프 - agent 응답 대기
-	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("\n⏱️  세션이 종료되었습니다.")
+			fmt.Println("\n👋 종료합니다.")
 			return nil
 
-		case msg, ok := <-outputCh:
+		case msg, ok := <-o.outputCh:
 			if !ok {
-				return nil
+				o.clearAgent()
+				continue
 			}
 			if err := o.handleMessage(msg); err != nil {
 				if err == io.EOF {
@@ -445,38 +395,98 @@ func (o *Orchestrator) Run(ctx context.Context, initialQuery string) error {
 	}
 }
 
-// runMetaCommandOnly는 agent 없이 메타 명령만 실행합니다.
-func (o *Orchestrator) runMetaCommandOnly() error {
-	for {
-		o.printStatusWarnings(false)
-		promptText := o.buildPrompt(false)
-		input, err := getInputWithUI(promptText, o.cfg.HistoryFile)
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("👋 종료합니다.")
-				return nil
-			}
-			return fmt.Errorf("입력 오류: %w", err)
-		}
-
-		input = strings.TrimSpace(input)
-		if input == "" {
-			continue
-		}
-		if input == "exit" {
+func (o *Orchestrator) readAndDispatchInput(ctx context.Context) error {
+	o.printStatusWarnings(true)
+	input, err := getInputWithUIEcho(o.buildPrompt(true), o.cfg.HistoryFile)
+	if err != nil {
+		if err == io.EOF {
 			fmt.Println("👋 종료합니다.")
-			return nil
+			return io.EOF
 		}
-
-		// "/" 입력 시 명령어 실행
-		if strings.HasPrefix(input, "/") {
-			if err := o.selectMetaCommand(input); err != nil && err != io.EOF {
-				fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
-			}
-			continue
-		}
-		o.showAgentRequirements()
+		return fmt.Errorf("입력 오류: %w", err)
 	}
+
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return nil
+	}
+	if input == "exit" {
+		fmt.Println("👋 종료합니다.")
+		return io.EOF
+	}
+	if inputIsQuit(input) {
+		fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
+		return nil
+	}
+	if strings.HasPrefix(input, "/") {
+		if err := o.selectMetaCommand(input); err != nil && err != io.EOF {
+			fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
+		}
+		return nil
+	}
+
+	if err := o.ensureReadyForAgent(); err != nil {
+		fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
+		o.showAgentRequirements()
+		return nil
+	}
+
+	o.logEntry("user_input", input)
+	return o.startAgent(ctx, input)
+}
+
+func (o *Orchestrator) startAgent(ctx context.Context, initialQuery string) error {
+	if err := o.ensureReadyForAgent(); err != nil {
+		return err
+	}
+	if o.agentWrap != nil {
+		return nil
+	}
+
+	klog.Info("agent 초기화 중...", "kubeconfig", o.cfg.Kubeconfig, "context", o.cfg.CurrentContext)
+	agentWrap, err := agent.NewAgentWrapper(o.cfg)
+	if err != nil {
+		o.agentInitErr = err
+		return fmt.Errorf("agent 생성 실패: %w", err)
+	}
+	if err := agentWrap.Start(ctx, initialQuery); err != nil {
+		agentWrap.Close()
+		o.agentInitErr = err
+		return fmt.Errorf("agent 시작 실패: %w", err)
+	}
+
+	o.agentWrap = agentWrap
+	o.outputCh = agentWrap.Output()
+	o.agentInitErr = nil
+	klog.Info("agent 준비 완료", "kubeconfig", o.cfg.Kubeconfig, "context", o.cfg.CurrentContext)
+	return nil
+}
+
+func (o *Orchestrator) ensureReadyForAgent() error {
+	if !o.isAPIKeyAvailable() {
+		return fmt.Errorf("%s API Key가 설정되지 않았습니다", o.cfg.LLMProvider)
+	}
+	if o.cfg.Kubeconfig == "" {
+		return fmt.Errorf("kubeconfig가 설정되지 않았습니다. /kubeconfig로 설정하세요")
+	}
+	if o.kubeconfigInfo == nil {
+		return fmt.Errorf("kubeconfig를 로드할 수 없습니다: %s", o.cfg.Kubeconfig)
+	}
+	return nil
+}
+
+func (o *Orchestrator) invalidateAgent(reason string) {
+	if o.agentWrap == nil {
+		return
+	}
+	klog.Info("agent invalidated", "reason", reason)
+	o.agentWrap.Close()
+	o.clearAgent()
+}
+
+func (o *Orchestrator) clearAgent() {
+	o.agentWrap = nil
+	o.outputCh = nil
 }
 
 // handleMessage는 Agent Output 채널에서 수신한 메시지를 처리합니다.
@@ -516,80 +526,126 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		o.logEntry("tool_result", fmt.Sprintf("[%s] %s", refID, masked))
 
 	case api.MessageTypeUserInputRequest:
-		fmt.Println()
-		prompt := o.buildPrompt(true) // agent 있음
-		o.rl.SetPrompt(prompt)
-		input, err := o.rl.Readline()
-		if err != nil {
-			if err == readline.ErrInterrupt || err == io.EOF {
-				o.agentWrap.SendInput(io.EOF)
-				fmt.Println("👋 종료합니다.")
-				return io.EOF
-			}
-			return err
-		}
-		input = strings.TrimSpace(input)
-		if input == "" {
-			return nil
-		}
-		if input == "exit" {
-			o.agentWrap.SendInput(io.EOF)
-			fmt.Println("👋 종료합니다.")
-			return io.EOF
-		}
-
-		// 메타 명령어 처리 (/ 로 시작)
-		if strings.HasPrefix(input, "/") {
-			if err := o.handleMetaCommand(input); err != nil {
-				fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
-			}
-			return nil
-		}
-
-		o.logEntry("user_input", input)
-		o.agentWrap.SendInput(&api.UserInputResponse{Query: input})
+		return o.handleAgentInputRequest()
 
 	case api.MessageTypeUserChoiceRequest:
 		choiceReq, ok := msg.Payload.(*api.UserChoiceRequest)
 		if !ok {
 			return nil
 		}
-
-		PrintMessage(o.formatter.FormatPropose(choiceReq.Prompt))
-		for i, opt := range choiceReq.Options {
-			fmt.Printf("  %d. %s\n", i+1, opt.Label)
-		}
-
-		o.rl.SetPrompt("실행하시겠습니까? (y/n): ")
-		input, err := o.rl.Readline()
-		o.rl.SetPrompt(">>> ")
-		if err != nil {
-			if err == readline.ErrInterrupt || err == io.EOF {
-				o.agentWrap.SendInput(&api.UserChoiceResponse{Choice: 1})
-				return nil
-			}
-			return err
-		}
-
-		input = strings.TrimSpace(strings.ToLower(input))
-		o.logEntry("user_choice", input)
-
-		choice := 1
-		if input == "y" || input == "yes" || input == "예" {
-			for i, opt := range choiceReq.Options {
-				label := strings.ToLower(opt.Label)
-				if strings.Contains(label, "yes") ||
-					strings.Contains(label, "confirm") ||
-					strings.Contains(label, "실행") {
-					choice = i + 1
-					break
-				}
-			}
-		}
-		o.agentWrap.SendInput(&api.UserChoiceResponse{Choice: choice})
+		return o.handleAgentChoiceRequest(choiceReq)
 	}
 
 	return nil
+}
+
+func (o *Orchestrator) handleAgentInputRequest() error {
+	activeAgent := o.agentWrap
+	if activeAgent == nil {
+		return nil
+	}
+
+	o.printStatusWarnings(true)
+	input, err := getInputWithUIEcho(o.buildPrompt(true), o.cfg.HistoryFile)
+	if err != nil {
+		if err == io.EOF {
+			activeAgent.SendInput(io.EOF)
+			fmt.Println("👋 종료합니다.")
+			return io.EOF
+		}
+		return fmt.Errorf("입력 오류: %w", err)
+	}
+
+	input = strings.TrimSpace(input)
+	if input == "exit" {
+		activeAgent.SendInput(io.EOF)
+		fmt.Println("👋 종료합니다.")
+		return io.EOF
+	}
+	if inputIsQuit(input) {
+		fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
+		activeAgent.SendInput(&api.UserInputResponse{Query: ""})
+		return nil
+	}
+	if strings.HasPrefix(input, "/") {
+		if err := o.selectMetaCommand(input); err != nil && err != io.EOF {
+			fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
+		}
+		if o.agentWrap == activeAgent {
+			activeAgent.SendInput(&api.UserInputResponse{Query: ""})
+		}
+		return nil
+	}
+
+	o.logEntry("user_input", input)
+	activeAgent.SendInput(&api.UserInputResponse{Query: input})
+	return nil
+}
+
+func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest) error {
+	activeAgent := o.agentWrap
+	if activeAgent == nil {
+		return nil
+	}
+
+	PrintMessage(o.formatter.FormatPropose(choiceReq.Prompt))
+	for i, opt := range choiceReq.Options {
+		fmt.Printf("  %d. %s\n", i+1, opt.Label)
+	}
+
+	for {
+		input, err := getInputWithUIEcho("선택 (번호, y/n): ", o.cfg.HistoryFile)
+		if err != nil {
+			if err == io.EOF {
+				activeAgent.SendInput(io.EOF)
+				fmt.Println("👋 종료합니다.")
+				return io.EOF
+			}
+			return fmt.Errorf("입력 오류: %w", err)
+		}
+
+		input = strings.TrimSpace(strings.ToLower(input))
+		if input == "exit" {
+			activeAgent.SendInput(io.EOF)
+			fmt.Println("👋 종료합니다.")
+			return io.EOF
+		}
+		if inputIsQuit(input) {
+			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
+			continue
+		}
+		if input == "y" || input == "yes" || input == "예" {
+			input = "1"
+		}
+		if input == "n" || input == "no" || input == "아니오" {
+			input = strconv.Itoa(findChoiceIndex(choiceReq.Options, "no", len(choiceReq.Options)))
+		}
+
+		choice, err := strconv.Atoi(input)
+		if err == nil && choice >= 1 && choice <= len(choiceReq.Options) {
+			o.logEntry("user_choice", input)
+			activeAgent.SendInput(&api.UserChoiceResponse{Choice: choice})
+			return nil
+		}
+
+		fmt.Println(colorBrightMagenta + "❌ 유효하지 않은 선택입니다" + colorReset)
+	}
+}
+
+func findChoiceIndex(options []api.UserChoiceOption, value string, fallback int) int {
+	for i, opt := range options {
+		if strings.EqualFold(opt.Value, value) {
+			return i + 1
+		}
+	}
+	if fallback >= 1 && fallback <= len(options) {
+		return fallback
+	}
+	return 1
+}
+
+func inputIsQuit(input string) bool {
+	return strings.EqualFold(strings.TrimSpace(input), "quit")
 }
 
 // Close는 Orchestrator 리소스를 정리합니다.
@@ -631,7 +687,7 @@ func (o *Orchestrator) buildPrompt(hasAgent bool) string {
 	}
 
 	statusSymbol := "⚠️ "
-	if hasAgent && o.kubeconfigInfo != nil && o.isAPIKeyAvailable() {
+	if o.kubeconfigInfo != nil && o.isAPIKeyAvailable() {
 		statusSymbol = "✓"
 	}
 
@@ -914,6 +970,8 @@ func (o *Orchestrator) switchContext(contextName string) error {
 
 	o.kubeconfigInfo = info
 	o.cfg.CurrentContext = info.CurrentContext
+	o.cfg.AvailableContexts = info.Contexts
+	o.invalidateAgent("kube-context changed")
 
 	// prompt 업데이트
 	newPrompt := o.buildPrompt(o.agentWrap != nil)
@@ -1032,6 +1090,7 @@ func (o *Orchestrator) setKubeconfig(kubeconfigPath string) error {
 	o.kubeconfigInfo = info
 	o.cfg.CurrentContext = info.CurrentContext
 	o.cfg.AvailableContexts = info.Contexts
+	o.invalidateAgent("kubeconfig changed")
 
 	fmt.Printf("%s✓ kubeconfig 설정 완료%s\n", colorBrightGreen, colorReset)
 	fmt.Printf("%s💾 /save 명령으로 설정을 저장하세요%s\n", colorYellow, colorReset)
@@ -1050,6 +1109,7 @@ func (o *Orchestrator) setModel(modelName string) error {
 		return fmt.Errorf("모델 이름이 비어있습니다")
 	}
 	o.cfg.Model = modelName
+	o.invalidateAgent("model changed")
 	fmt.Println()
 	fmt.Printf("%s✓ 모델이 변경되었습니다: %s%s\n", colorBrightGreen, modelName, colorReset)
 	fmt.Printf("%s💾 /save 명령으로 설정을 저장하세요%s\n", colorYellow, colorReset)

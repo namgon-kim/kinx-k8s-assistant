@@ -300,6 +300,9 @@ OpenAI 호환 모델 중 native tool calling을 지원하지 않는 경우:
 | `--prompt-template` | 자동 탐색 | 한국어 시스템 프롬프트 템플릿 경로 |
 | `--session-backend` | `memory` | 세션 저장 방식 (`memory`=RAM, `filesystem`=디스크) |
 | `--log-file` | 없음 | 대화 로그 저장 경로 (선택, 감사/분석용) |
+| `--log-dir` | `~/.k8s-assistant/logs` | k8s-assistant 시스템 로그 디렉토리 |
+| `--log-level` | `0` | 시스템 로그 레벨 (`0`=info) |
+| `--show-log-output` | `false` | 시스템 로그를 콘솔에도 출력 |
 
 ### 사용 예시
 
@@ -703,6 +706,12 @@ go list -m all | grep -E "kubectl-ai|openai|anthropic|chromem"
   --llm-provider openai \
   --model gpt-4o \
   --show-tool-output
+
+# 시스템 로그를 실행 중 콘솔에도 표시
+./bin/k8s-assistant \
+  --llm-provider openai \
+  --model gpt-4o \
+  --show-log-output
 
 # 대화 로그 저장
 ./bin/k8s-assistant \

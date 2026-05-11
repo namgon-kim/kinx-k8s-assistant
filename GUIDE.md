@@ -18,8 +18,8 @@ make build-linux
 # LLM 설정
 llmprovider: openai
 model: gpt-4o
-apikey: sk-...                 # API 키 (선택사항, env가 우선)
-endpoint: https://...          # API 엔드포인트 (선택사항, env가 우선)
+openai_apikey: sk-...          # Provider별 API 키 (env가 우선)
+openai_endpoint: https://...   # Provider별 API 엔드포인트 (필요한 provider만 설정)
 
 # Kubernetes 설정
 kubeconfig: ~/.kube/config
@@ -39,7 +39,7 @@ showtooloutput: true
   --max-iterations 20
 ```
 
-#### 3. 환경 변수 (CLI 플래그 없을 때만 적용)
+#### 3. 환경 변수
 ```bash
 export KUBECONFIG=$HOME/.kube/config
 export LLM_PROVIDER=openai
@@ -47,9 +47,9 @@ export MODEL=gpt-4o
 ```
 
 **설정 우선순위:**
-1. CLI 플래그 (`--kubeconfig`, `--model`, `--api-key`, 등) - 최우선
-2. 환경 변수 (`OPENAI_API_KEY`, `OPENAI_ENDPOINT`, `LLM_PROVIDER`, `MODEL`) 
-3. `~/.k8s-assistant/config.yaml` - 권장 설정 방식
+1. CLI 플래그 (`--kubeconfig`, `--model`, `--llm-provider` 등)
+2. 환경 변수 (`OPENAI_API_KEY`, `OPENAI_ENDPOINT`, `GEMINI_API_KEY`, `LLM_PROVIDER`, `MODEL` 등)
+3. `~/.k8s-assistant/config.yaml`의 provider별 API/endpoint 필드
 4. 기본값 - 모든 설정이 없을 때
 
 ## API 키 설정 방법
@@ -58,8 +58,8 @@ export MODEL=gpt-4o
 ```yaml
 llmprovider: openai
 model: gpt-4o
-apikey: sk-...
-endpoint: https://api.openai.com/v1  # 선택사항
+openai_apikey: sk-...
+openai_endpoint: https://api.openai.com/v1  # 선택사항
 ```
 
 ### 방법 2: 환경 변수 사용 (권장 - CI/CD)
@@ -69,12 +69,12 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
 ./k8s-assistant
 ```
 
-### 방법 3: CLI 플래그 사용
+### 방법 3: 실행 옵션으로 provider/model 선택
 ```bash
-./k8s-assistant --api-key sk-... --endpoint https://api.openai.com/v1
+./k8s-assistant --llm-provider openai --model gpt-4o
 ```
 
-**주의:** 환경 변수가 config.yaml과 CLI 플래그보다 우선하므로, 민감한 정보는 환경 변수로 전달하는 것이 권장됩니다.
+**주의:** kubectl-ai/gollm은 provider별 환경 변수가 설정되어 있어야 동작합니다. k8s-assistant는 시작 시 config.yaml의 provider별 API/endpoint 값을 필요한 환경 변수로 올린 뒤 gollm이 읽도록 재실행합니다. 이미 환경 변수가 설정되어 있으면 환경 변수 값을 우선합니다.
 
 ## 메타 명령어
 
@@ -141,9 +141,11 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
 
 - **시스템 로그**: `~/.k8s-assistant/logs/k8s-assistant-YYYYMMDD.log`
 - **대화 로그**: `--log-file` 옵션으로 지정
+- **콘솔 시스템 로그**: 기본 비활성화, `--show-log-output`으로 활성화
 
 ```bash
 ./bin/k8s-assistant-linux-amd64 --log-file /tmp/conversation.log
+./bin/k8s-assistant-linux-amd64 --show-log-output
 ```
 
 ## 명령어 라인 옵션
@@ -156,6 +158,7 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
   --max-iterations 20 \
   --mcp-client \
   --show-tool-output \
+  --show-log-output \
   --log-file /tmp/chat.log
 ```
 

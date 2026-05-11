@@ -1,0 +1,117 @@
+cases:
+  - id: crashloop-oom
+    title: "CrashLoopBackOff - OOMKilled"
+    match_types:
+      - CrashLoopBackOff
+      - OOMKilled
+    cause: "컨테이너 메모리 사용량이 limit을 초과해 OOMKilled가 발생했을 가능성이 높습니다."
+    resolution: "이벤트와 메모리 사용 추이를 확인한 뒤 memory request/limit 조정 또는 애플리케이션 메모리 사용량 개선을 진행합니다."
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Pod 이벤트와 종료 사유 확인"
+        command_template: "kubectl describe pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "이전 컨테이너 로그 확인"
+        command_template: "kubectl logs {{pod_name}} -n {{namespace}} --previous --tail=200"
+        automatic_candidate: true
+        requires_confirmation: false
+    remediate_steps:
+      - type: remediate
+        description: "워크로드 memory limit 조정"
+        command_template: "kubectl set resources {{owner_kind}}/{{owner_name}} -n {{namespace}} --limits=memory={{memory_limit}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          memory_limit: "2Gi"
+    verify_steps:
+      - type: verify
+        description: "재시작 횟수와 상태 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    rollback_steps:
+      - type: rollback
+        description: "이전 ReplicaSet으로 롤백"
+        command_template: "kubectl rollout undo {{owner_kind}}/{{owner_name}} -n {{namespace}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    risk_level: medium
+    source: "internal-runbook"
+    tags: ["oom", "memory", "crashloop"]
+
+  - id: image-pull-backoff
+    title: "ImagePullBackOff / ErrImagePull"
+    match_types:
+      - ImagePullBackOff
+      - ErrImagePull
+    cause: "이미지 이름, 태그, 레지스트리 인증 또는 네트워크 문제로 이미지를 가져오지 못하는 상태입니다."
+    resolution: "Pod 이벤트에서 pull 실패 이유를 확인하고 이미지 경로, 태그, imagePullSecret, 레지스트리 접근성을 검증합니다."
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Pod 이벤트에서 이미지 pull 실패 이유 확인"
+        command_template: "kubectl describe pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "대상 네임스페이스의 imagePullSecret 확인"
+        command_template: "kubectl get secret -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    remediate_steps:
+      - type: remediate
+        description: "잘못된 이미지 태그 또는 secret을 수정한 manifest 적용"
+        command_template: "kubectl apply -f {{manifest_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          manifest_path: "./deployment.yaml"
+    verify_steps:
+      - type: verify
+        description: "Pod 상태 재확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "internal-runbook"
+    tags: ["image", "registry", "pull"]
+
+  - id: pending-failed-scheduling
+    title: "Pending / FailedScheduling"
+    match_types:
+      - Pending
+      - FailedScheduling
+    cause: "노드 리소스 부족, nodeSelector/taint/toleration 불일치, PVC 미바인딩 등으로 스케줄링이 실패했을 수 있습니다."
+    resolution: "이벤트와 노드/PVC 상태를 확인한 뒤 리소스 요청 조정, 노드 증설, 스케줄링 조건 수정을 검토합니다."
+    diagnostic_steps:
+      - type: diagnostic
+        description: "스케줄링 실패 이벤트 확인"
+        command_template: "kubectl describe pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "노드 리소스 확인"
+        command_template: "kubectl describe nodes"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "PVC 상태 확인"
+        command_template: "kubectl get pvc -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    remediate_steps:
+      - type: remediate
+        description: "리소스 request 조정 또는 스케줄링 조건 수정"
+        command_template: "kubectl edit {{owner_kind}}/{{owner_name}} -n {{namespace}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    verify_steps:
+      - type: verify
+        description: "Pod가 Running으로 전환되는지 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}} -w"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: medium
+    source: "internal-runbook"
+    tags: ["scheduling", "pending", "resources"]
