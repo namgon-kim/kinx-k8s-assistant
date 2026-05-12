@@ -122,5 +122,8 @@ func PrintMessage(msg *FormattedMessage) {
 		fmt.Print(msg.Content)
 	default:
 		fmt.Print(msg.Content)
+		if !strings.HasSuffix(msg.Content, "\n") {
+			fmt.Println()
+		}
 	}
 }

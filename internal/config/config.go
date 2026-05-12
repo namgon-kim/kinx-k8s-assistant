@@ -13,8 +13,8 @@ type Config struct {
 	// LLM 설정
 	LLMProvider string `json:"llmprovider"`
 	Model       string `json:"model"`
-	APIKey      string `json:"apikey"`   // 하위 호환성 (deprecated)
-	Endpoint    string `json:"endpoint"` // 하위 호환성 (deprecated)
+	APIKey      string `json:"apikey"`
+	Endpoint    string `json:"endpoint"`
 
 	// Provider별 인증 (환경변수가 config 값보다 우선)
 	AnthropicAPIKey     string `json:"anthropic_apikey,omitempty"`
@@ -29,7 +29,7 @@ type Config struct {
 	GCPProject          string `json:"gcp_project,omitempty"`
 	GCPLocation         string `json:"gcp_location,omitempty"`
 
-	// kubectl-ai Agent 설정
+	// ReAct loop 설정
 	Kubeconfig         string   `json:"kubeconfig"`
 	CurrentContext     string   `json:"-"`
 	AvailableContexts  []string `json:"-"`

@@ -13,9 +13,10 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/chzyer/readline"
-	"github.com/namgon-kim/kinx-k8s-assistant/internal/agent"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/k8s"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/toolconnector"
 	"k8s.io/klog/v2"
 )
 
@@ -108,7 +109,7 @@ type inputModel struct {
 	selectedIdx  int
 	result       string
 	history      []string // 입력 히스토리
-	historyIdx   int      // 현재 히스토리 인덱스 (-1 = 현재 입력)
+	historyIdx   int      // 현재 히스토리 인덱스 (len(history) = 현재 입력)
 	originalText string   // 히스토리 네비게이션 시 원본 입력 보존
 	historyFile  string   // 히스토리 파일 경로
 	interrupted  bool     // Ctrl+C로 종료 요청
@@ -120,11 +121,12 @@ func newInputModel(prompt, historyFile string) inputModel {
 	ti.Focus()
 	ti.Prompt = prompt
 	ti.ShowSuggestions = false
+	history := loadHistory(historyFile)
 
 	return inputModel{
 		textinput:   ti,
-		history:     loadHistory(historyFile),
-		historyIdx:  -1,
+		history:     history,
+		historyIdx:  len(history),
 		historyFile: historyFile,
 	}
 }
@@ -148,30 +150,25 @@ func (m inputModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if isMeta && m.selectedIdx > 0 {
 				m.selectedIdx--
 			} else if !isMeta && len(m.history) > 0 {
-				// 히스토리 네비게이션: 과거로 이동
-				if m.historyIdx == -1 {
+				if m.historyIdx == len(m.history) {
 					m.originalText = text
 				}
-				m.historyIdx++
-				if m.historyIdx >= len(m.history) {
-					m.historyIdx = len(m.history) - 1
+				if m.historyIdx > 0 {
+					m.historyIdx--
 				}
-				if m.historyIdx >= 0 {
-					m.textinput.SetValue(m.history[len(m.history)-1-m.historyIdx])
-				}
+				m.textinput.SetValue(m.history[m.historyIdx])
 			}
 			return m, nil
 
 		case "down":
 			if isMeta && m.selectedIdx < len(filtered)-1 {
 				m.selectedIdx++
-			} else if !isMeta && m.historyIdx >= 0 {
-				// 히스토리 네비게이션: 최신으로 이동
-				m.historyIdx--
-				if m.historyIdx < 0 {
+			} else if !isMeta && len(m.history) > 0 && m.historyIdx < len(m.history) {
+				m.historyIdx++
+				if m.historyIdx == len(m.history) {
 					m.textinput.SetValue(m.originalText)
-				} else if m.historyIdx >= 0 {
-					m.textinput.SetValue(m.history[len(m.history)-1-m.historyIdx])
+				} else {
+					m.textinput.SetValue(m.history[m.historyIdx])
 				}
 			}
 			return m, nil
@@ -199,8 +196,9 @@ func (m inputModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.selectedIdx = 0
 	}
 	// 텍스트 변경 시 히스토리 인덱스 초기화
-	if m.textinput.Value() != m.originalText && m.historyIdx >= 0 {
-		m.historyIdx = -1
+	if m.historyIdx < len(m.history) && m.textinput.Value() != m.history[m.historyIdx] {
+		m.historyIdx = len(m.history)
+		m.originalText = m.textinput.Value()
 	}
 	return m, cmd
 }
@@ -239,8 +237,12 @@ func clampSelection(idx, size int) int {
 	return idx
 }
 
-// getInputWithUI는 bubbletea를 사용해서 사용자 입력을 받습니다
 func getInputWithUI(prompt, historyFile string) (string, error) {
+	return getInputWithUIHistory(prompt, historyFile, true)
+}
+
+// getInputWithUI는 bubbletea를 사용해서 사용자 입력을 받습니다
+func getInputWithUIHistory(prompt, historyFile string, saveToHistory bool) (string, error) {
 	m := newInputModel(prompt, historyFile)
 	p, err := tea.NewProgram(m).Run()
 	if err != nil {
@@ -252,7 +254,7 @@ func getInputWithUI(prompt, historyFile string) (string, error) {
 		return "", io.EOF
 	}
 	// 히스토리에 추가
-	if model.result != "" && model.result != "exit" {
+	if saveToHistory && model.result != "" && model.result != "exit" {
 		m.history = append(m.history, model.result)
 		saveHistory(historyFile, m.history)
 	}
@@ -260,7 +262,15 @@ func getInputWithUI(prompt, historyFile string) (string, error) {
 }
 
 func getInputWithUIEcho(prompt, historyFile string) (string, error) {
-	input, err := getInputWithUI(prompt, historyFile)
+	return getInputWithUIEchoHistory(prompt, historyFile, true)
+}
+
+func getInputWithUIEchoNoHistory(prompt, historyFile string) (string, error) {
+	return getInputWithUIEchoHistory(prompt, "", false)
+}
+
+func getInputWithUIEchoHistory(prompt, historyFile string, saveToHistory bool) (string, error) {
+	input, err := getInputWithUIHistory(prompt, historyFile, saveToHistory)
 	if err != nil {
 		return "", err
 	}
@@ -270,11 +280,11 @@ func getInputWithUIEcho(prompt, historyFile string) (string, error) {
 	return input, nil
 }
 
-// Orchestrator는 kubectl-ai Agent를 래핑하여
+// Orchestrator는 k8s-assistant ReAct loop와 사용자 입력/출력 UX를 연결하고,
 // 컨텍스트 관리, 마스킹, 포맷팅, propose/commit 플로우를 처리합니다.
 type Orchestrator struct {
 	cfg             *config.Config
-	agentWrap       *agent.AgentWrapper
+	agentWrap       *react.Loop
 	outputCh        <-chan *api.Message
 	agentInitErr    error // agent 초기화 실패 원인 저장
 	ctx             *ConversationContext
@@ -355,7 +365,7 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 func (o *Orchestrator) Run(ctx context.Context, initialQuery string) error {
 	PrintBanner(o.kubeconfigInfo, o.cfg.Kubeconfig)
 	if o.cfg.MCPClient {
-		if path, err := agent.PrepareKinxMCPClient(); err != nil {
+		if path, err := toolconnector.PrepareKinxMCPClient(); err != nil {
 			return fmt.Errorf("MCP 클라이언트 준비 실패: %w", err)
 		} else {
 			klog.Infof("MCP 설정 준비 완료: %s", path)
@@ -453,15 +463,15 @@ func (o *Orchestrator) startAgent(ctx context.Context, initialQuery string) erro
 	}
 
 	klog.Info("agent 초기화 중...", "kubeconfig", o.cfg.Kubeconfig, "context", o.cfg.CurrentContext)
-	agentWrap, err := agent.NewAgentWrapper(o.cfg)
+	agentWrap, err := react.New(o.cfg)
 	if err != nil {
 		o.agentInitErr = err
-		return fmt.Errorf("agent 생성 실패: %w", err)
+		return fmt.Errorf("react loop 생성 실패: %w", err)
 	}
 	if err := agentWrap.Start(ctx, initialQuery); err != nil {
 		agentWrap.Close()
 		o.agentInitErr = err
-		return fmt.Errorf("agent 시작 실패: %w", err)
+		return fmt.Errorf("react loop 시작 실패: %w", err)
 	}
 
 	o.agentWrap = agentWrap
@@ -507,7 +517,10 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		if !ok {
 			return nil
 		}
-		masked := MaskSensitiveData(text)
+		if msg.Source == api.MessageSourceUser {
+			return nil
+		}
+		masked := MaskSensitiveData(sanitizeDisplayText(text))
 		PrintMessage(o.formatter.FormatText(masked))
 		o.logEntry("response", masked)
 		return o.troubleshooting.AfterAgentText(o, masked)
@@ -517,6 +530,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		if !ok {
 			return nil
 		}
+		errText = sanitizeDisplayText(errText)
 		PrintMessage(o.formatter.FormatError(errText))
 		o.logEntry("error", errText)
 		return o.troubleshooting.AfterAgentText(o, errText)
@@ -530,7 +544,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		o.logEntry("tool_call", desc)
 
 	case api.MessageTypeToolCallResponse:
-		resultStr := fmt.Sprintf("%v", msg.Payload)
+		resultStr := sanitizeDisplayText(fmt.Sprintf("%v", msg.Payload))
 		masked := MaskSensitiveData(MaskSecretResource(resultStr))
 		refID := o.ctx.AddToolResult("tool", masked)
 		PrintMessage(o.formatter.FormatToolResult(masked, refID))
@@ -609,7 +623,7 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 	}
 
 	for {
-		input, err := getInputWithUIEcho("선택 (번호): ", o.cfg.HistoryFile)
+		input, err := getInputWithUIEchoNoHistory("선택 (번호): ", o.cfg.HistoryFile)
 		if err != nil {
 			if err == io.EOF {
 				activeAgent.SendInput(io.EOF)
