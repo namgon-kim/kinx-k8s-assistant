@@ -1,16 +1,19 @@
-# kubectl-ai MCP 클라이언트 설정
-# 경로: ~/.config/kubectl-ai/mcp.yaml
+# k8s-assistant MCP 클라이언트 설정 예시
+# 기본 경로: ~/.k8s-assistant/mcp.yaml
+#
+# --mcp-client 실행 시 이 파일에 선언된 서버만 kubectl-ai MCP 설정으로 동기화됩니다.
+# log-analyzer와 trouble-shooting은 모두 선택 사항이므로 필요한 서버만 남겨서 사용하세요.
 
 servers:
-  # log-analyzer MCP 서버
+  # log-analyzer MCP 서버 (선택)
   # 실행 방법: ./bin/log-analyzer-server --port 9090 --log-dir /var/log/filebeat
   - name: log-analyzer
     url: http://localhost:9090/mcp
     use_streaming: true
     timeout: 60
 
-  # trouble-shooting MCP 서버
-  # 실행 방법: ./bin/trouble-shooting-server --port 9091
+  # trouble-shooting MCP 서버 (선택)
+  # 실행 방법: ./bin/trouble-shooting-server --port 9091 --knowledge-provider qdrant
   - name: trouble-shooting
     url: http://localhost:9091/mcp
     use_streaming: true

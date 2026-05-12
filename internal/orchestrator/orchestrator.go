@@ -273,15 +273,16 @@ func getInputWithUIEcho(prompt, historyFile string) (string, error) {
 // Orchestrator는 kubectl-ai Agent를 래핑하여
 // 컨텍스트 관리, 마스킹, 포맷팅, propose/commit 플로우를 처리합니다.
 type Orchestrator struct {
-	cfg            *config.Config
-	agentWrap      *agent.AgentWrapper
-	outputCh       <-chan *api.Message
-	agentInitErr   error // agent 초기화 실패 원인 저장
-	ctx            *ConversationContext
-	formatter      *Formatter
-	logger         *Logger
-	rl             *readline.Instance
-	kubeconfigInfo *k8s.KubeconfigInfo
+	cfg             *config.Config
+	agentWrap       *agent.AgentWrapper
+	outputCh        <-chan *api.Message
+	agentInitErr    error // agent 초기화 실패 원인 저장
+	ctx             *ConversationContext
+	troubleshooting *TroubleshootingFlow
+	formatter       *Formatter
+	logger          *Logger
+	rl              *readline.Instance
+	kubeconfigInfo  *k8s.KubeconfigInfo
 }
 
 // New는 새 Orchestrator를 생성하고 초기화합니다.
@@ -338,13 +339,14 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 	}
 
 	return &Orchestrator{
-		cfg:            cfg,
-		agentWrap:      nil, // 나중에 필요할 때 생성
-		ctx:            NewConversationContext(),
-		formatter:      NewFormatter(cfg.ShowToolOutput),
-		logger:         logger,
-		rl:             rl,
-		kubeconfigInfo: kubeconfigInfo,
+		cfg:             cfg,
+		agentWrap:       nil, // 나중에 필요할 때 생성
+		ctx:             NewConversationContext(),
+		troubleshooting: NewTroubleshootingFlow(),
+		formatter:       NewFormatter(cfg.ShowToolOutput),
+		logger:          logger,
+		rl:              rl,
+		kubeconfigInfo:  kubeconfigInfo,
 	}, nil
 }
 
@@ -352,6 +354,13 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 // initialQuery가 비어 있으면 인터랙티브 모드로 동작합니다.
 func (o *Orchestrator) Run(ctx context.Context, initialQuery string) error {
 	PrintBanner(o.kubeconfigInfo, o.cfg.Kubeconfig)
+	if o.cfg.MCPClient {
+		if path, err := agent.PrepareKinxMCPClient(); err != nil {
+			return fmt.Errorf("MCP 클라이언트 준비 실패: %w", err)
+		} else {
+			klog.Infof("MCP 설정 준비 완료: %s", path)
+		}
+	}
 
 	initialQuery = strings.TrimSpace(initialQuery)
 	if initialQuery != "" {
@@ -501,6 +510,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		masked := MaskSensitiveData(text)
 		PrintMessage(o.formatter.FormatText(masked))
 		o.logEntry("response", masked)
+		return o.troubleshooting.AfterAgentText(o, masked)
 
 	case api.MessageTypeError:
 		errText, ok := msg.Payload.(string)
@@ -509,6 +519,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		}
 		PrintMessage(o.formatter.FormatError(errText))
 		o.logEntry("error", errText)
+		return o.troubleshooting.AfterAgentText(o, errText)
 
 	case api.MessageTypeToolCallRequest:
 		desc, ok := msg.Payload.(string)
@@ -524,6 +535,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		refID := o.ctx.AddToolResult("tool", masked)
 		PrintMessage(o.formatter.FormatToolResult(masked, refID))
 		o.logEntry("tool_result", fmt.Sprintf("[%s] %s", refID, masked))
+		o.troubleshooting.RecordEvidence(masked)
 
 	case api.MessageTypeUserInputRequest:
 		return o.handleAgentInputRequest()
@@ -543,6 +555,9 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 	activeAgent := o.agentWrap
 	if activeAgent == nil {
 		return nil
+	}
+	if handled, err := o.troubleshooting.BeforeUserInput(o, activeAgent); handled || err != nil {
+		return err
 	}
 
 	o.printStatusWarnings(true)
@@ -594,7 +609,7 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 	}
 
 	for {
-		input, err := getInputWithUIEcho("선택 (번호, y/n): ", o.cfg.HistoryFile)
+		input, err := getInputWithUIEcho("선택 (번호): ", o.cfg.HistoryFile)
 		if err != nil {
 			if err == io.EOF {
 				activeAgent.SendInput(io.EOF)

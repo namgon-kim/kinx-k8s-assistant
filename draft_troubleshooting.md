@@ -718,66 +718,47 @@ trouble_shooting:
     mcp_endpoint: /mcp
     timeout_seconds: 60
 
-  runbook:
-    enabled: true
-    dir: ./internal/troubleshooting/runbooks
-    reload_on_start: true
-    min_match_score: 60
-    max_cases: 5
-
   rag:
     enabled: true
-    provider: local            # local|endpoint
-    mode: hybrid              # keyword|vector|hybrid
-    top_k: 5
+    provider: qdrant           # local|endpoint|qdrant
+    mode: hybrid               # keyword|vector|hybrid
+    top_k: 11
     min_score: 0.65
     rerank_enabled: true
     max_context_chars: 12000
     include_sources: true
 
-    knowledge_base:
-      dir: ~/.k8s-assistant/troubleshooting/kb
-      export_dir: ~/.k8s-assistant/troubleshooting/exports
-      import_on_start: true
-      persist_index: true
-
-    chunking:
-      chunk_size: 1000
-      chunk_overlap: 150
-      split_by: markdown_section # markdown_section|paragraph|token
-
     embedding:
-      provider: openai          # openai|local|ollama
-      model: text-embedding-3-small
-      batch_size: 64
-      timeout_seconds: 30
+      url: http://1.201.177.120:4000
+      api_key: ""
+      model: bge-m3
+      vector_name: dense
+      vector_size: 1024
+      distance: Cosine
+      max_length: 1024
+      normalize_embeddings: true
 
-    vector_store:
-      provider: chromem         # chromem|chroma|qdrant
-      persist_dir: ~/.k8s-assistant/troubleshooting/vector
-      collection: troubleshooting_cases
+    qdrant:
+      url: http://localhost:6333
+      collection: k8s_troubleshooting_runbooks_v1
+      limit: 11
+      with_payload: true
+      with_vectors: false
+      search_params:
+        exact: true
 
-    keyword_search:
+    reranker:
       enabled: true
-      index_dir: ~/.k8s-assistant/troubleshooting/keyword
-      language: ko
+      url: http://1.201.177.120:4000
+      api_key: ""
+      model: bge-reranker-v2-m3
+      top_n: 3
+      max_length: 1024
+      use_fp16: true
+      normalize: true
 
-    endpoint:
-      url: ""                  # provider=endpoint일 때 search_knowledge POST 대상
-      api_key: ""              # Bearer token, 선택
-      timeout_seconds: 30
-
-  issue_export:
-    enabled: true
-    dir: ~/.k8s-assistant/troubleshooting/issues
-    format: markdown           # markdown|yaml|json
-    include_problem_signal: true
-    include_log_summary: true
-    include_metric_summary: true
-    include_plan: true
-    include_execution_result: true
-    include_raw_logs: false
-    mask_sensitive_data: true
+    # provider=endpoint는 Qdrant를 직접 붙이지 않고 별도 RAG API 서버에 위임할 때만 사용한다.
+    # 이 경우 endpoint.url/api_key/timeout_seconds를 설정하고 qdrant/embedding/reranker 블록은 서버 구현에 맡긴다.
 
   remediation:
     allow_auto_remediate: false
@@ -984,14 +965,41 @@ make build-k8s-assistant
 현재 코드에는 runbook 로딩이 `log-analyzer-server`에 남아 있다. 분리 후에는 `trouble-shooting-server`에서 runbook을 로딩한다.
 
 ```bash
+./bin/trouble-shooting-server
+```
+
+기본 설정 파일 경로는 `~/.k8s-assistant/trouble-shooting.yaml`이다. 예시 파일은 `config/trouble-shooting.yaml`에 있으며, 필요하면 명시적으로 지정할 수 있다.
+
+```bash
+./bin/trouble-shooting-server --config config/trouble-shooting.yaml
+```
+
+동일 설정은 개별 flag로도 재정의할 수 있다. CLI flag가 config file 값보다 우선한다.
+
+```bash
 ./bin/trouble-shooting-server \
   --port 9091 \
   --runbook-dir internal/troubleshooting/runbooks \
-  --rag-enabled \
+  --knowledge-provider qdrant \
+  --embedding-url http://1.201.177.120:4000 \
+  --reranker-enabled=true \
+  --reranker-url http://1.201.177.120:4000 \
   --rag-mode hybrid \
+  --qdrant-url http://localhost:6333 \
+  --qdrant-collection k8s_troubleshooting_runbooks_v1 \
   --knowledge-dir ~/.k8s-assistant/troubleshooting/kb \
-  --issue-export-dir ~/.k8s-assistant/troubleshooting/issues
+  --issue-dir ~/.k8s-assistant/troubleshooting/issues
 ```
+
+runbook을 Qdrant에 업로드할 때도 같은 설정 파일을 사용할 수 있다.
+이 업로드 도구는 현재 프로젝트 런타임 기능이 아니라 동작 검증과 초기 데이터 적재를 위한 helper다.
+Qdrant에는 vector가 저장되어야 하므로 업로드 과정에서 embedding endpoint를 호출한다.
+
+```bash
+./bin/troubleshooting-upload
+```
+
+예시 파일을 직접 지정하려면 `./bin/troubleshooting-upload --config config/trouble-shooting.yaml`처럼 실행한다.
 
 기대 출력:
 
@@ -1003,21 +1011,17 @@ trouble-shooting MCP server starting on port 9091
 
 ### 3. kubectl-ai MCP 설정 확인
 
-`~/.config/kubectl-ai/mcp.yaml`에 다음과 같은 서버 설정이 필요하다.
+`~/.k8s-assistant/mcp.yaml`에 사용할 MCP 서버만 선언한다. `log-analyzer`와 `trouble-shooting`은 모두 선택 사항이며, 이 파일에 있는 서버만 kubectl-ai MCP 설정으로 동기화된다.
 
 ```yaml
 servers:
-  - name: log-analyzer
-    url: http://localhost:9090/mcp
-    use_streaming: true
-    timeout: 60
   - name: trouble-shooting
     url: http://localhost:9091/mcp
     use_streaming: true
     timeout: 60
 ```
 
-프로젝트의 예시는 `config/mcp.yaml`에 있다.
+프로젝트의 예시는 `config/mcp.yaml`에 있다. 두 서버를 모두 쓰려면 두 항목을 모두 남기고, trouble-shooting만 쓰려면 `log-analyzer` 항목을 제거한다.
 
 ### 4. k8s-assistant에서 직접 runbook 매칭
 

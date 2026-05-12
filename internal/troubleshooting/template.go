@@ -8,15 +8,17 @@ import (
 
 func renderCommand(tmpl string, target diagnostic.KubernetesTarget, vars map[string]string) string {
 	replacements := map[string]string{
-		"cluster":    target.Cluster,
-		"context":    target.Context,
-		"namespace":  target.Namespace,
-		"kind":       target.Kind,
-		"name":       target.Name,
-		"pod_name":   firstNonEmpty(target.PodName, target.Name),
-		"container":  target.Container,
-		"owner_kind": target.OwnerKind,
-		"owner_name": target.OwnerName,
+		"cluster":        target.Cluster,
+		"context":        target.Context,
+		"namespace":      target.Namespace,
+		"kind":           target.Kind,
+		"name":           target.Name,
+		"pod_name":       firstNonEmpty(target.PodName, target.Name),
+		"container":      target.Container,
+		"container_name": target.Container,
+		"owner_kind":     target.OwnerKind,
+		"owner_name":     target.OwnerName,
+		"node_name":      vars["node_name"],
 	}
 	for k, v := range vars {
 		replacements[k] = v

@@ -1,0 +1,46 @@
+# trouble-shooting MCP server 설정 예시
+# 기본 경로:
+#   ~/.k8s-assistant/trouble-shooting.yaml
+# 실행 예:
+#   ./bin/trouble-shooting-server
+#   ./bin/troubleshooting-upload
+#     - helper tool: runbook text를 embedding한 뒤 Qdrant point로 업로드한다.
+
+trouble_shooting:
+  server:
+    port: 9091
+    import_on_start: true
+
+  rag:
+    provider: qdrant
+    mode: hybrid
+
+    embedding:
+      url: http://1.201.177.120:4000
+      api_key: ""
+      model: bge-m3
+      vector_name: dense
+      vector_size: 1024
+      distance: Cosine
+      max_length: 1024
+      normalize_embeddings: true
+
+    qdrant:
+      url: http://localhost:6333
+      api_key: ""
+      collection: k8s_troubleshooting_runbooks_v1
+      limit: 11
+      with_payload: true
+      with_vectors: false
+      search_params:
+        exact: true
+
+    reranker:
+      enabled: true
+      url: http://1.201.177.120:4000
+      api_key: ""
+      model: bge-reranker-v2-m3
+      top_n: 3
+      max_length: 1024
+      use_fp16: true
+      normalize: true

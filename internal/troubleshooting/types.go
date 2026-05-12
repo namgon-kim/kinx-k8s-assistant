@@ -16,6 +16,7 @@ type KnowledgeProvider string
 const (
 	KnowledgeProviderLocal    KnowledgeProvider = "local"
 	KnowledgeProviderEndpoint KnowledgeProvider = "endpoint"
+	KnowledgeProviderQdrant   KnowledgeProvider = "qdrant"
 )
 
 type RiskLevel string
@@ -44,19 +45,24 @@ type TroubleshootingSearchResult struct {
 }
 
 type TroubleshootingCase struct {
-	ID              string                     `json:"id" yaml:"id"`
-	Title           string                     `json:"title" yaml:"title"`
-	MatchTypes      []diagnostic.DetectionType `json:"match_types,omitempty" yaml:"match_types,omitempty"`
-	Similarity      float64                    `json:"similarity,omitempty" yaml:"similarity,omitempty"`
-	Cause           string                     `json:"cause,omitempty" yaml:"cause,omitempty"`
-	Resolution      string                     `json:"resolution,omitempty" yaml:"resolution,omitempty"`
-	DiagnosticSteps []PlanStep                 `json:"diagnostic_steps,omitempty" yaml:"diagnostic_steps,omitempty"`
-	RemediateSteps  []PlanStep                 `json:"remediate_steps,omitempty" yaml:"remediate_steps,omitempty"`
-	VerifySteps     []PlanStep                 `json:"verify_steps,omitempty" yaml:"verify_steps,omitempty"`
-	RollbackSteps   []PlanStep                 `json:"rollback_steps,omitempty" yaml:"rollback_steps,omitempty"`
-	RiskLevel       RiskLevel                  `json:"risk_level,omitempty" yaml:"risk_level,omitempty"`
-	Source          string                     `json:"source,omitempty" yaml:"source,omitempty"`
-	Tags            []string                   `json:"tags,omitempty" yaml:"tags,omitempty"`
+	ID               string                     `json:"id" yaml:"id"`
+	Title            string                     `json:"title" yaml:"title"`
+	MatchTypes       []diagnostic.DetectionType `json:"match_types,omitempty" yaml:"match_types,omitempty"`
+	Symptoms         []string                   `json:"symptoms,omitempty" yaml:"symptoms,omitempty"`
+	EvidenceKeywords []string                   `json:"evidence_keywords,omitempty" yaml:"evidence_keywords,omitempty"`
+	Similarity       float64                    `json:"similarity,omitempty" yaml:"similarity,omitempty"`
+	Cause            string                     `json:"cause,omitempty" yaml:"cause,omitempty"`
+	LikelyCauses     []string                   `json:"likely_causes,omitempty" yaml:"likely_causes,omitempty"`
+	Resolution       string                     `json:"resolution,omitempty" yaml:"resolution,omitempty"`
+	DecisionHints    []string                   `json:"decision_hints,omitempty" yaml:"decision_hints,omitempty"`
+	RelatedObjects   []string                   `json:"related_objects,omitempty" yaml:"related_objects,omitempty"`
+	DiagnosticSteps  []PlanStep                 `json:"diagnostic_steps,omitempty" yaml:"diagnostic_steps,omitempty"`
+	RemediateSteps   []PlanStep                 `json:"remediate_steps,omitempty" yaml:"remediate_steps,omitempty"`
+	VerifySteps      []PlanStep                 `json:"verify_steps,omitempty" yaml:"verify_steps,omitempty"`
+	RollbackSteps    []PlanStep                 `json:"rollback_steps,omitempty" yaml:"rollback_steps,omitempty"`
+	RiskLevel        RiskLevel                  `json:"risk_level,omitempty" yaml:"risk_level,omitempty"`
+	Source           string                     `json:"source,omitempty" yaml:"source,omitempty"`
+	Tags             []string                   `json:"tags,omitempty" yaml:"tags,omitempty"`
 }
 
 type RemediationPlanRequest struct {
@@ -129,16 +135,40 @@ type ValidationResult struct {
 }
 
 type Config struct {
-	RunbookDir        string
-	IssueDir          string
-	KnowledgeDir      string
-	SearchMode        SearchMode
-	KnowledgeProvider KnowledgeProvider
-	EndpointURL       string
-	EndpointAPIKey    string
-	EndpointTimeout   int
-	MinMatchScore     float64
-	MaxCases          int
-	MaskSensitive     bool
-	IncludeRawLogs    bool
+	RunbookDir          string
+	IssueDir            string
+	KnowledgeDir        string
+	SearchMode          SearchMode
+	KnowledgeProvider   KnowledgeProvider
+	EndpointURL         string
+	EndpointAPIKey      string
+	EndpointTimeout     int
+	EmbeddingBaseURL    string
+	EmbeddingAPIKey     string
+	EmbeddingModel      string
+	VectorName          string
+	VectorSize          int
+	Distance            string
+	EmbeddingMaxLength  int
+	NormalizeEmbeddings bool
+	QdrantURL           string
+	QdrantAPIKey        string
+	QdrantCollection    string
+	QdrantLimit         int
+	QdrantWithPayload   bool
+	QdrantWithVectors   bool
+	QdrantExact         bool
+	RerankerEnabled     bool
+	RerankerEnabledSet  bool
+	RerankerBaseURL     string
+	RerankerAPIKey      string
+	RerankerModel       string
+	RerankerTopN        int
+	RerankerMaxLength   int
+	RerankerUseFP16     bool
+	RerankerNormalize   bool
+	MinMatchScore       float64
+	MaxCases            int
+	MaskSensitive       bool
+	IncludeRawLogs      bool
 }

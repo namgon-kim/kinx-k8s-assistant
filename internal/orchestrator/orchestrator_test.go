@@ -90,6 +90,25 @@ func TestInputModelQuitIsPlainInput(t *testing.T) {
 	}
 }
 
+func TestLooksTroubleshootableIgnoresGenericUserProblemRequest(t *testing.T) {
+	if looksTroubleshootable("tests 네임스페이스의 pods의 문제를 해결해줘") {
+		t.Fatal("generic user problem request should not trigger troubleshooting offer")
+	}
+}
+
+func TestLooksTroubleshootableDetectsConcreteKubernetesFailure(t *testing.T) {
+	cases := []string{
+		"pod test-oom is in CrashLoopBackOff",
+		"Last State: Terminated Reason: OOMKilled",
+		"Back-off restarting failed container",
+	}
+	for _, tc := range cases {
+		if !looksTroubleshootable(tc) {
+			t.Fatalf("expected concrete failure to trigger troubleshooting: %q", tc)
+		}
+	}
+}
+
 func updateInputModelForTest(t *testing.T, m inputModel, msg tea.Msg) inputModel {
 	t.Helper()
 	updated, _ := m.Update(msg)

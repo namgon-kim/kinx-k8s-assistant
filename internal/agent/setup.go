@@ -96,6 +96,13 @@ func NewAgentWrapper(cfg *config.Config) (*AgentWrapper, error) {
 
 	// 프로바이더별 환경변수 설정
 	setupProviderEnv(cfg)
+	if cfg.MCPClient {
+		if path, err := PrepareKinxMCPClient(); err != nil {
+			return nil, fmt.Errorf("MCP 설정 준비 실패: %w", err)
+		} else {
+			klog.Infof("MCP 설정 준비 완료: %s", path)
+		}
+	}
 
 	// LLM 클라이언트 생성
 	llmClient, err := gollm.NewClient(ctx, cfg.LLMProvider)

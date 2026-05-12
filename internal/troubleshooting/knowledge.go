@@ -52,6 +52,11 @@ func (s *KnowledgeStore) Search(query string, max int) []TroubleshootingCase {
 func keywordScore(c TroubleshootingCase, query string) float64 {
 	text := strings.ToLower(strings.Join([]string{
 		c.ID, c.Title, c.Cause, c.Resolution, c.Source, strings.Join(c.Tags, " "),
+		strings.Join(c.Symptoms, " "),
+		strings.Join(c.EvidenceKeywords, " "),
+		strings.Join(c.LikelyCauses, " "),
+		strings.Join(c.DecisionHints, " "),
+		strings.Join(c.RelatedObjects, " "),
 	}, " "))
 	words := strings.Fields(strings.ToLower(query))
 	if len(words) == 0 {

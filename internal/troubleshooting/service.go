@@ -14,27 +14,35 @@ type Service struct {
 	runbooks  []TroubleshootingCase
 	knowledge *KnowledgeStore
 	endpoint  *EndpointClient
+	embedder  *EmbeddingClient
+	qdrant    *QdrantClient
+	reranker  *RerankerClient
 }
 
 func NewService(cfg Config, runbooks []TroubleshootingCase) *Service {
-	if cfg.MaxCases <= 0 {
-		cfg.MaxCases = 5
-	}
-	if cfg.SearchMode == "" {
-		cfg.SearchMode = SearchModeHybrid
-	}
-	if cfg.KnowledgeProvider == "" {
-		cfg.KnowledgeProvider = KnowledgeProviderLocal
-	}
+	cfg = ApplyDefaults(cfg)
 	var endpoint *EndpointClient
 	if cfg.KnowledgeProvider == KnowledgeProviderEndpoint {
 		endpoint = NewEndpointClient(cfg.EndpointURL, cfg.EndpointAPIKey, cfg.EndpointTimeout)
+	}
+	var embedder *EmbeddingClient
+	var qdrant *QdrantClient
+	var reranker *RerankerClient
+	if cfg.KnowledgeProvider == KnowledgeProviderQdrant {
+		embedder = NewEmbeddingClient(cfg)
+		qdrant = NewQdrantClient(cfg)
+		if cfg.RerankerEnabled {
+			reranker = NewRerankerClient(cfg)
+		}
 	}
 	return &Service{
 		cfg:       cfg,
 		runbooks:  runbooks,
 		knowledge: NewKnowledgeStore(),
 		endpoint:  endpoint,
+		embedder:  embedder,
+		qdrant:    qdrant,
+		reranker:  reranker,
 	}
 }
 
@@ -61,6 +69,33 @@ func (s *Service) MatchRunbook(ctx context.Context, req TroubleshootingSearchReq
 func (s *Service) SearchKnowledge(ctx context.Context, req TroubleshootingSearchRequest) (*TroubleshootingSearchResult, error) {
 	if s.cfg.KnowledgeProvider == KnowledgeProviderEndpoint {
 		return s.endpoint.Search(ctx, req)
+	}
+	if s.cfg.KnowledgeProvider == KnowledgeProviderQdrant {
+		query := buildQuery(req)
+		vector, err := s.embedder.Embed(ctx, truncateText(query, s.cfg.EmbeddingMaxLength), s.cfg)
+		if err != nil {
+			return nil, err
+		}
+		cases, err := s.qdrant.Search(ctx, s.cfg, vector)
+		if err != nil {
+			return nil, err
+		}
+		if s.reranker != nil && len(cases) > 0 {
+			if reranked, err := s.reranker.Rerank(ctx, query, cases, s.cfg); err == nil {
+				cases = reranked
+			}
+		}
+		conf := diagnostic.ConfidenceSpeculate
+		if len(cases) > 0 {
+			conf = confidenceForScore(cases[0].Similarity)
+		}
+		return &TroubleshootingSearchResult{
+			Query:      query,
+			Cases:      cases,
+			Confidence: conf,
+			Summary:    summarizeCases(cases),
+			SearchMode: SearchModeHybrid,
+		}, nil
 	}
 
 	max := req.TopK

@@ -4,50 +4,259 @@ cases:
     match_types:
       - CrashLoopBackOff
       - OOMKilled
-    cause: "컨테이너 메모리 사용량이 limit을 초과해 OOMKilled가 발생했을 가능성이 높습니다."
-    resolution: "이벤트와 메모리 사용 추이를 확인한 뒤 memory request/limit 조정 또는 애플리케이션 메모리 사용량 개선을 진행합니다."
+      - Reason: OOMKilled
+      - Exit Code: 137
+    symptoms:
+      - "Pod 상태가 CrashLoopBackOff로 반복 전환됨"
+      - "kubectl describe pod 결과 Last State가 Terminated이고 Reason이 OOMKilled임"
+      - "컨테이너 restartCount가 지속 증가함"
+      - "로그가 중간에 끊기거나 JVM/Go/Python 애플리케이션이 메모리 부족 상태를 보임"
+    evidence_keywords:
+      - "OOMKilled"
+      - "exit code 137"
+      - "Last State: Terminated"
+      - "Reason: OOMKilled"
+      - "Back-off restarting failed container"
+      - "memory limit"
+      - "container_memory_working_set_bytes"
+    cause: "컨테이너 메모리 사용량이 memory limit을 초과하여 kubelet 또는 커널 OOM killer에 의해 종료되었을 가능성이 높습니다."
+    likely_causes:
+      - "memory limit이 실제 사용량보다 낮음"
+      - "애플리케이션 메모리 누수"
+      - "트래픽 증가 또는 배치 작업으로 인한 일시적 메모리 급증"
+      - "JVM heap, Python worker, Node.js memory 옵션이 컨테이너 limit과 맞지 않음"
+      - "sidecar 포함 전체 Pod 메모리 사용량 고려 부족"
+    resolution: "이벤트, 이전 로그, 메모리 사용 추이, limit 설정을 확인한 뒤 memory request/limit 조정 또는 애플리케이션 메모리 사용량 개선을 진행합니다."
+    decision_hints:
+      - "Reason이 OOMKilled이고 Exit Code가 137이면 메모리 limit 초과 가능성이 높음"
+      - "limit이 없는데 OOM이 발생했다면 Node 메모리 압박 또는 system OOM 가능성도 확인"
+      - "restartCount가 증가하지만 OOMKilled가 없다면 probe 실패, 앱 크래시, 설정 오류도 함께 확인"
+    related_objects:
+      - Pod
+      - Deployment
+      - ReplicaSet
+      - StatefulSet
+      - Node
+      - Event
+      - Metrics
     diagnostic_steps:
       - type: diagnostic
-        description: "Pod 이벤트와 종료 사유 확인"
+        description: "Pod 상태, 이벤트, 종료 사유 확인"
         command_template: "kubectl describe pod {{pod_name}} -n {{namespace}}"
         automatic_candidate: true
         requires_confirmation: false
       - type: diagnostic
         description: "이전 컨테이너 로그 확인"
-        command_template: "kubectl logs {{pod_name}} -n {{namespace}} --previous --tail=200"
+        command_template: "kubectl logs {{pod_name}} -n {{namespace}} -c {{container_name}} --previous --tail=200"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "현재 컨테이너 로그 확인"
+        command_template: "kubectl logs {{pod_name}} -n {{namespace}} -c {{container_name}} --tail=200"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Pod 리소스 request/limit 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}} -o jsonpath='{.spec.containers[*].resources}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Pod 메모리 사용량 확인"
+        command_template: "kubectl top pod {{pod_name}} -n {{namespace}} --containers"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Node 메모리 압박 상태 확인"
+        command_template: "kubectl describe node {{node_name}}"
         automatic_candidate: true
         requires_confirmation: false
     remediate_steps:
       - type: remediate
-        description: "워크로드 memory limit 조정"
-        command_template: "kubectl set resources {{owner_kind}}/{{owner_name}} -n {{namespace}} --limits=memory={{memory_limit}}"
+        description: "워크로드 memory request/limit 조정"
+        command_template: "kubectl set resources {{owner_kind}}/{{owner_name}} -n {{namespace}} --requests=memory={{memory_request}} --limits=memory={{memory_limit}}"
         automatic_candidate: false
         requires_confirmation: true
         variables:
+          memory_request: "1Gi"
           memory_limit: "2Gi"
+      - type: remediate
+        description: "JVM 애플리케이션 heap 제한 조정"
+        command_template: "kubectl set env {{owner_kind}}/{{owner_name}} -n {{namespace}} JAVA_TOOL_OPTIONS='-XX:MaxRAMPercentage={{max_ram_percentage}}'"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          max_ram_percentage: "75"
     verify_steps:
       - type: verify
-        description: "재시작 횟수와 상태 확인"
+        description: "Pod 재시작 횟수와 상태 확인"
         command_template: "kubectl get pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: verify
+        description: "rollout 상태 확인"
+        command_template: "kubectl rollout status {{owner_kind}}/{{owner_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: verify
+        description: "메모리 사용량 안정화 확인"
+        command_template: "kubectl top pod {{pod_name}} -n {{namespace}} --containers"
         automatic_candidate: true
         requires_confirmation: false
     rollback_steps:
       - type: rollback
-        description: "이전 ReplicaSet으로 롤백"
+        description: "이전 ReplicaSet 또는 revision으로 롤백"
         command_template: "kubectl rollout undo {{owner_kind}}/{{owner_name}} -n {{namespace}}"
         automatic_candidate: false
         requires_confirmation: true
     risk_level: medium
     source: "internal-runbook"
-    tags: ["oom", "memory", "crashloop"]
+    tags: ["oom", "memory", "crashloop", "exit-137", "resource-limit"]
+
+  - id: crashloop-app-error
+    title: "CrashLoopBackOff - Application Error"
+    match_types:
+      - CrashLoopBackOff
+      - Error
+      - StartError
+      - Back-off restarting failed container
+    symptoms:
+      - "Pod가 Running으로 올라온 뒤 곧바로 재시작됨"
+      - "OOMKilled가 아닌 Error, Completed, StartError 등으로 종료됨"
+      - "애플리케이션 로그에 panic, exception, config error, connection refused 등이 나타남"
+    evidence_keywords:
+      - "Back-off restarting failed container"
+      - "Error"
+      - "panic"
+      - "exception"
+      - "failed to load config"
+      - "connection refused"
+      - "no such file or directory"
+      - "permission denied"
+    cause: "애플리케이션 시작 실패, 설정 오류, 의존 서비스 연결 실패, 파일/권한 문제, command/args 오류 등으로 컨테이너가 반복 종료되는 상태입니다."
+    likely_causes:
+      - "잘못된 command 또는 args"
+      - "필수 환경변수 누락"
+      - "ConfigMap 또는 Secret 누락"
+      - "외부 DB, Redis, MQ 등 의존 서비스 연결 실패"
+      - "볼륨 마운트 경로 또는 파일 권한 오류"
+      - "애플리케이션 버그 또는 이미지 변경"
+    resolution: "이전 로그와 이벤트를 기준으로 애플리케이션 종료 원인을 식별하고 설정, Secret, command, 의존 서비스 연결성을 수정합니다."
+    decision_hints:
+      - "OOMKilled가 없고 로그에 stack trace가 있으면 애플리케이션 레벨 문제 가능성이 높음"
+      - "CreateContainerConfigError와 함께 발생하면 ConfigMap/Secret 참조 오류 가능성이 높음"
+      - "컨테이너가 즉시 종료되면 command/args, entrypoint, 필수 파일 존재 여부를 우선 확인"
+    related_objects:
+      - Pod
+      - Deployment
+      - ConfigMap
+      - Secret
+      - Service
+      - EndpointSlice
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Pod 이벤트와 종료 상태 확인"
+        command_template: "kubectl describe pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "이전 컨테이너 로그 확인"
+        command_template: "kubectl logs {{pod_name}} -n {{namespace}} -c {{container_name}} --previous --tail=300"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "워크로드 command/args/env 확인"
+        command_template: "kubectl get {{owner_kind}} {{owner_name}} -n {{namespace}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "참조 중인 ConfigMap 확인"
+        command_template: "kubectl get configmap -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "참조 중인 Secret 확인"
+        command_template: "kubectl get secret -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    remediate_steps:
+      - type: remediate
+        description: "수정된 manifest 적용"
+        command_template: "kubectl apply -f {{manifest_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          manifest_path: "./deployment.yaml"
+      - type: remediate
+        description: "이전 정상 이미지로 롤백"
+        command_template: "kubectl rollout undo {{owner_kind}}/{{owner_name}} -n {{namespace}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    verify_steps:
+      - type: verify
+        description: "Pod 상태와 재시작 횟수 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: verify
+        description: "rollout 상태 확인"
+        command_template: "kubectl rollout status {{owner_kind}}/{{owner_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    rollback_steps:
+      - type: rollback
+        description: "manifest 적용 전 revision으로 롤백"
+        command_template: "kubectl rollout undo {{owner_kind}}/{{owner_name}} -n {{namespace}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    risk_level: medium
+    source: "internal-runbook"
+    tags: ["crashloop", "application-error", "config", "secret", "env"]
 
   - id: image-pull-backoff
     title: "ImagePullBackOff / ErrImagePull"
     match_types:
       - ImagePullBackOff
       - ErrImagePull
-    cause: "이미지 이름, 태그, 레지스트리 인증 또는 네트워크 문제로 이미지를 가져오지 못하는 상태입니다."
-    resolution: "Pod 이벤트에서 pull 실패 이유를 확인하고 이미지 경로, 태그, imagePullSecret, 레지스트리 접근성을 검증합니다."
+      - pull access denied
+      - manifest unknown
+      - unauthorized
+      - i/o timeout
+    symptoms:
+      - "Pod가 Running으로 전환되지 않고 ImagePullBackOff 또는 ErrImagePull 상태에 머무름"
+      - "이벤트에 이미지 pull 실패 사유가 출력됨"
+      - "동일 이미지가 다른 노드나 네임스페이스에서는 정상 동작할 수 있음"
+    evidence_keywords:
+      - "ImagePullBackOff"
+      - "ErrImagePull"
+      - "manifest unknown"
+      - "pull access denied"
+      - "unauthorized"
+      - "no basic auth credentials"
+      - "TLS handshake timeout"
+      - "i/o timeout"
+      - "x509: certificate signed by unknown authority"
+    cause: "이미지 이름, 태그, 레지스트리 인증, imagePullSecret, 네트워크, DNS, 사설 인증서 문제로 이미지를 가져오지 못하는 상태입니다."
+    likely_causes:
+      - "이미지 경로 또는 태그 오타"
+      - "이미지가 레지스트리에 존재하지 않음"
+      - "private registry 인증 정보 누락 또는 만료"
+      - "imagePullSecret이 ServiceAccount에 연결되지 않음"
+      - "노드에서 레지스트리 DNS 해석 또는 네트워크 접근 불가"
+      - "사설 레지스트리 CA 인증서 미설정"
+      - "레지스트리 rate limit 또는 장애"
+    resolution: "Pod 이벤트에서 pull 실패 이유를 확인하고 이미지 경로, 태그, imagePullSecret, ServiceAccount, 노드의 레지스트리 접근성을 검증합니다."
+    decision_hints:
+      - "manifest unknown이면 이미지 태그 또는 레포지토리 존재 여부를 우선 확인"
+      - "unauthorized 또는 no basic auth credentials이면 imagePullSecret 문제 가능성이 높음"
+      - "timeout이면 노드 네트워크, DNS, 프록시, 방화벽 문제 가능성이 높음"
+      - "x509 오류이면 사설 CA 인증서 설정 문제 가능성이 높음"
+    related_objects:
+      - Pod
+      - Deployment
+      - Secret
+      - ServiceAccount
+      - Node
+      - Registry
     diagnostic_steps:
       - type: diagnostic
         description: "Pod 이벤트에서 이미지 pull 실패 이유 확인"
@@ -55,35 +264,105 @@ cases:
         automatic_candidate: true
         requires_confirmation: false
       - type: diagnostic
-        description: "대상 네임스페이스의 imagePullSecret 확인"
+        description: "Pod에 설정된 image와 imagePullSecrets 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}} -o jsonpath='{.spec.containers[*].image}{\"\\n\"}{.spec.imagePullSecrets}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "네임스페이스의 imagePullSecret 확인"
         command_template: "kubectl get secret -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "ServiceAccount의 imagePullSecrets 확인"
+        command_template: "kubectl get serviceaccount {{service_account}} -n {{namespace}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Pod가 배치된 Node 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}} -o wide"
         automatic_candidate: true
         requires_confirmation: false
     remediate_steps:
       - type: remediate
-        description: "잘못된 이미지 태그 또는 secret을 수정한 manifest 적용"
-        command_template: "kubectl apply -f {{manifest_path}}"
+        description: "이미지 태그 수정"
+        command_template: "kubectl set image {{owner_kind}}/{{owner_name}} {{container_name}}={{image}} -n {{namespace}}"
         automatic_candidate: false
         requires_confirmation: true
         variables:
-          manifest_path: "./deployment.yaml"
+          image: "registry.example.com/app:stable"
+      - type: remediate
+        description: "imagePullSecret을 ServiceAccount에 연결"
+        command_template: "kubectl patch serviceaccount {{service_account}} -n {{namespace}} -p '{\"imagePullSecrets\":[{\"name\":\"{{image_pull_secret}}\"}]}'"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          image_pull_secret: "registry-secret"
     verify_steps:
       - type: verify
         description: "Pod 상태 재확인"
         command_template: "kubectl get pod {{pod_name}} -n {{namespace}}"
         automatic_candidate: true
         requires_confirmation: false
+      - type: verify
+        description: "이벤트 재확인"
+        command_template: "kubectl get event -n {{namespace}} --sort-by=.lastTimestamp"
+        automatic_candidate: true
+        requires_confirmation: false
+    rollback_steps:
+      - type: rollback
+        description: "이전 이미지 revision으로 롤백"
+        command_template: "kubectl rollout undo {{owner_kind}}/{{owner_name}} -n {{namespace}}"
+        automatic_candidate: false
+        requires_confirmation: true
     risk_level: low
     source: "internal-runbook"
-    tags: ["image", "registry", "pull"]
+    tags: ["image", "registry", "pull", "secret", "imagepullbackoff"]
 
   - id: pending-failed-scheduling
     title: "Pending / FailedScheduling"
     match_types:
       - Pending
       - FailedScheduling
-    cause: "노드 리소스 부족, nodeSelector/taint/toleration 불일치, PVC 미바인딩 등으로 스케줄링이 실패했을 수 있습니다."
-    resolution: "이벤트와 노드/PVC 상태를 확인한 뒤 리소스 요청 조정, 노드 증설, 스케줄링 조건 수정을 검토합니다."
+      - Insufficient cpu
+      - Insufficient memory
+      - node(s) had untolerated taint
+      - node affinity
+      - pod has unbound immediate PersistentVolumeClaims
+    symptoms:
+      - "Pod가 Pending 상태에서 Running으로 전환되지 않음"
+      - "이벤트에 FailedScheduling 메시지가 반복됨"
+      - "특정 노드 조건, taint, affinity, PVC 문제로 스케줄러가 배치하지 못함"
+    evidence_keywords:
+      - "FailedScheduling"
+      - "Insufficient cpu"
+      - "Insufficient memory"
+      - "untolerated taint"
+      - "didn't match Pod's node affinity"
+      - "didn't match Pod's node selector"
+      - "unbound immediate PersistentVolumeClaims"
+      - "Too many pods"
+    cause: "노드 리소스 부족, nodeSelector/affinity 불일치, taint/toleration 불일치, PVC 미바인딩, Pod density 제한 등으로 스케줄링이 실패한 상태입니다."
+    likely_causes:
+      - "CPU 또는 memory request가 클러스터 가용 리소스보다 큼"
+      - "nodeSelector 또는 nodeAffinity가 실제 노드 라벨과 맞지 않음"
+      - "노드 taint에 대응하는 toleration이 없음"
+      - "PVC가 Bound 상태가 아님"
+      - "노드별 최대 Pod 수 제한에 도달"
+      - "TopologySpreadConstraints 또는 anti-affinity 조건이 과도함"
+    resolution: "스케줄링 이벤트를 기준으로 리소스, 노드 라벨, taint/toleration, PVC 상태, affinity 조건을 확인한 뒤 request 조정, 노드 증설, 스케줄링 조건 수정을 검토합니다."
+    decision_hints:
+      - "Insufficient cpu/memory이면 request와 node allocatable 비교"
+      - "untolerated taint이면 toleration 추가 또는 taint 제거 검토"
+      - "node affinity mismatch이면 노드 라벨과 affinity 조건 비교"
+      - "unbound PVC이면 StorageClass, PV provisioning, PVC 이벤트 확인"
+    related_objects:
+      - Pod
+      - Node
+      - PVC
+      - PV
+      - StorageClass
+      - Scheduler
     diagnostic_steps:
       - type: diagnostic
         description: "스케줄링 실패 이벤트 확인"
@@ -91,8 +370,13 @@ cases:
         automatic_candidate: true
         requires_confirmation: false
       - type: diagnostic
-        description: "노드 리소스 확인"
+        description: "노드 리소스와 taint 확인"
         command_template: "kubectl describe nodes"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "노드 라벨 확인"
+        command_template: "kubectl get nodes --show-labels"
         automatic_candidate: true
         requires_confirmation: false
       - type: diagnostic
@@ -100,9 +384,22 @@ cases:
         command_template: "kubectl get pvc -n {{namespace}}"
         automatic_candidate: true
         requires_confirmation: false
+      - type: diagnostic
+        description: "Pod 스케줄링 조건 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}} -o jsonpath='{.spec.nodeSelector}{\"\\n\"}{.spec.affinity}{\"\\n\"}{.spec.tolerations}'"
+        automatic_candidate: true
+        requires_confirmation: false
     remediate_steps:
       - type: remediate
-        description: "리소스 request 조정 또는 스케줄링 조건 수정"
+        description: "워크로드 리소스 request 조정"
+        command_template: "kubectl set resources {{owner_kind}}/{{owner_name}} -n {{namespace}} --requests=cpu={{cpu_request}},memory={{memory_request}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          cpu_request: "500m"
+          memory_request: "512Mi"
+      - type: remediate
+        description: "워크로드 스케줄링 조건 수정"
         command_template: "kubectl edit {{owner_kind}}/{{owner_name}} -n {{namespace}}"
         automatic_candidate: false
         requires_confirmation: true
@@ -112,6 +409,738 @@ cases:
         command_template: "kubectl get pod {{pod_name}} -n {{namespace}} -w"
         automatic_candidate: true
         requires_confirmation: false
+      - type: verify
+        description: "스케줄링 이벤트 재확인"
+        command_template: "kubectl get event -n {{namespace}} --sort-by=.lastTimestamp"
+        automatic_candidate: true
+        requires_confirmation: false
+    rollback_steps:
+      - type: rollback
+        description: "스케줄링 조건 수정 전 revision으로 롤백"
+        command_template: "kubectl rollout undo {{owner_kind}}/{{owner_name}} -n {{namespace}}"
+        automatic_candidate: false
+        requires_confirmation: true
     risk_level: medium
     source: "internal-runbook"
-    tags: ["scheduling", "pending", "resources"]
+    tags: ["scheduling", "pending", "resources", "taint", "affinity", "pvc"]
+
+  - id: probe-failure
+    title: "Readiness/Liveness Probe Failure"
+    match_types:
+      - Unhealthy
+      - Readiness probe failed
+      - Liveness probe failed
+      - Startup probe failed
+    symptoms:
+      - "Pod는 Running이지만 Ready 상태가 false임"
+      - "Service endpoint에 Pod가 포함되지 않음"
+      - "liveness probe 실패로 컨테이너가 반복 재시작됨"
+      - "startup probe 실패로 애플리케이션이 초기화 전에 종료됨"
+    evidence_keywords:
+      - "Readiness probe failed"
+      - "Liveness probe failed"
+      - "Startup probe failed"
+      - "connection refused"
+      - "context deadline exceeded"
+      - "HTTP probe failed"
+      - "Back-off restarting failed container"
+    cause: "Probe 경로, 포트, 지연 시간, timeout, 애플리케이션 초기화 시간, 의존 서비스 상태가 실제 애플리케이션 동작과 맞지 않아 헬스체크가 실패하는 상태입니다."
+    likely_causes:
+      - "probe port 또는 path 오설정"
+      - "애플리케이션 기동 시간이 initialDelaySeconds보다 김"
+      - "timeoutSeconds가 너무 짧음"
+      - "readiness가 외부 의존 서비스 상태에 과도하게 의존"
+      - "컨테이너 내부에서는 정상이나 Pod IP 접근이 실패"
+      - "인증이 필요한 endpoint를 probe 대상으로 사용"
+    resolution: "Probe 이벤트와 애플리케이션 로그를 확인하고 path, port, scheme, initialDelaySeconds, timeoutSeconds, failureThreshold를 실제 기동 특성에 맞게 조정합니다."
+    decision_hints:
+      - "Readiness 실패는 트래픽 제외 문제를 유발하지만 컨테이너를 재시작하지 않음"
+      - "Liveness 실패는 컨테이너 재시작을 유발함"
+      - "Startup probe가 없고 앱 기동이 느리면 liveness가 너무 일찍 실패할 수 있음"
+    related_objects:
+      - Pod
+      - Deployment
+      - Service
+      - EndpointSlice
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Probe 실패 이벤트 확인"
+        command_template: "kubectl describe pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "컨테이너 로그 확인"
+        command_template: "kubectl logs {{pod_name}} -n {{namespace}} -c {{container_name}} --tail=300"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "워크로드 probe 설정 확인"
+        command_template: "kubectl get {{owner_kind}} {{owner_name}} -n {{namespace}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Pod 내부에서 probe endpoint 확인"
+        command_template: "kubectl exec -n {{namespace}} {{pod_name}} -c {{container_name}} -- wget -qO- {{probe_url}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          probe_url: "http://127.0.0.1:8080/healthz"
+    remediate_steps:
+      - type: remediate
+        description: "probe 설정을 수정한 manifest 적용"
+        command_template: "kubectl apply -f {{manifest_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          manifest_path: "./deployment.yaml"
+    verify_steps:
+      - type: verify
+        description: "Ready 상태 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: verify
+        description: "Service endpoint 포함 여부 확인"
+        command_template: "kubectl get endpointslice -n {{namespace}} -l kubernetes.io/service-name={{service_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    rollback_steps:
+      - type: rollback
+        description: "probe 수정 전 revision으로 롤백"
+        command_template: "kubectl rollout undo {{owner_kind}}/{{owner_name}} -n {{namespace}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    risk_level: medium
+    source: "internal-runbook"
+    tags: ["probe", "readiness", "liveness", "startup", "healthcheck"]
+
+  - id: create-container-config-error
+    title: "CreateContainerConfigError - ConfigMap/Secret Missing"
+    match_types:
+      - CreateContainerConfigError
+      - CreateContainerError
+      - configmap not found
+      - secret not found
+      - couldn't find key
+    symptoms:
+      - "Pod가 컨테이너 생성 단계에서 멈춤"
+      - "컨테이너 로그가 생성되지 않거나 kubectl logs가 실패함"
+      - "이벤트에 ConfigMap, Secret, key 누락 메시지가 표시됨"
+    evidence_keywords:
+      - "CreateContainerConfigError"
+      - "configmap not found"
+      - "secret not found"
+      - "couldn't find key"
+      - "references non-existent secret key"
+      - "Error: secret"
+      - "Error: configmap"
+    cause: "Pod spec에서 참조하는 ConfigMap, Secret 또는 특정 key가 존재하지 않아 kubelet이 컨테이너 설정을 구성하지 못하는 상태입니다."
+    likely_causes:
+      - "ConfigMap 또는 Secret 생성 누락"
+      - "네임스페이스 불일치"
+      - "key 이름 오타"
+      - "Helm values 또는 Kustomize patch 오류"
+      - "배포 순서 문제"
+    resolution: "Pod 이벤트와 manifest를 확인하여 누락된 ConfigMap/Secret/key를 생성하거나 참조 이름을 수정합니다."
+    decision_hints:
+      - "컨테이너가 시작되지 않았기 때문에 애플리케이션 로그보다 describe pod 이벤트가 우선"
+      - "Secret과 ConfigMap은 Pod와 같은 네임스페이스에 있어야 함"
+      - "optional: true가 아니면 참조 대상 누락 시 컨테이너 생성이 실패함"
+    related_objects:
+      - Pod
+      - ConfigMap
+      - Secret
+      - Deployment
+      - StatefulSet
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Pod 이벤트에서 누락된 참조 확인"
+        command_template: "kubectl describe pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Pod env/envFrom/volume 참조 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "ConfigMap 목록 확인"
+        command_template: "kubectl get configmap -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Secret 목록 확인"
+        command_template: "kubectl get secret -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    remediate_steps:
+      - type: remediate
+        description: "누락된 ConfigMap 생성"
+        command_template: "kubectl create configmap {{configmap_name}} -n {{namespace}} --from-literal={{key}}={{value}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          configmap_name: "app-config"
+          key: "APP_MODE"
+          value: "production"
+      - type: remediate
+        description: "누락된 Secret 생성"
+        command_template: "kubectl create secret generic {{secret_name}} -n {{namespace}} --from-literal={{key}}={{value}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          secret_name: "app-secret"
+          key: "PASSWORD"
+          value: "change-me"
+    verify_steps:
+      - type: verify
+        description: "Pod 재생성 후 상태 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: verify
+        description: "이벤트 재확인"
+        command_template: "kubectl get event -n {{namespace}} --sort-by=.lastTimestamp"
+        automatic_candidate: true
+        requires_confirmation: false
+    rollback_steps:
+      - type: rollback
+        description: "잘못 생성한 ConfigMap 삭제"
+        command_template: "kubectl delete configmap {{configmap_name}} -n {{namespace}}"
+        automatic_candidate: false
+        requires_confirmation: true
+      - type: rollback
+        description: "잘못 생성한 Secret 삭제"
+        command_template: "kubectl delete secret {{secret_name}} -n {{namespace}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    risk_level: low
+    source: "internal-runbook"
+    tags: ["configmap", "secret", "createcontainerconfigerror", "env", "volume"]
+
+  - id: pvc-pending-or-mount-failed
+    title: "PVC Pending / Volume Mount Failed"
+    match_types:
+      - PersistentVolumeClaim is not bound
+      - FailedMount
+      - FailedAttachVolume
+      - Unable to attach or mount volumes
+      - pod has unbound immediate PersistentVolumeClaims
+    symptoms:
+      - "PVC가 Pending 상태에 머무름"
+      - "Pod가 ContainerCreating 또는 Pending 상태에서 진행되지 않음"
+      - "이벤트에 FailedMount, FailedAttachVolume, unbound PVC 메시지가 반복됨"
+    evidence_keywords:
+      - "FailedMount"
+      - "FailedAttachVolume"
+      - "unbound immediate PersistentVolumeClaims"
+      - "PersistentVolumeClaim is not bound"
+      - "waiting for a volume to be created"
+      - "Multi-Attach error"
+      - "timed out waiting for the condition"
+    cause: "StorageClass, PV provisioning, CSI driver, zone/topology, accessMode, attach 제한, 노드-스토리지 연결 문제로 볼륨이 바인딩 또는 마운트되지 않는 상태입니다."
+    likely_causes:
+      - "StorageClass가 존재하지 않거나 default가 아님"
+      - "CSI provisioner 장애"
+      - "스토리지 backend quota 부족"
+      - "PVC accessMode와 워크로드 배치 방식 불일치"
+      - "ReadWriteOnce 볼륨을 여러 노드에서 동시에 사용하려 함"
+      - "PV nodeAffinity와 Pod 스케줄링 노드가 맞지 않음"
+      - "볼륨 attach/detach 지연"
+    resolution: "PVC, PV, StorageClass, CSI Pod, 이벤트를 확인하고 provisioning 실패 원인, attach 제한, accessMode, topology 조건을 수정합니다."
+    decision_hints:
+      - "PVC Pending이면 StorageClass와 provisioner 이벤트를 우선 확인"
+      - "FailedMount이면 kubelet, CSI node plugin, Secret/permission 문제도 확인"
+      - "Multi-Attach error이면 RWO 볼륨이 다른 노드에 붙어있는지 확인"
+    related_objects:
+      - PVC
+      - PV
+      - StorageClass
+      - Pod
+      - Node
+      - CSIController
+      - CSINode
+    diagnostic_steps:
+      - type: diagnostic
+        description: "PVC 상태 확인"
+        command_template: "kubectl describe pvc {{pvc_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "PV 상태 확인"
+        command_template: "kubectl get pv"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "StorageClass 확인"
+        command_template: "kubectl get storageclass"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Pod 볼륨 이벤트 확인"
+        command_template: "kubectl describe pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "CSI 관련 Pod 상태 확인"
+        command_template: "kubectl get pod -A | grep -i csi"
+        automatic_candidate: true
+        requires_confirmation: false
+    remediate_steps:
+      - type: remediate
+        description: "수정된 PVC 또는 StorageClass manifest 적용"
+        command_template: "kubectl apply -f {{manifest_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          manifest_path: "./storage.yaml"
+      - type: remediate
+        description: "문제 Pod 재생성"
+        command_template: "kubectl delete pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    verify_steps:
+      - type: verify
+        description: "PVC Bound 상태 확인"
+        command_template: "kubectl get pvc {{pvc_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: verify
+        description: "Pod Running 상태 확인"
+        command_template: "kubectl get pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    rollback_steps:
+      - type: rollback
+        description: "적용한 storage manifest 변경 롤백"
+        command_template: "kubectl delete -f {{manifest_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    risk_level: high
+    source: "internal-runbook"
+    tags: ["pvc", "pv", "storageclass", "csi", "mount", "attach"]
+
+  - id: service-no-endpoints
+    title: "Service Has No Endpoints"
+    match_types:
+      - no endpoints
+      - endpoints empty
+      - connection refused
+      - service unavailable
+      - 503
+    symptoms:
+      - "Service로 접근 시 503, connection refused, timeout 발생"
+      - "Service는 존재하지만 Endpoints 또는 EndpointSlice가 비어 있음"
+      - "Pod는 Running이지만 Ready가 false이거나 label selector가 맞지 않음"
+    evidence_keywords:
+      - "endpoints: <none>"
+      - "EndpointSlice"
+      - "Ready: False"
+      - "selector"
+      - "503 Service Unavailable"
+      - "connection refused"
+    cause: "Service selector와 Pod label 불일치, readiness 실패, targetPort 오설정, Pod 미기동으로 인해 Service가 트래픽을 전달할 endpoint를 찾지 못하는 상태입니다."
+    likely_causes:
+      - "Service selector와 Pod label이 일치하지 않음"
+      - "Pod readiness probe 실패"
+      - "targetPort가 컨테이너 listen port와 다름"
+      - "Pod가 다른 네임스페이스에 있음"
+      - "Deployment rollout 실패로 Ready Pod가 없음"
+    resolution: "Service selector, Pod label, EndpointSlice, readiness 상태, targetPort를 확인하여 Service가 올바른 Pod를 선택하도록 수정합니다."
+    decision_hints:
+      - "EndpointSlice가 비어 있으면 selector/label 또는 readiness 문제 가능성이 높음"
+      - "Endpoint는 있는데 접속이 안 되면 targetPort, NetworkPolicy, 애플리케이션 listen address 확인"
+      - "Pod가 127.0.0.1에만 바인딩하면 Service 경유 접근이 실패할 수 있음"
+    related_objects:
+      - Service
+      - Pod
+      - EndpointSlice
+      - Deployment
+      - NetworkPolicy
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Service selector와 port 확인"
+        command_template: "kubectl describe service {{service_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "EndpointSlice 확인"
+        command_template: "kubectl get endpointslice -n {{namespace}} -l kubernetes.io/service-name={{service_name}} -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Service selector에 매칭되는 Pod 확인"
+        command_template: "kubectl get pod -n {{namespace}} -l {{label_selector}} -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Pod readiness 상태 확인"
+        command_template: "kubectl describe pod {{pod_name}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    remediate_steps:
+      - type: remediate
+        description: "Service selector 수정"
+        command_template: "kubectl patch service {{service_name}} -n {{namespace}} -p '{\"spec\":{\"selector\":{{selector_json}}}}'"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          selector_json: "{\"app\":\"my-app\"}"
+      - type: remediate
+        description: "수정된 Service manifest 적용"
+        command_template: "kubectl apply -f {{manifest_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          manifest_path: "./service.yaml"
+    verify_steps:
+      - type: verify
+        description: "EndpointSlice 생성 여부 확인"
+        command_template: "kubectl get endpointslice -n {{namespace}} -l kubernetes.io/service-name={{service_name}} -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: verify
+        description: "Service 접근 테스트"
+        command_template: "kubectl run curl-test -n {{namespace}} --rm -it --image=curlimages/curl --restart=Never -- curl -v http://{{service_name}}:{{service_port}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    rollback_steps:
+      - type: rollback
+        description: "Service manifest 이전 버전 재적용"
+        command_template: "kubectl apply -f {{rollback_manifest_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          rollback_manifest_path: "./service.rollback.yaml"
+    risk_level: medium
+    source: "internal-runbook"
+    tags: ["service", "endpoint", "endpointslice", "selector", "readiness", "503"]
+
+  - id: dns-resolution-failure
+    title: "DNS Resolution Failure"
+    match_types:
+      - DNS
+      - CoreDNS
+      - Temporary failure in name resolution
+      - no such host
+      - NXDOMAIN
+      - SERVFAIL
+    symptoms:
+      - "Pod 내부에서 Service DNS 또는 외부 도메인 해석 실패"
+      - "애플리케이션 로그에 no such host, Temporary failure in name resolution 출력"
+      - "IP 직접 접근은 가능하지만 DNS 이름 접근은 실패"
+    evidence_keywords:
+      - "no such host"
+      - "Temporary failure in name resolution"
+      - "NXDOMAIN"
+      - "SERVFAIL"
+      - "CoreDNS"
+      - "/etc/resolv.conf"
+      - "kube-dns"
+    cause: "CoreDNS 장애, kube-dns Service 문제, NetworkPolicy, Node DNS 설정, upstream DNS 장애, 잘못된 search domain 또는 ndots 설정으로 DNS 해석이 실패하는 상태입니다."
+    likely_causes:
+      - "CoreDNS Pod 비정상"
+      - "kube-dns Service endpoint 없음"
+      - "NetworkPolicy가 DNS UDP/TCP 53 차단"
+      - "Node의 upstream DNS 장애"
+      - "Pod DNS policy 또는 dnsConfig 오설정"
+      - "CoreDNS ConfigMap 오류"
+    resolution: "Pod 내부 DNS 테스트, CoreDNS 상태, kube-dns Service/Endpoint, NetworkPolicy, CoreDNS 로그와 ConfigMap을 확인합니다."
+    decision_hints:
+      - "Service FQDN만 실패하면 Kubernetes DNS 또는 Service 존재 여부 확인"
+      - "외부 도메인만 실패하면 CoreDNS upstream 또는 Node DNS 확인"
+      - "IP 접근은 되는데 DNS만 실패하면 네트워크보다 DNS 경로를 우선 확인"
+    related_objects:
+      - Pod
+      - CoreDNS
+      - Service
+      - EndpointSlice
+      - NetworkPolicy
+      - ConfigMap
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Pod 내부 DNS 질의 테스트"
+        command_template: "kubectl exec -n {{namespace}} {{pod_name}} -- nslookup {{dns_name}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          dns_name: "kubernetes.default.svc.cluster.local"
+      - type: diagnostic
+        description: "Pod resolv.conf 확인"
+        command_template: "kubectl exec -n {{namespace}} {{pod_name}} -- cat /etc/resolv.conf"
+        automatic_candidate: false
+        requires_confirmation: true
+      - type: diagnostic
+        description: "CoreDNS Pod 상태 확인"
+        command_template: "kubectl get pod -n kube-system -l k8s-app=kube-dns -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "CoreDNS 로그 확인"
+        command_template: "kubectl logs -n kube-system -l k8s-app=kube-dns --tail=200"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "kube-dns Service 확인"
+        command_template: "kubectl get svc,endpointslice -n kube-system -l k8s-app=kube-dns"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "NetworkPolicy 확인"
+        command_template: "kubectl get networkpolicy -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    remediate_steps:
+      - type: remediate
+        description: "CoreDNS rollout 재시작"
+        command_template: "kubectl rollout restart deployment/coredns -n kube-system"
+        automatic_candidate: false
+        requires_confirmation: true
+      - type: remediate
+        description: "수정된 CoreDNS ConfigMap 적용"
+        command_template: "kubectl apply -f {{coredns_configmap_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          coredns_configmap_path: "./coredns-configmap.yaml"
+    verify_steps:
+      - type: verify
+        description: "DNS 재질의 확인"
+        command_template: "kubectl exec -n {{namespace}} {{pod_name}} -- nslookup {{dns_name}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          dns_name: "kubernetes.default.svc.cluster.local"
+      - type: verify
+        description: "CoreDNS rollout 상태 확인"
+        command_template: "kubectl rollout status deployment/coredns -n kube-system"
+        automatic_candidate: true
+        requires_confirmation: false
+    rollback_steps:
+      - type: rollback
+        description: "CoreDNS ConfigMap 이전 버전 재적용"
+        command_template: "kubectl apply -f {{rollback_configmap_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          rollback_configmap_path: "./coredns-configmap.rollback.yaml"
+    risk_level: high
+    source: "internal-runbook"
+    tags: ["dns", "coredns", "kube-dns", "networkpolicy", "service-discovery"]
+
+  - id: node-not-ready
+    title: "Node NotReady"
+    match_types:
+      - NodeNotReady
+      - NotReady
+      - KubeletNotReady
+      - node.kubernetes.io/unreachable
+      - node.kubernetes.io/not-ready
+    symptoms:
+      - "Node 상태가 NotReady로 표시됨"
+      - "해당 노드의 Pod가 Evicted, Terminating, Unknown 상태가 됨"
+      - "새 Pod가 해당 노드에 스케줄링되지 않음"
+    evidence_keywords:
+      - "NodeNotReady"
+      - "KubeletNotReady"
+      - "node.kubernetes.io/unreachable"
+      - "node.kubernetes.io/not-ready"
+      - "MemoryPressure"
+      - "DiskPressure"
+      - "PIDPressure"
+      - "NetworkUnavailable"
+    cause: "kubelet 장애, container runtime 장애, 노드 리소스 압박, 네트워크 단절, CNI 장애, 디스크 부족 등으로 노드가 정상 상태를 보고하지 못하는 상태입니다."
+    likely_causes:
+      - "kubelet 비정상 또는 인증서 문제"
+      - "containerd 또는 CRI runtime 장애"
+      - "노드 디스크 부족"
+      - "노드 메모리 압박"
+      - "CNI plugin 장애"
+      - "노드와 control plane 간 네트워크 단절"
+      - "노드 OS 또는 커널 문제"
+    resolution: "Node condition, kubelet/container runtime 상태, 디스크/메모리, CNI Pod, control plane 연결성을 확인하고 노드 복구 또는 cordon/drain을 수행합니다."
+    decision_hints:
+      - "DiskPressure가 있으면 image GC, 로그, ephemeral storage 사용량 확인"
+      - "NetworkUnavailable이면 CNI DaemonSet과 노드 네트워크 확인"
+      - "unreachable taint가 있으면 control plane과 노드 간 통신 문제 가능성이 높음"
+    related_objects:
+      - Node
+      - Pod
+      - Kubelet
+      - ContainerRuntime
+      - CNI
+      - Event
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Node condition과 taint 확인"
+        command_template: "kubectl describe node {{node_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "NotReady 노드 목록 확인"
+        command_template: "kubectl get nodes"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "해당 노드의 Pod 상태 확인"
+        command_template: "kubectl get pod -A --field-selector spec.nodeName={{node_name}} -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "CNI Pod 상태 확인"
+        command_template: "kubectl get pod -A -o wide | grep {{node_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    remediate_steps:
+      - type: remediate
+        description: "문제 노드 cordon"
+        command_template: "kubectl cordon {{node_name}}"
+        automatic_candidate: false
+        requires_confirmation: true
+      - type: remediate
+        description: "문제 노드 drain"
+        command_template: "kubectl drain {{node_name}} --ignore-daemonsets --delete-emptydir-data"
+        automatic_candidate: false
+        requires_confirmation: true
+      - type: remediate
+        description: "노드 uncordon"
+        command_template: "kubectl uncordon {{node_name}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    verify_steps:
+      - type: verify
+        description: "Node Ready 상태 확인"
+        command_template: "kubectl get node {{node_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: verify
+        description: "Node condition 재확인"
+        command_template: "kubectl describe node {{node_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    rollback_steps:
+      - type: rollback
+        description: "cordon 상태 해제"
+        command_template: "kubectl uncordon {{node_name}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    risk_level: high
+    source: "internal-runbook"
+    tags: ["node", "notready", "kubelet", "containerd", "cni", "diskpressure"]
+
+  - id: rbac-forbidden
+    title: "RBAC Forbidden"
+    match_types:
+      - Forbidden
+      - RBAC
+      - cannot get resource
+      - cannot list resource
+      - User cannot
+      - serviceaccount
+    symptoms:
+      - "kubectl 또는 애플리케이션에서 Kubernetes API 호출 시 Forbidden 발생"
+      - "Controller 로그에 cannot get/list/watch/create/update resource 메시지가 출력됨"
+      - "ServiceAccount 기반 Pod가 특정 리소스 접근에 실패함"
+    evidence_keywords:
+      - "Forbidden"
+      - "cannot get resource"
+      - "cannot list resource"
+      - "cannot watch resource"
+      - "cannot create resource"
+      - "User \"system:serviceaccount"
+      - "RBAC"
+    cause: "사용자, ServiceAccount, Role, ClusterRole, RoleBinding, ClusterRoleBinding 권한 설정이 필요한 Kubernetes API 동작을 허용하지 않는 상태입니다."
+    likely_causes:
+      - "Role 또는 ClusterRole rule 누락"
+      - "RoleBinding 대상 ServiceAccount 불일치"
+      - "네임스페이스 범위 RoleBinding과 클러스터 범위 리소스 혼동"
+      - "Controller가 watch해야 하는 리소스 권한 누락"
+      - "API group 또는 resource 이름 오기입"
+    resolution: "에러 메시지의 user, verb, resource, apiGroup, namespace를 기준으로 can-i 검증 후 필요한 최소 권한을 Role/ClusterRole에 추가합니다."
+    decision_hints:
+      - "namespaces, nodes, persistentvolumes 같은 클러스터 범위 리소스는 ClusterRole 권한 필요"
+      - "Pod 내부 ServiceAccount 문제는 --as=system:serviceaccount 형식으로 can-i 확인"
+      - "권한은 넓게 주기보다 에러에 나온 verb/resource 기준으로 최소화"
+    related_objects:
+      - ServiceAccount
+      - Role
+      - ClusterRole
+      - RoleBinding
+      - ClusterRoleBinding
+    diagnostic_steps:
+      - type: diagnostic
+        description: "현재 사용자 권한 확인"
+        command_template: "kubectl auth can-i {{verb}} {{resource}} -n {{namespace}}"
+        automatic_candidate: true
+        requires_confirmation: false
+        variables:
+          verb: "get"
+          resource: "pods"
+      - type: diagnostic
+        description: "ServiceAccount 기준 권한 확인"
+        command_template: "kubectl auth can-i {{verb}} {{resource}} -n {{namespace}} --as=system:serviceaccount:{{namespace}}:{{service_account}}"
+        automatic_candidate: true
+        requires_confirmation: false
+        variables:
+          verb: "list"
+          resource: "pods"
+      - type: diagnostic
+        description: "RoleBinding 확인"
+        command_template: "kubectl get rolebinding -n {{namespace}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "ClusterRoleBinding 확인"
+        command_template: "kubectl get clusterrolebinding -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    remediate_steps:
+      - type: remediate
+        description: "수정된 RBAC manifest 적용"
+        command_template: "kubectl apply -f {{rbac_manifest_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+        variables:
+          rbac_manifest_path: "./rbac.yaml"
+    verify_steps:
+      - type: verify
+        description: "수정 후 권한 재확인"
+        command_template: "kubectl auth can-i {{verb}} {{resource}} -n {{namespace}} --as=system:serviceaccount:{{namespace}}:{{service_account}}"
+        automatic_candidate: true
+        requires_confirmation: false
+        variables:
+          verb: "list"
+          resource: "pods"
+      - type: verify
+        description: "애플리케이션 또는 controller 로그 재확인"
+        command_template: "kubectl logs {{pod_name}} -n {{namespace}} -c {{container_name}} --tail=200"
+        automatic_candidate: true
+        requires_confirmation: false
+    rollback_steps:
+      - type: rollback
+        description: "RBAC manifest 변경 제거"
+        command_template: "kubectl delete -f {{rbac_manifest_path}}"
+        automatic_candidate: false
+        requires_confirmation: true
+    risk_level: medium
+    source: "internal-runbook"
+    tags: ["rbac", "forbidden", "serviceaccount", "role", "clusterrole"]
+
+rag_metadata:
+  domain: kubernetes
+  object_scope:
+    - pod
+    - workload
+    - node
+    - service
+    - storage
+    - rbac
+  query_examples:
+    - "pod가 CrashLoopBackOff이고 OOMKilled가 보임"
+    - "ImagePullBackOff unauthorized 발생"
+    - "Pending FailedScheduling Insufficient memory"
+    - "readiness probe failed 때문에 endpoint가 없음"
+  execution_policy:
+    diagnostic_auto_allowed: true
+    remediate_requires_confirmation: true
+    destructive_commands_require_confirmation: true

@@ -144,29 +144,42 @@
 
 ```bash
 # 전체 빌드
-make build
+make build-all
 
 # 또는 개별 빌드
 make build-k8s-assistant        # k8s-assistant CLI만
 make build-log-analyzer          # log-analyzer-server만
+make build-trouble-shooting      # trouble-shooting-server만
+make build-troubleshooting-upload # Qdrant 업로드 helper만
 ```
 
 생성 파일:
 ```
 bin/k8s-assistant               # 메인 CLI 도구
 bin/log-analyzer-server         # 로그 분석 MCP 서버
+bin/trouble-shooting-server     # 트러블슈팅 MCP 서버
+bin/troubleshooting-upload      # Qdrant 업로드 helper
 ```
 
 ### 사용 가능한 Make targets
 
 | Target | 설명 |
 |--------|------|
-| `make build` | 전체 바이너리 빌드 |
+| `make build` | k8s-assistant CLI 빌드 |
+| `make build-all` | 전체 바이너리 빌드 |
 | `make build-k8s-assistant` | CLI만 빌드 |
 | `make build-log-analyzer` | 로그 분석 서버만 빌드 |
-| `make build-linux` | Linux 바이너리 빌드 (크로스 컴파일) |
+| `make build-trouble-shooting` | 트러블슈팅 MCP 서버만 빌드 |
+| `make build-troubleshooting-upload` | Qdrant 업로드 helper만 빌드 |
+| `make build-linux` | 전체 Linux 바이너리 빌드 (linux/amd64 크로스 컴파일) |
+| `make build-k8s-assistant-linux` | CLI Linux 바이너리만 빌드 |
+| `make build-log-analyzer-linux` | 로그 분석 서버 Linux 바이너리만 빌드 |
+| `make build-trouble-shooting-linux` | 트러블슈팅 서버 Linux 바이너리만 빌드 |
+| `make build-troubleshooting-upload-linux` | 업로드 helper Linux 바이너리만 빌드 |
 | `make run` | k8s-assistant 실행 (개발용) |
 | `make run-log-analyzer` | log-analyzer-server 실행 (개발용) |
+| `make run-trouble-shooting` | trouble-shooting-server 실행 (개발용) |
+| `make run-mcp-servers` | MCP 서버 2개(log-analyzer, trouble-shooting) 동시 실행 |
 | `make tidy` | Go 의존성 정리 |
 | `make clean` | 빌드 산출물 제거 |
 
@@ -379,34 +392,44 @@ tools:
     binary: kustomize
 ```
 
-### 2. MCP Client 설정 (로그 분석 서버 연동)
+### 2. MCP Client 설정
 
-log-analyzer-server를 kubectl-ai와 연동하려면:
+필요한 MCP 서버만 k8s-assistant 설정에 등록합니다. log-analyzer와 trouble-shooting은 모두 선택 사항입니다.
 
 ```bash
-mkdir -p ~/.config/kubectl-ai
-cp config/mcp.yaml ~/.config/kubectl-ai/mcp.yaml
+mkdir -p ~/.k8s-assistant
+cp config/mcp.yaml ~/.k8s-assistant/mcp.yaml
 ```
 
-**탐색 경로**: `~/.config/kubectl-ai/mcp.yaml`
+**탐색 경로**: `~/.k8s-assistant/mcp.yaml`
 
-**config/mcp.yaml 기본 내용**:
+`--mcp-client` 실행 시 이 파일에 선언된 서버만 kubectl-ai MCP 설정으로 동기화됩니다.
+
+**trouble-shooting만 사용하는 예시**:
 ```yaml
 servers:
-  log-analyzer:
-    type: http
-    url: http://localhost:9090/mcp
+  - name: trouble-shooting
+    url: http://localhost:9091/mcp
+    use_streaming: true
+    timeout: 60
+```
 
-  sequential-thinking:
-    type: stdio
-    command: npx
-    args:
-      - -y
-      - '@modelcontextprotocol/server-sequential-thinking'
+**log-analyzer까지 함께 사용하는 예시**:
+```yaml
+servers:
+  - name: log-analyzer
+    url: http://localhost:9090/mcp
+    use_streaming: true
+    timeout: 60
+  - name: trouble-shooting
+    url: http://localhost:9091/mcp
+    use_streaming: true
+    timeout: 60
 ```
 
 **사용 가능한 MCP 서버**:
-- **log-analyzer**: 로그 분석, 패턴 탐지, runbook 검색 (자체 구현)
+- **log-analyzer**: 로그 분석, 패턴 탐지
+- **trouble-shooting**: runbook 매칭, 운영 이슈 RAG 검색, 조치 계획 생성
 - **sequential-thinking**: 단계적 추론 (Anthropic 제공)
 - 기타: 필요에 따라 추가 가능
 

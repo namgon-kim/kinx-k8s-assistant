@@ -199,7 +199,7 @@ func main() {
 	f.BoolVar(&cfg.EnableToolUseShim, "enable-tool-use-shim", cfg.EnableToolUseShim,
 		"tool use shim 활성화 (native function calling 미지원 모델용)")
 	f.BoolVar(&cfg.MCPClient, "mcp-client", cfg.MCPClient,
-		"MCP 클라이언트 모드 활성화 (log-analyzer 등 외부 MCP 서버 연동)")
+		"MCP 클라이언트 모드 활성화 (~/.k8s-assistant/mcp.yaml에 선언된 서버만 연동)")
 	f.IntVar(&cfg.MaxIterations, "max-iterations", cfg.MaxIterations,
 		"ReAct 루프 최대 반복 횟수")
 	f.BoolVar(&cfg.ShowToolOutput, "show-tool-output", cfg.ShowToolOutput,
@@ -267,9 +267,11 @@ func setupKlog(cfg *config.Config) (func(), error) {
 	klog.SetOutput(out)
 
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	klog.InitFlags(fs)
 	_ = fs.Set("logtostderr", "false")
 	_ = fs.Set("alsologtostderr", "false")
+	_ = fs.Set("stderrthreshold", "FATAL")
 	_ = fs.Set("v", fmt.Sprintf("%d", cfg.LogLevel))
 
 	klog.Infof("k8s-assistant log started: %s", logFile)

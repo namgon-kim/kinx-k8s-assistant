@@ -53,6 +53,11 @@ func scoreCase(c TroubleshootingCase, req TroubleshootingSearchRequest, query st
 	}, " "))
 	caseText := strings.ToLower(strings.Join([]string{
 		c.ID, c.Title, c.Cause, c.Resolution, strings.Join(c.Tags, " "),
+		strings.Join(c.Symptoms, " "),
+		strings.Join(c.EvidenceKeywords, " "),
+		strings.Join(c.LikelyCauses, " "),
+		strings.Join(c.DecisionHints, " "),
+		strings.Join(c.RelatedObjects, " "),
 	}, " "))
 
 	for _, word := range strings.Fields(strings.ToLower(query)) {
