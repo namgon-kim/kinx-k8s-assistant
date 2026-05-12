@@ -10,6 +10,20 @@ make build-linux
 ./bin/k8s-assistant-linux-amd64
 ```
 
+### 전체 빌드
+```bash
+make build-all
+```
+
+생성 바이너리:
+
+```text
+bin/k8s-assistant
+bin/log-analyzer-server
+bin/trouble-shooting-server
+bin/troubleshooting-upload
+```
+
 ### 설정
 
 #### 1. Config 파일 (권장)
@@ -115,6 +129,106 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
 
 **주의:** 메타 명령(/kubeconfig, /kube-context 등)은 설정을 변경하지만 자동 저장되지 않습니다. 
 변경 사항을 저장하려면 명시적으로 `/save` 명령을 실행해야 합니다.
+
+## MCP 서버 설정
+
+`--mcp-client`는 `~/.k8s-assistant/mcp.yaml`에 선언된 서버만 kubectl-ai MCP 설정으로 동기화합니다. `log-analyzer`와 `trouble-shooting`은 모두 선택 사항입니다.
+
+```bash
+mkdir -p ~/.k8s-assistant
+cp config/mcp.yaml ~/.k8s-assistant/mcp.yaml
+```
+
+trouble-shooting만 사용할 때:
+
+```yaml
+servers:
+  - name: trouble-shooting
+    url: http://localhost:9091/mcp
+    use_streaming: true
+    timeout: 60
+```
+
+둘 다 사용할 때:
+
+```yaml
+servers:
+  - name: log-analyzer
+    url: http://localhost:9090/mcp
+    use_streaming: true
+    timeout: 60
+  - name: trouble-shooting
+    url: http://localhost:9091/mcp
+    use_streaming: true
+    timeout: 60
+```
+
+주의: MCP tool 이름은 kubectl-ai에서 `<server_name>_<tool_name>` 형태로 노출됩니다. `trouble-shooting`처럼 hyphen이 포함된 server name을 유지할지, `troubleshooting`처럼 안전한 이름으로 바꿀지는 revise 논의 중입니다.
+
+## trouble-shooting 서버
+
+`trouble-shooting-server`는 runbook 매칭, 운영 이슈 RAG 검색, 조치 계획 생성을 담당합니다. Kubernetes 명령 실행은 하지 않고, 실제 실행은 kubectl-ai 승인 흐름이 담당합니다.
+
+기본 실행:
+
+```bash
+./bin/trouble-shooting-server
+```
+
+기본 설정 경로:
+
+```text
+~/.k8s-assistant/trouble-shooting.yaml
+```
+
+예시 설정 복사:
+
+```bash
+mkdir -p ~/.k8s-assistant
+cp config/trouble-shooting.yaml ~/.k8s-assistant/trouble-shooting.yaml
+```
+
+주요 설정:
+
+```yaml
+trouble_shooting:
+  server:
+    port: 9091
+  rag:
+    provider: qdrant
+    embedding:
+      url: http://1.201.177.120:4000
+      model: bge-m3
+    qdrant:
+      url: http://localhost:6333
+      collection: k8s_troubleshooting_runbooks_v1
+    reranker:
+      enabled: true
+      url: http://1.201.177.120:4000
+      model: bge-reranker-v2-m3
+```
+
+runbook을 Qdrant에 업로드:
+
+```bash
+./bin/troubleshooting-upload
+# 또는
+./bin/troubleshooting-upload --config config/trouble-shooting.yaml
+```
+
+업로드 helper는 runbook text를 embedding endpoint로 vector화한 뒤 Qdrant에 저장합니다. 이는 런타임 필수 기능이 아니라 초기 적재/검증용 도구입니다.
+
+## trouble-shooting revise 논의
+
+아직 확정되지 않은 설계 논점은 `revise_troubleshooting.md`에 정리합니다.
+
+현재 논의 중인 항목:
+
+- 간단한 문제는 kubectl-ai가 직접 처리하고, 불확실한 문제만 trouble-shooting/RAG를 호출할지 여부
+- kubectl-ai의 self assessment를 이용해 trouble-shooting 호출 여부를 판단하는 방식
+- trouble-shooting 결과와 kubectl-ai 자체 해결책이 충돌하지 않도록 최종 판단권을 어디에 둘지
+- `trouble-shooting` MCP server name을 `troubleshooting`으로 바꿀지 여부
+- delete/recreate 작업 시 YAML export, runtime field 제거, 수정안 제시, 승인, apply/delete 순서를 어떻게 강제할지
 
 ## 프롬프트
 
