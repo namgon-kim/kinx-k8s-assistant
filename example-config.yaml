@@ -52,6 +52,15 @@ sessionbackend: memory        # Session backend: memory, filesystem, redis, etc.
 showtooloutput: true          # Show tool execution output in console
 skipverifyssl: false          # Skip SSL verification (not recommended for production)
 enabletoolshim: false         # Enable tool use shim for models that don't support function calling
+readonly: false               # Block commands that modify Kubernetes resources
+
+# User-facing output language.
+# Provider is fixed to openai-compatible for the translation model.
+lang:
+  language: English           # Korean or English
+  model: ""                   # Translation model name, e.g. nvidia/Llama-3.3-70B-Instruct-FP8
+  endpoint: ""                # OpenAI-compatible endpoint, e.g. http://1.201.177.120:4000
+  apikey: ""                  # Optional API key
 
 # ===== Advanced Settings =====
 
@@ -142,6 +151,8 @@ showlogoutput: false          # Also print system logs to console
 # ===== Available Meta Commands =====
 # /config              - Show current configuration
 # /model               - Change LLM model
+# /lang                - Show or change output language
 # /kubeconfig          - Set kubeconfig file path
 # /kube-context        - Manage Kubernetes contexts
+# /readonly            - Show or change read-only mode
 # /save                - Save configuration to ~/.k8s-assistant/config.yaml

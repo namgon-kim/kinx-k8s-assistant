@@ -13,8 +13,8 @@ type Config struct {
 	// LLM 설정
 	LLMProvider string `json:"llmprovider"`
 	Model       string `json:"model"`
-	APIKey      string `json:"apikey"`   // 하위 호환성 (deprecated)
-	Endpoint    string `json:"endpoint"` // 하위 호환성 (deprecated)
+	APIKey      string `json:"apikey"`
+	Endpoint    string `json:"endpoint"`
 
 	// Provider별 인증 (환경변수가 config 값보다 우선)
 	AnthropicAPIKey     string `json:"anthropic_apikey,omitempty"`
@@ -29,7 +29,7 @@ type Config struct {
 	GCPProject          string `json:"gcp_project,omitempty"`
 	GCPLocation         string `json:"gcp_location,omitempty"`
 
-	// kubectl-ai Agent 설정
+	// ReAct loop 설정
 	Kubeconfig         string   `json:"kubeconfig"`
 	CurrentContext     string   `json:"-"`
 	AvailableContexts  []string `json:"-"`
@@ -38,6 +38,7 @@ type Config struct {
 	MCPClient          bool     `json:"mcp_client"`
 	MaxIterations      int      `json:"maxiterations"`
 	ShowToolOutput     bool     `json:"showtooloutput"`
+	ReadOnly           bool     `json:"readonly"`
 	PromptTemplateFile string   `json:"prompttemplatefile,omitempty"`
 	SessionBackend     string   `json:"sessionbackend"`
 
@@ -52,6 +53,16 @@ type Config struct {
 	SystemLogDir  string `json:"systemlogdir,omitempty"`
 	LogLevel      int    `json:"loglevel"`
 	ShowLogOutput bool   `json:"showlogoutput"`
+
+	// 사용자 출력 언어/번역 설정
+	Lang LangConfig `json:"lang"`
+}
+
+type LangConfig struct {
+	Language string `json:"language"`
+	Model    string `json:"model,omitempty"`
+	Endpoint string `json:"endpoint,omitempty"`
+	APIKey   string `json:"apikey,omitempty"`
 }
 
 // NewConfig는 기본값이 설정된 Config를 반환합니다.
@@ -63,6 +74,9 @@ func NewConfig() *Config {
 		MaxIterations:  20,
 		SessionBackend: "memory",
 		LogLevel:       0,
+		Lang: LangConfig{
+			Language: "English",
+		},
 	}
 
 	home, _ := os.UserHomeDir()
@@ -88,6 +102,7 @@ func NewConfig() *Config {
 				} else {
 					cfg.SystemLogDir = expandHome(cfg.SystemLogDir, home)
 				}
+				normalizeLangConfig(cfg)
 				applyEnvironmentOverrides(cfg)
 				return cfg
 			}
@@ -101,9 +116,23 @@ func NewConfig() *Config {
 			cfg.Kubeconfig = candidate
 		}
 	}
+	normalizeLangConfig(cfg)
 	applyEnvironmentOverrides(cfg)
 
 	return cfg
+}
+
+func normalizeLangConfig(cfg *Config) {
+	switch strings.ToLower(strings.TrimSpace(cfg.Lang.Language)) {
+	case "english", "en":
+		cfg.Lang.Language = "English"
+	case "korean", "ko":
+		cfg.Lang.Language = "Korean"
+	case "":
+		cfg.Lang.Language = "English"
+	default:
+		cfg.Lang.Language = strings.TrimSpace(cfg.Lang.Language)
+	}
 }
 
 // expandHome은 경로에서 ~ 를 홈 디렉토리로 확장합니다

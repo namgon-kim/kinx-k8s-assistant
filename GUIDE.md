@@ -20,7 +20,6 @@ make build-all
 ```text
 bin/k8s-assistant
 bin/log-analyzer-server
-bin/trouble-shooting-server
 bin/troubleshooting-upload
 ```
 
@@ -42,7 +41,24 @@ kubeconfig: ~/.kube/config
 maxiterations: 20
 sessionbackend: memory
 showtooloutput: true
+readonly: false
+lang:
+  language: English
+  model: ""
+  endpoint: ""
+  apikey: ""
 ```
+
+샘플 파일:
+
+```bash
+mkdir -p ~/.k8s-assistant
+cp example-config.yaml ~/.k8s-assistant/config.yaml
+```
+
+native tool/function calling을 지원하지 않는 모델은 `enabletoolshim: true`로 JSON ReAct shim을 사용할 수 있습니다.
+
+기본 프롬프트 템플릿은 `prompts/default.tmpl`입니다. `--prompt-template` 또는 `prompttemplatefile`로 다른 템플릿을 지정할 수 있습니다.
 
 #### 2. 명령줄 옵션 (CLI 플래그)
 ```bash
@@ -88,7 +104,7 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
 ./k8s-assistant --llm-provider openai --model gpt-4o
 ```
 
-**주의:** kubectl-ai/gollm은 provider별 환경 변수가 설정되어 있어야 동작합니다. k8s-assistant는 시작 시 config.yaml의 provider별 API/endpoint 값을 필요한 환경 변수로 올린 뒤 gollm이 읽도록 재실행합니다. 이미 환경 변수가 설정되어 있으면 환경 변수 값을 우선합니다.
+**주의:** kubectl-ai/gollm은 provider별 환경 변수가 설정되어 있어야 동작합니다. k8s-assistant는 시작 시 config.yaml의 provider별 API/endpoint 값을 필요한 환경 변수로 올린 뒤 gollm이 읽도록 합니다. 이미 환경 변수가 설정되어 있으면 환경 변수 값을 우선합니다.
 
 ## 메타 명령어
 
@@ -99,12 +115,30 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
 >>> /              # 메타 명령 메뉴 표시
 ```
 
-메뉴에서 번호(1-4)를 선택하거나 명령어를 직접 입력할 수 있습니다.
+메뉴에서 번호를 선택하거나 명령어를 직접 입력할 수 있습니다.
 
 ### 설정 조회
 ```bash
 >>> /config        # 현재 LLM, Kubeconfig, Context 설정 표시
 ```
+
+### Read-only 모드
+```bash
+>>> /readonly status  # 현재 read-only 상태 표시
+>>> /readonly on      # Kubernetes 리소스 변경 명령 차단
+>>> /readonly off     # 기존 승인 흐름으로 변경 명령 허용
+```
+
+**주의:** `/readonly` 변경 후 `/save` 명령으로 저장해야 다음 실행에도 유지됩니다.
+
+### 출력 언어
+```bash
+>>> /lang status   # 현재 출력 언어 표시
+>>> /lang Korean   # 자연어 출력 한국어
+>>> /lang English  # 자연어 출력 영어
+```
+
+`lang.language: Korean`이고 `lang.model`/`lang.endpoint`가 설정되어 있으면 primary model은 영어로 ReAct/tool loop를 수행하고, 사용자에게 보여줄 자연어 설명만 openai-compatible 번역 모델로 한국어 변환합니다.
 
 ### Kubeconfig 관리
 ```bash
@@ -127,29 +161,19 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
 >>> /save          # 현재 설정을 ~/.k8s-assistant/config.yaml에 저장
 ```
 
-**주의:** 메타 명령(/kubeconfig, /kube-context 등)은 설정을 변경하지만 자동 저장되지 않습니다. 
+**주의:** 메타 명령(/kubeconfig, /kube-context, /readonly, /lang 등)은 설정을 변경하지만 자동 저장되지 않습니다.
 변경 사항을 저장하려면 명시적으로 `/save` 명령을 실행해야 합니다.
 
 ## MCP 서버 설정
 
-`--mcp-client`는 `~/.k8s-assistant/mcp.yaml`에 선언된 서버만 kubectl-ai MCP 설정으로 동기화합니다. `log-analyzer`와 `trouble-shooting`은 모두 선택 사항입니다.
+`--mcp-client`는 `~/.k8s-assistant/mcp.yaml`에 선언된 서버만 kubectl-ai MCP 설정으로 동기화한 뒤, k8s-assistant의 Tool connector registry에 등록합니다. trouble-shooting은 내부 패키지로 실행되므로 MCP 서버 설정이 필요하지 않습니다.
 
 ```bash
 mkdir -p ~/.k8s-assistant
 cp config/mcp.yaml ~/.k8s-assistant/mcp.yaml
 ```
 
-trouble-shooting만 사용할 때:
-
-```yaml
-servers:
-  - name: trouble-shooting
-    url: http://localhost:9091/mcp
-    use_streaming: true
-    timeout: 60
-```
-
-둘 다 사용할 때:
+log-analyzer를 사용할 때:
 
 ```yaml
 servers:
@@ -157,23 +181,13 @@ servers:
     url: http://localhost:9090/mcp
     use_streaming: true
     timeout: 60
-  - name: trouble-shooting
-    url: http://localhost:9091/mcp
-    use_streaming: true
-    timeout: 60
 ```
 
-주의: MCP tool 이름은 kubectl-ai에서 `<server_name>_<tool_name>` 형태로 노출됩니다. `trouble-shooting`처럼 hyphen이 포함된 server name을 유지할지, `troubleshooting`처럼 안전한 이름으로 바꿀지는 revise 논의 중입니다.
+주의: MCP tool 이름은 kubectl-ai tool connector 규칙에 따라 `<server_name>_<tool_name>` 형태로 노출됩니다.
 
-## trouble-shooting 서버
+## trouble-shooting 설정
 
-`trouble-shooting-server`는 runbook 매칭, 운영 이슈 RAG 검색, 조치 계획 생성을 담당합니다. Kubernetes 명령 실행은 하지 않고, 실제 실행은 kubectl-ai 승인 흐름이 담당합니다.
-
-기본 실행:
-
-```bash
-./bin/trouble-shooting-server
-```
+trouble-shooting은 별도 서버를 실행하지 않습니다. k8s-assistant가 문제 감지 후 사용자 확인을 받고 내부 패키지로 runbook/RAG 검색과 조치 계획 생성을 수행합니다. Kubernetes 명령 실행은 k8s-assistant ReAct 루프와 승인 흐름이 담당합니다.
 
 기본 설정 경로:
 
@@ -192,8 +206,6 @@ cp config/trouble-shooting.yaml ~/.k8s-assistant/trouble-shooting.yaml
 
 ```yaml
 trouble_shooting:
-  server:
-    port: 9091
   rag:
     provider: qdrant
     embedding:
@@ -220,14 +232,13 @@ runbook을 Qdrant에 업로드:
 
 ## trouble-shooting revise 논의
 
-아직 확정되지 않은 설계 논점은 `revise_troubleshooting.md`에 정리합니다.
+아직 확정되지 않은 설계 논점은 `docs/reviews/revise_troubleshooting.md`에 정리합니다.
 
 현재 논의 중인 항목:
 
-- 간단한 문제는 kubectl-ai가 직접 처리하고, 불확실한 문제만 trouble-shooting/RAG를 호출할지 여부
-- kubectl-ai의 self assessment를 이용해 trouble-shooting 호출 여부를 판단하는 방식
-- trouble-shooting 결과와 kubectl-ai 자체 해결책이 충돌하지 않도록 최종 판단권을 어디에 둘지
-- `trouble-shooting` MCP server name을 `troubleshooting`으로 바꿀지 여부
+- 간단한 문제는 k8s-assistant ReAct 루프가 직접 처리하고, 불확실한 문제만 trouble-shooting/RAG를 호출할지 여부
+- LLM self assessment를 이용해 trouble-shooting 호출 여부를 판단하는 방식
+- trouble-shooting 결과와 LLM 자체 해결책이 충돌하지 않도록 최종 판단권을 어디에 둘지
 - delete/recreate 작업 시 YAML export, runtime field 제거, 수정안 제시, 승인, apply/delete 순서를 어떻게 강제할지
 
 ## 프롬프트
@@ -272,6 +283,7 @@ runbook을 Qdrant에 업로드:
   --max-iterations 20 \
   --mcp-client \
   --show-tool-output \
+  --read-only \
   --show-log-output \
   --log-file /tmp/chat.log
 ```

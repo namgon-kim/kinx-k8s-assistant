@@ -13,16 +13,10 @@ type FileConfig struct {
 }
 
 type TroubleShootingFileConfig struct {
-	Server        ServerFileConfig    `yaml:"server"`
 	Runbook       RunbookFileConfig   `yaml:"runbook"`
 	RAG           RAGFileConfig       `yaml:"rag"`
 	IssueExport   IssueFileConfig     `yaml:"issue_export"`
 	KnowledgeBase KnowledgeFileConfig `yaml:"knowledge_base"`
-}
-
-type ServerFileConfig struct {
-	Port          int   `yaml:"port"`
-	ImportOnStart *bool `yaml:"import_on_start"`
 }
 
 type RunbookFileConfig struct {

@@ -49,6 +49,12 @@ func NewFormatter(showToolOutput bool) *Formatter {
 
 // FormatText는 에이전트 텍스트 응답을 마크다운 렌더링하여 포맷합니다.
 func (f *Formatter) FormatText(text string) *FormattedMessage {
+	if !shouldRenderMarkdown(text) {
+		return &FormattedMessage{
+			Kind:    KindText,
+			Content: text,
+		}
+	}
 	rendered := text
 	if f.renderer != nil {
 		if out, err := f.renderer.Render(text); err == nil {
@@ -59,6 +65,56 @@ func (f *Formatter) FormatText(text string) *FormattedMessage {
 		Kind:    KindText,
 		Content: rendered,
 	}
+}
+
+func shouldRenderMarkdown(text string) bool {
+	if text == "" {
+		return false
+	}
+	markers := []string{"```", "**", "__", "`", "> ", "# ", "## ", "[", "](", "\n- ", "\n* ", "\n1. "}
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return strings.HasPrefix(text, "- ") || strings.HasPrefix(text, "* ") || strings.HasPrefix(text, "1. ") || hasMarkdownTable(text)
+}
+
+func hasMarkdownTable(text string) bool {
+	previousHadPipe := false
+	remaining := text
+	for {
+		line := remaining
+		if idx := strings.IndexByte(remaining, '\n'); idx >= 0 {
+			line = remaining[:idx]
+			remaining = remaining[idx+1:]
+		} else {
+			remaining = ""
+		}
+		trimmed := strings.TrimSpace(line)
+		if previousHadPipe && isMarkdownTableSeparator(trimmed) {
+			return true
+		}
+		previousHadPipe = strings.Contains(trimmed, "|")
+		if remaining == "" {
+			return false
+		}
+	}
+}
+
+func isMarkdownTableSeparator(line string) bool {
+	if line == "" || !strings.Contains(line, "|") {
+		return false
+	}
+	for _, r := range line {
+		switch r {
+		case '|', '-', ':', ' ':
+			continue
+		default:
+			return false
+		}
+	}
+	return strings.Contains(line, "-")
 }
 
 // FormatError는 에러 메시지를 포맷합니다.
@@ -122,5 +178,8 @@ func PrintMessage(msg *FormattedMessage) {
 		fmt.Print(msg.Content)
 	default:
 		fmt.Print(msg.Content)
+		if !strings.HasSuffix(msg.Content, "\n") {
+			fmt.Println()
+		}
 	}
 }

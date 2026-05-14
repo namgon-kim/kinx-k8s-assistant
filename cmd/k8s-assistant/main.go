@@ -204,8 +204,10 @@ func main() {
 		"ReAct 루프 최대 반복 횟수")
 	f.BoolVar(&cfg.ShowToolOutput, "show-tool-output", cfg.ShowToolOutput,
 		"Tool 실행 결과를 화면에 출력")
+	f.BoolVar(&cfg.ReadOnly, "read-only", cfg.ReadOnly,
+		"읽기 전용 모드 활성화 (Kubernetes 리소스 변경 명령 차단)")
 	f.StringVar(&cfg.PromptTemplateFile, "prompt-template", cfg.PromptTemplateFile,
-		"커스텀 시스템 프롬프트 템플릿 파일 경로 (기본: prompts/system_ko.tmpl)")
+		"커스텀 시스템 프롬프트 템플릿 파일 경로 (기본: prompts/default.tmpl)")
 	f.StringVar(&cfg.SessionBackend, "session-backend", cfg.SessionBackend,
 		"세션 저장 방식 (memory, filesystem)")
 	f.StringVar(&cfg.LogFile, "log-file", cfg.LogFile,
@@ -282,11 +284,11 @@ func setupKlog(cfg *config.Config) (func(), error) {
 }
 
 func run(ctx context.Context, cfg *config.Config, initialQuery string) error {
-	// 바이너리와 같은 디렉토리의 prompts/system_ko.tmpl 자동 탐색
+	// 바이너리와 같은 디렉토리의 prompts/default.tmpl 자동 탐색
 	if cfg.PromptTemplateFile == "" {
 		execPath, err := os.Executable()
 		if err == nil {
-			candidate := filepath.Join(filepath.Dir(execPath), "..", "prompts", "system_ko.tmpl")
+			candidate := filepath.Join(filepath.Dir(execPath), "..", "prompts", "default.tmpl")
 			if _, err := os.Stat(candidate); err == nil {
 				cfg.PromptTemplateFile = candidate
 			}
