@@ -178,7 +178,7 @@ log-analyzer-server (기존 + 확장)
 **단점:**
 - log-analyzer의 역할이 "관측 데이터 수집"에서 벗어남 (리소스 상태 조회는 다른 책임)
 - cluster-api 리소스 조회와 로그 분석이 한 서버에 혼재
-- `draft_troubleshooting_v1.md`의 역할 분리 원칙과 충돌
+- `docs/drafts/draft_troubleshooting_v1.md`의 역할 분리 원칙과 충돌
 
 **적합한 경우:** 빠른 프로토타이핑, 서버 수를 최소화해야 하는 경우
 
@@ -718,7 +718,7 @@ const (
 
 ### Phase 5: 운영 이슈 RAG 활성화
 
-구현 범위 (기존 `draft_troubleshooting_v1.md` Phase 5와 동일):
+구현 범위 (기존 `docs/drafts/draft_troubleshooting_v1.md` Phase 5와 동일):
 - cluster-api 장애 해결 이슈를 export/import/index
 - 자체 컨트롤러 장애 이슈 축적
 - `search_knowledge`에서 cluster-api/컨트롤러 관련 이슈 검색
@@ -936,9 +936,9 @@ internal/clusterapiobserver/
 config/cluster-api.yaml
 
 # 참고 설계 문서
-draft_troubleshooting_v1.md   ← ProblemSignal, 역할 분리, 구현 순서
+docs/drafts/draft_troubleshooting_v1.md   ← ProblemSignal, 역할 분리, 구현 순서
 draft_log_analyzer.md         ← observability toolset, 로그 수집 전략
-revise_troubleshooting.md     ← 미결 논점, 호출 게이트 설계
+docs/reviews/revise_troubleshooting.md    ← 미결 논점, 호출 게이트 설계
 
 # cluster-api 공식 문서
 https://cluster-api.sigs.k8s.io/reference/glossary

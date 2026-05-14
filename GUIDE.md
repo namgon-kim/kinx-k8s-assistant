@@ -43,7 +43,7 @@ sessionbackend: memory
 showtooloutput: true
 readonly: false
 lang:
-  language: Korean
+  language: English
   model: ""
   endpoint: ""
   apikey: ""
@@ -232,7 +232,7 @@ runbook을 Qdrant에 업로드:
 
 ## trouble-shooting revise 논의
 
-아직 확정되지 않은 설계 논점은 `revise_troubleshooting.md`에 정리합니다.
+아직 확정되지 않은 설계 논점은 `docs/reviews/revise_troubleshooting.md`에 정리합니다.
 
 현재 논의 중인 항목:
 

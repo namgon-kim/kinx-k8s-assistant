@@ -10,7 +10,7 @@ Kubernetes 클러스터를 자연어로 조회하고 관리하는 Go 기반 CLI 
 - 내장 trouble-shooting 패키지: runbook 매칭, 운영 이슈 RAG 검색, 조치 계획 생성
 - Qdrant 업로드 helper: `troubleshooting-upload`
 - MCP 서버는 필수가 아닙니다. `~/.k8s-assistant/mcp.yaml`에 선언된 서버만 로딩합니다.
-- 아직 확정되지 않은 trouble-shooting 설계 논점은 `revise_troubleshooting.md`에 분리해 정리합니다.
+- 아직 확정되지 않은 trouble-shooting 설계 논점은 `docs/reviews/revise_troubleshooting.md`에 분리해 정리합니다.
 
 ## 역할 분리
 
@@ -119,7 +119,7 @@ sessionbackend: memory
 showtooloutput: false
 readonly: false
 lang:
-  language: Korean
+  language: English
   model: ""
   endpoint: ""
   apikey: ""
@@ -347,8 +347,9 @@ kinx-k8s-assistant/
 ├── prompts/
 │   ├── default.tmpl
 │   └── system_ko.tmpl
-├── draft_troubleshooting.md
-├── revise_troubleshooting.md
+├── docs/
+│   ├── drafts/
+│   └── reviews/
 ├── GUIDE.md
 ├── Makefile
 └── README.md
@@ -397,7 +398,7 @@ cat ~/.k8s-assistant/mcp.yaml
 
 ## 설계 메모
 
-확정되지 않은 항목은 README에 섞지 않고 `revise_troubleshooting.md`에 기록합니다.
+확정되지 않은 항목은 README에 섞지 않고 `docs/reviews/revise_troubleshooting.md`에 기록합니다.
 
 현재 주요 논점:
 

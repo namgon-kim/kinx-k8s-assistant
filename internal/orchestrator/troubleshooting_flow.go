@@ -389,7 +389,7 @@ func shouldOfferTroubleshootingForQuery(query string) bool {
 			return true
 		}
 	}
-	if isReadOnlyKubernetesQuery(query) {
+	if isKubernetesLookupOrSummaryQuery(query) {
 		return false
 	}
 	diagnosticIntent := []string{
@@ -404,7 +404,7 @@ func shouldOfferTroubleshootingForQuery(query string) bool {
 	return false
 }
 
-func isReadOnlyKubernetesQuery(query string) bool {
+func isKubernetesLookupOrSummaryQuery(query string) bool {
 	readOnlyIntent := []string{
 		"보여", "조회", "목록", "상세", "알려", "출력", "확인", "요약", "보고",
 		"describe", "get", "list", "show", "summarize",

@@ -57,7 +57,7 @@ readonly: false               # Block commands that modify Kubernetes resources
 # User-facing output language.
 # Provider is fixed to openai-compatible for the translation model.
 lang:
-  language: Korean            # Korean or English
+  language: English           # Korean or English
   model: ""                   # Translation model name, e.g. nvidia/Llama-3.3-70B-Instruct-FP8
   endpoint: ""                # OpenAI-compatible endpoint, e.g. http://1.201.177.120:4000
   apikey: ""                  # Optional API key

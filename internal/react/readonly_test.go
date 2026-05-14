@@ -105,3 +105,27 @@ func TestAnalyzeToolCallsBlocksMutationPipeline(t *testing.T) {
 		t.Fatalf("expected mutation pipeline to be blocked, got %q", pending[0].ModifiesResource)
 	}
 }
+
+func TestAnalyzeToolCallsBlocksKubectlApplyAfterReadOnlyPipeline(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl get pod app -o yaml | kubectl apply -f -",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("unexpected pending count: %d", len(pending))
+	}
+	if pending[0].ModifiesResource == "no" {
+		t.Fatalf("expected kubectl apply pipeline to be blocked, got %q", pending[0].ModifiesResource)
+	}
+}

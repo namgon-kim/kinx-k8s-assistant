@@ -447,13 +447,13 @@ func (l *Loop) modifiesResource(parsed *tools.ToolCall, call gollm.FunctionCall)
 	if isObservationToolName(call.Name) {
 		return "no"
 	}
-	if isReadOnlyKubectlCommand(call) {
+	if isNonMutatingKubectlInvocation(call) {
 		return "no"
 	}
 	return parsed.GetTool().CheckModifiesResource(call.Arguments)
 }
 
-func isReadOnlyKubectlCommand(call gollm.FunctionCall) bool {
+func isNonMutatingKubectlInvocation(call gollm.FunctionCall) bool {
 	if strings.ToLower(call.Name) != "kubectl" {
 		return false
 	}
@@ -465,23 +465,74 @@ func isReadOnlyKubectlCommand(call gollm.FunctionCall) bool {
 	if command == "" {
 		return false
 	}
-	lower := strings.ToLower(command)
-	for _, forbidden := range []string{
-		" apply ", " delete ", " patch ", " replace ", " edit ", " scale ",
-		" rollout restart ", " set ", " create ", " annotate ", " label ",
-		" cordon", " uncordon", " drain", " taint",
-	} {
-		if strings.Contains(" "+lower+" ", forbidden) {
+	segments := splitShellPipeline(command)
+	if len(segments) == 0 {
+		return false
+	}
+	for _, segment := range segments {
+		if containsMutatingKubectlVerb(segment) {
 			return false
 		}
 	}
-	first := strings.TrimSpace(strings.Split(command, "|")[0])
-	fields := strings.Fields(first)
-	if len(fields) < 2 || fields[0] != "kubectl" {
+
+	firstFields := strings.Fields(segments[0])
+	if len(firstFields) < 2 || firstFields[0] != "kubectl" || !isKubectlReadOnlyVerb(firstFields[1]) {
 		return false
 	}
-	switch fields[1] {
+	// Later pipeline segments are only allowed when they are local text
+	// processors. This makes `kubectl get ... | tail -20` read-only while
+	// keeping `kubectl get ... | kubectl apply -f -` blocked.
+	for _, segment := range segments[1:] {
+		fields := strings.Fields(segment)
+		if len(fields) == 0 || !isSafeLocalPipelineCommand(fields[0]) {
+			return false
+		}
+	}
+	return true
+}
+
+func splitShellPipeline(command string) []string {
+	var segments []string
+	for _, segment := range strings.Split(command, "|") {
+		segment = strings.TrimSpace(segment)
+		if segment != "" {
+			segments = append(segments, segment)
+		}
+	}
+	return segments
+}
+
+func containsMutatingKubectlVerb(segment string) bool {
+	fields := strings.Fields(strings.ToLower(segment))
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "kubectl" && isKubectlMutatingVerb(fields[i+1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isKubectlReadOnlyVerb(verb string) bool {
+	switch strings.ToLower(verb) {
 	case "get", "describe", "logs", "top", "api-resources", "api-versions", "version", "config", "auth":
+		return true
+	default:
+		return false
+	}
+}
+
+func isKubectlMutatingVerb(verb string) bool {
+	switch strings.ToLower(verb) {
+	case "apply", "delete", "patch", "replace", "edit", "scale", "set", "create", "annotate", "label", "cordon", "uncordon", "drain", "taint":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSafeLocalPipelineCommand(command string) bool {
+	switch strings.ToLower(command) {
+	case "tail", "head", "grep", "egrep", "fgrep", "awk", "sed", "sort", "uniq", "wc", "cut", "jq", "yq", "column":
 		return true
 	default:
 		return false

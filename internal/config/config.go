@@ -75,7 +75,7 @@ func NewConfig() *Config {
 		SessionBackend: "memory",
 		LogLevel:       0,
 		Lang: LangConfig{
-			Language: "Korean",
+			Language: "English",
 		},
 	}
 
@@ -126,8 +126,10 @@ func normalizeLangConfig(cfg *Config) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Lang.Language)) {
 	case "english", "en":
 		cfg.Lang.Language = "English"
-	case "korean", "ko", "":
+	case "korean", "ko":
 		cfg.Lang.Language = "Korean"
+	case "":
+		cfg.Lang.Language = "English"
 	default:
 		cfg.Lang.Language = strings.TrimSpace(cfg.Lang.Language)
 	}
