@@ -17,9 +17,12 @@ type promptData struct {
 	ToolsAsJSON          string
 	ToolNames            string
 	SessionIsInteractive bool
+	ReadOnly             bool
+	UserLanguage         string
+	TranslateOutput      bool
 }
 
-func buildSystemPrompt(templateFile string, registry tools.Tools, enableToolUseShim bool) (string, error) {
+func buildSystemPrompt(templateFile string, registry tools.Tools, enableToolUseShim bool, readOnly bool, userLanguage string, translateOutput bool) (string, error) {
 	path := templateFile
 	if strings.TrimSpace(path) == "" {
 		path = filepath.Join("prompts", "default.tmpl")
@@ -47,6 +50,9 @@ func buildSystemPrompt(templateFile string, registry tools.Tools, enableToolUseS
 		ToolsAsJSON:          string(rawDefs),
 		ToolNames:            strings.Join(registry.Names(), ", "),
 		SessionIsInteractive: true,
+		ReadOnly:             readOnly,
+		UserLanguage:         userLanguage,
+		TranslateOutput:      translateOutput,
 	}); err != nil {
 		return "", fmt.Errorf("system prompt 템플릿 실행 실패: %w", err)
 	}

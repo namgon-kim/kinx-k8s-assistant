@@ -30,22 +30,70 @@ suffix`)
 	}
 }
 
-func TestParseReActResponseRepairsRawNewlinesInAnswer(t *testing.T) {
+func TestParseReActResponseRepairsUnescapedQuotesInAnswer(t *testing.T) {
 	parsed, err := parseReActResponse("```json\n" + `{
   "thought": "describe 확인",
-  "answer": "Name: test-oom
-Namespace: tests
-Command:
-  python
-  -c
-  import time; time.sleep(3600)"
+  "answer": "Normal Pulled kubelet Successfully pulled image "busybox" in 1.233s"
 }` + "\n```")
 	if err != nil {
-		t.Fatalf("parse ReAct response with raw newlines: %v", err)
+		t.Fatalf("parse ReAct response with unescaped quotes: %v", err)
 	}
-	want := "Name: test-oom\nNamespace: tests\nCommand:\n  python\n  -c\n  import time; time.sleep(3600)"
+	want := `Normal Pulled kubelet Successfully pulled image "busybox" in 1.233s`
 	if parsed.Answer != want {
 		t.Fatalf("unexpected answer:\n got: %q\nwant: %q", parsed.Answer, want)
+	}
+}
+
+func TestParseReActResponseRepairsRawMultilineDescribeAnswer(t *testing.T) {
+	parsed, err := parseReActResponse("```json\n" + `{
+  "thought": "describe 확인",
+  "answer": "Name:             example-nginx
+Namespace:        default
+Containers:
+  sidecar:
+    Image:         busybox
+Events:
+  Normal  Pulled   kubelet  Successfully pulled image \"busybox\" in 1.193s
+  Normal  Started  kubelet  Container started"
+}` + "\n```")
+	if err != nil {
+		t.Fatalf("parse ReAct response with raw multiline describe answer: %v", err)
+	}
+	want := "Name:             example-nginx\n" +
+		"Namespace:        default\n" +
+		"Containers:\n" +
+		"  sidecar:\n" +
+		"    Image:         busybox\n" +
+		"Events:\n" +
+		"  Normal  Pulled   kubelet  Successfully pulled image \"busybox\" in 1.193s\n" +
+		"  Normal  Started  kubelet  Container started"
+	if parsed.Answer != want {
+		t.Fatalf("unexpected answer:\n got: %q\nwant: %q", parsed.Answer, want)
+	}
+}
+
+func TestShimCandidateSeparatesThoughtAndAnswerWithBlankLine(t *testing.T) {
+	candidate := &shimCandidate{candidate: &reActResponse{
+		Thought: "default 네임스페이스의 팟 정보가 제공되었습니다.",
+		Answer:  "Name: example-nginx\nNamespace: default",
+	}}
+	parts := candidate.Parts()
+	if len(parts) != 2 {
+		t.Fatalf("unexpected part count: %d", len(parts))
+	}
+	thought, ok := parts[0].AsText()
+	if !ok {
+		t.Fatal("expected thought text part")
+	}
+	if thought != "default 네임스페이스의 팟 정보가 제공되었습니다.\n\n" {
+		t.Fatalf("unexpected thought text: %q", thought)
+	}
+	answer, ok := parts[1].AsText()
+	if !ok {
+		t.Fatal("expected answer text part")
+	}
+	if answer != "Name: example-nginx\nNamespace: default" {
+		t.Fatalf("unexpected answer text: %q", answer)
 	}
 }
 

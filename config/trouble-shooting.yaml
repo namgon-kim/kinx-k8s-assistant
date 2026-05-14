@@ -1,16 +1,12 @@
-# trouble-shooting MCP server 설정 예시
+# k8s-assistant 내장 trouble-shooting 설정 예시
 # 기본 경로:
 #   ~/.k8s-assistant/trouble-shooting.yaml
 # 실행 예:
-#   ./bin/trouble-shooting-server
+#   ./bin/k8s-assistant
 #   ./bin/troubleshooting-upload
 #     - helper tool: runbook text를 embedding한 뒤 Qdrant point로 업로드한다.
 
 trouble_shooting:
-  server:
-    port: 9091
-    import_on_start: true
-
   rag:
     provider: qdrant
     mode: hybrid

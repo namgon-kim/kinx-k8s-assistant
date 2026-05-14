@@ -27,6 +27,7 @@ const (
 type TroubleshootingFlow struct {
 	phase            troubleshootingPhase
 	lastHash         string
+	lastUserQuery    string
 	problemText      string
 	evidence         []string
 	searchBrief      []string
@@ -46,6 +47,9 @@ func (f *TroubleshootingFlow) AfterAgentText(o *Orchestrator, text string) error
 		return nil
 	}
 	if o.agentWrap == nil {
+		return nil
+	}
+	if !shouldOfferTroubleshootingForQuery(f.lastUserQuery) {
 		return nil
 	}
 	if !looksTroubleshootable(text) {
@@ -72,6 +76,14 @@ func (f *TroubleshootingFlow) RecordEvidence(text string) {
 	if f.phase == troubleshootingIdle && looksTroubleshootable(text) {
 		f.evidence = appendBounded(f.evidence, text, 3)
 	}
+}
+
+func (f *TroubleshootingFlow) ObserveUserInput(query string) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return
+	}
+	f.lastUserQuery = query
 }
 
 func (f *TroubleshootingFlow) BeforeUserInput(o *Orchestrator, activeAgent *react.Loop) (bool, error) {
@@ -164,68 +176,21 @@ trouble-shooting 결과 요약:
 }
 
 func (f *TroubleshootingFlow) runTroubleshooting(o *Orchestrator) (string, error) {
-	cfg := troubleshooting.Config{}
-	if fileCfg, _, err := troubleshooting.LoadOptionalFileConfig(""); err != nil {
-		return "", err
-	} else if fileCfg != nil {
-		cfg = fileCfg.ApplyToConfig(cfg)
-	}
-	cfg = troubleshooting.ApplyDefaults(cfg)
-
-	runbooks, err := troubleshooting.LoadRunbooks(cfg.RunbookDir)
+	client, err := troubleshooting.NewClientFromDefaultConfig()
 	if err != nil {
 		return "", err
 	}
-	svc := troubleshooting.NewService(cfg, runbooks)
 
 	signal := f.buildProblemSignal(o)
-	req := troubleshooting.TroubleshootingSearchRequest{
-		Signal: signal,
-		Query:  signal.Summary,
-		Target: signal.Target,
-		TopK:   cfg.MaxCases,
-		Locale: "ko",
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	runbookResult, err := svc.MatchRunbook(ctx, req)
+	result, err := client.Analyze(ctx, signal)
 	if err != nil {
 		return "", err
 	}
 
-	var knowledgeResult *troubleshooting.TroubleshootingSearchResult
-	if cfg.KnowledgeProvider != troubleshooting.KnowledgeProviderLocal || cfg.SearchMode == troubleshooting.SearchModeHybrid {
-		if result, err := svc.SearchKnowledge(ctx, req); err == nil {
-			knowledgeResult = result
-		}
-	}
-
-	var selected []troubleshooting.TroubleshootingCase
-	if len(runbookResult.Cases) > 0 {
-		selected = append(selected, runbookResult.Cases[0])
-	}
-
-	plan, err := svc.BuildRemediationPlan(ctx, troubleshooting.RemediationPlanRequest{
-		Signal:        signal,
-		SelectedCases: selected,
-		Target:        signal.Target,
-		Constraints: troubleshooting.RemediationConstraints{
-			AllowMutation:       true,
-			RequireDryRun:       true,
-			RequireConfirmation: true,
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-	validation, err := svc.ValidatePlan(ctx, *plan)
-	if err != nil {
-		return "", err
-	}
-
-	return formatTroubleshootingSummary(signal, runbookResult, knowledgeResult, plan, validation), nil
+	return formatTroubleshootingSummary(result), nil
 }
 
 func (f *TroubleshootingFlow) buildProblemSignal(o *Orchestrator) diagnostic.ProblemSignal {
@@ -323,23 +288,23 @@ func severityForText(text string) diagnostic.Severity {
 	return diagnostic.SeverityWarning
 }
 
-func formatTroubleshootingSummary(signal diagnostic.ProblemSignal, runbook *troubleshooting.TroubleshootingSearchResult, knowledge *troubleshooting.TroubleshootingSearchResult, plan *troubleshooting.RemediationPlan, validation *troubleshooting.ValidationResult) string {
+func formatTroubleshootingSummary(result *troubleshooting.ClientResult) string {
 	var b strings.Builder
 	b.WriteString("**해결 방법 요약**\n\n")
-	b.WriteString("- 추정 원인: " + summarizeDetectionTypes(signal.DetectionTypes) + "\n")
-	if len(runbook.Cases) > 0 {
-		b.WriteString("- 참고 runbook: " + runbook.Cases[0].Title + "\n")
+	b.WriteString("- 추정 원인: " + summarizeDetectionTypes(result.Signal.DetectionTypes) + "\n")
+	if len(result.Runbook.Cases) > 0 {
+		b.WriteString("- 참고 runbook: " + result.Runbook.Cases[0].Title + "\n")
 	}
-	if knowledge != nil && len(knowledge.Cases) > 0 {
-		b.WriteString("- 유사 사례: " + knowledge.Cases[0].Title + "\n")
+	if result.Knowledge != nil && len(result.Knowledge.Cases) > 0 {
+		b.WriteString("- 유사 사례: " + result.Knowledge.Cases[0].Title + "\n")
 	}
 	b.WriteString("- 권장 방향: 현재 Pod/이벤트/이전 로그로 OOMKilled 여부를 재확인한 뒤, 컨트롤러가 있는 워크로드라면 memory request/limit을 조정하고 rollout 상태를 검증합니다.\n")
-	b.WriteString(fmt.Sprintf("- 위험도: %s\n", plan.RiskLevel))
-	if validation != nil && !validation.Valid {
+	b.WriteString(fmt.Sprintf("- 위험도: %s\n", result.Plan.RiskLevel))
+	if result.Validation != nil && !result.Validation.Valid {
 		b.WriteString("- 주의: 일부 runbook 명령은 대상 정보가 부족해 자동 실행 후보에서 제외했습니다.\n")
 	}
 
-	steps := executableSummarySteps(plan.Steps, 5)
+	steps := executableSummarySteps(result.Plan.Steps, 5)
 	b.WriteString("\n**권장 단계**\n")
 	for i, step := range steps {
 		b.WriteString(fmt.Sprintf("%d. %s", i+1, step.Description))
@@ -348,7 +313,7 @@ func formatTroubleshootingSummary(signal diagnostic.ProblemSignal, runbook *trou
 		}
 		b.WriteString("\n")
 	}
-	verifySteps := executableSummarySteps(plan.Verification, 3)
+	verifySteps := executableSummarySteps(result.Plan.Verification, 3)
 	if len(verifySteps) > 0 {
 		b.WriteString("\n**검증**\n")
 		for _, step := range verifySteps {
@@ -390,6 +355,7 @@ func (f *TroubleshootingFlow) reset() {
 	f.problemText = ""
 	f.evidence = nil
 	f.searchBrief = nil
+	f.remediationBrief = ""
 }
 
 func looksTroubleshootable(text string) bool {
@@ -399,10 +365,52 @@ func looksTroubleshootable(text string) bool {
 		"failedscheduling", "pending", "back-off", "probe failed",
 		"no endpoints", "no space left", "permission denied", "connection refused",
 		"timeout", "deadline exceeded", "notready", "forbidden", "createcontainerconfigerror",
-		"오류", "실패", "장애", "조치가 필요",
+		"장애", "조치가 필요",
 	}
 	for _, keyword := range keywords {
 		if strings.Contains(lower, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldOfferTroubleshootingForQuery(query string) bool {
+	query = strings.TrimSpace(strings.ToLower(query))
+	if query == "" {
+		return false
+	}
+	actionIntent := []string{
+		"해결", "수정", "고쳐", "조치", "복구",
+		"troubleshoot", "troubleshooting", "fix", "resolve", "repair",
+	}
+	for _, keyword := range actionIntent {
+		if strings.Contains(query, keyword) {
+			return true
+		}
+	}
+	if isReadOnlyKubernetesQuery(query) {
+		return false
+	}
+	diagnosticIntent := []string{
+		"원인", "왜", "분석", "진단",
+		"debug", "diagnose", "analyze", "why",
+	}
+	for _, keyword := range diagnosticIntent {
+		if strings.Contains(query, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func isReadOnlyKubernetesQuery(query string) bool {
+	readOnlyIntent := []string{
+		"보여", "조회", "목록", "상세", "알려", "출력", "확인", "요약", "보고",
+		"describe", "get", "list", "show", "summarize",
+	}
+	for _, keyword := range readOnlyIntent {
+		if strings.Contains(query, keyword) {
 			return true
 		}
 	}

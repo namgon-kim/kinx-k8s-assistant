@@ -19,8 +19,8 @@ func TestEnsureKinxMCPConfigUsesOnlyAppConfig(t *testing.T) {
 	}
 	appConfig := filepath.Join(appConfigDir, "mcp.yaml")
 	if err := os.WriteFile(appConfig, []byte(`servers:
-  - name: trouble-shooting
-    url: http://localhost:9091/mcp
+  - name: log-analyzer
+    url: http://localhost:9090/mcp
     use_streaming: true
     timeout: 60
 `), 0o644); err != nil {
@@ -35,8 +35,8 @@ func TestEnsureKinxMCPConfigUsesOnlyAppConfig(t *testing.T) {
 		t.Fatalf("create kubectl config dir: %v", err)
 	}
 	if err := os.WriteFile(kubectlConfig, []byte(`servers:
-  - name: log-analyzer
-    url: http://localhost:9090/mcp
+  - name: stale-server
+    url: http://localhost:9999/mcp
 `), 0o644); err != nil {
 		t.Fatalf("write stale kubectl config: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestEnsureKinxMCPConfigUsesOnlyAppConfig(t *testing.T) {
 	if path != appConfig {
 		t.Fatalf("unexpected source path: got %s want %s", path, appConfig)
 	}
-	if len(cfg.Servers) != 1 || cfg.Servers[0].Name != "trouble-shooting" {
+	if len(cfg.Servers) != 1 || cfg.Servers[0].Name != "log-analyzer" {
 		t.Fatalf("unexpected servers: %+v", cfg.Servers)
 	}
 
@@ -56,10 +56,10 @@ func TestEnsureKinxMCPConfigUsesOnlyAppConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read synced kubectl config: %v", err)
 	}
-	if strings.Contains(string(synced), "log-analyzer") {
-		t.Fatalf("synced config should not include stale log-analyzer:\n%s", synced)
+	if strings.Contains(string(synced), "stale-server") {
+		t.Fatalf("synced config should not include stale server:\n%s", synced)
 	}
-	if !strings.Contains(string(synced), "trouble-shooting") {
+	if !strings.Contains(string(synced), "log-analyzer") {
 		t.Fatalf("synced config should include app config server:\n%s", synced)
 	}
 }
@@ -67,8 +67,8 @@ func TestEnsureKinxMCPConfigUsesOnlyAppConfig(t *testing.T) {
 func TestCheckKinxMCPServersOnlyChecksConfiguredHTTPServers(t *testing.T) {
 	cfg := &mcpConfigFile{
 		Servers: []mcpServerConfig{
-			{Name: "log-analyzer", Command: "log-analyzer-server"},
-			{Name: "trouble-shooting", URL: "http://127.0.0.1:1/mcp"},
+			{Name: "stdio-tool", Command: "stdio-tool"},
+			{Name: "log-analyzer", URL: "http://127.0.0.1:1/mcp"},
 		},
 	}
 
@@ -77,10 +77,10 @@ func TestCheckKinxMCPServersOnlyChecksConfiguredHTTPServers(t *testing.T) {
 		t.Fatal("expected missing HTTP server error")
 	}
 	msg := err.Error()
-	if strings.Contains(msg, "log-analyzer") {
+	if strings.Contains(msg, "stdio-tool") {
 		t.Fatalf("stdio server should not be preflight-checked: %s", msg)
 	}
-	if !strings.Contains(msg, "trouble-shooting") {
+	if !strings.Contains(msg, "log-analyzer") {
 		t.Fatalf("configured HTTP server should be reported: %s", msg)
 	}
 }

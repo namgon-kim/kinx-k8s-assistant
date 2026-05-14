@@ -204,6 +204,8 @@ func main() {
 		"ReAct 루프 최대 반복 횟수")
 	f.BoolVar(&cfg.ShowToolOutput, "show-tool-output", cfg.ShowToolOutput,
 		"Tool 실행 결과를 화면에 출력")
+	f.BoolVar(&cfg.ReadOnly, "read-only", cfg.ReadOnly,
+		"읽기 전용 모드 활성화 (Kubernetes 리소스 변경 명령 차단)")
 	f.StringVar(&cfg.PromptTemplateFile, "prompt-template", cfg.PromptTemplateFile,
 		"커스텀 시스템 프롬프트 템플릿 파일 경로 (기본: prompts/default.tmpl)")
 	f.StringVar(&cfg.SessionBackend, "session-backend", cfg.SessionBackend,

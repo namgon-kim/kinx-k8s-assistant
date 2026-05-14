@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 )
@@ -66,7 +65,7 @@ func parseReActResponse(input string) (*reActResponse, error) {
 	if !found {
 		return nil, fmt.Errorf("no JSON code block found in shim response: %q", strings.TrimSpace(input))
 	}
-	cleaned = repairJSONStrings(strings.TrimSpace(cleaned))
+	cleaned = repairUnescapedQuotesInJSONStrings(strings.TrimSpace(cleaned))
 
 	var parsed reActResponse
 	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
@@ -85,26 +84,31 @@ func extractJSON(input string) (string, bool) {
 	return input[first+len(marker) : last], true
 }
 
-func repairJSONStrings(input string) string {
+func repairUnescapedQuotesInJSONStrings(input string) string {
 	var out strings.Builder
 	out.Grow(len(input))
 
 	inString := false
 	escaped := false
-	for _, r := range input {
+	for i := 0; i < len(input); i++ {
+		ch := input[i]
 		if inString {
 			if escaped {
-				out.WriteRune(r)
+				out.WriteByte(ch)
 				escaped = false
 				continue
 			}
-			switch r {
+			switch ch {
 			case '\\':
-				out.WriteRune(r)
+				out.WriteByte(ch)
 				escaped = true
 			case '"':
-				out.WriteRune(r)
-				inString = false
+				if isJSONStringTerminator(input, i) {
+					out.WriteByte(ch)
+					inString = false
+				} else {
+					out.WriteString(`\"`)
+				}
 			case '\n':
 				out.WriteString(`\n`)
 			case '\r':
@@ -112,24 +116,35 @@ func repairJSONStrings(input string) string {
 			case '\t':
 				out.WriteString(`\t`)
 			default:
-				if r < 0x20 || r == utf8.RuneError {
-					out.WriteString(fmt.Sprintf(`\u%04x`, r))
-				} else {
-					out.WriteRune(r)
+				if ch < 0x20 {
+					out.WriteString(fmt.Sprintf(`\u%04x`, ch))
+					continue
 				}
+				out.WriteByte(ch)
 			}
 			continue
 		}
 
-		if r == '"' {
+		if ch == '"' {
 			inString = true
 		}
-		if r < 0x20 {
-			continue
-		}
-		out.WriteRune(r)
+		out.WriteByte(ch)
 	}
 	return out.String()
+}
+
+func isJSONStringTerminator(input string, quoteIndex int) bool {
+	for i := quoteIndex + 1; i < len(input); i++ {
+		switch input[i] {
+		case ' ', '\n', '\r', '\t':
+			continue
+		case ':', ',', '}', ']':
+			return true
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 type shimResponse struct {
@@ -155,7 +170,11 @@ func (c *shimCandidate) String() string {
 func (c *shimCandidate) Parts() []gollm.Part {
 	var parts []gollm.Part
 	if c.candidate.Thought != "" {
-		parts = append(parts, &shimPart{text: c.candidate.Thought})
+		text := c.candidate.Thought
+		if c.candidate.Answer != "" {
+			text += "\n\n"
+		}
+		parts = append(parts, &shimPart{text: text})
 	}
 	if c.candidate.Answer != "" {
 		parts = append(parts, &shimPart{text: c.candidate.Answer})

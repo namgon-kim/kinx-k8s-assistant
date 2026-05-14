@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/mcp"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
@@ -73,10 +72,6 @@ func RegisterMCPTools(ctx context.Context, registry *tools.Tools) (*mcp.Manager,
 	}
 
 	if err := manager.RegisterWithToolSystem(ctx, func(serverName string, toolInfo mcp.Tool) error {
-		if isInternalTroubleshootingServer(serverName) {
-			klog.Infof("trouble-shooting MCP tool은 LLM registry에 등록하지 않습니다: %s_%s", serverName, toolInfo.Name)
-			return nil
-		}
 		schema, err := tools.ConvertToolToGollm(&toolInfo)
 		if err != nil {
 			return err
@@ -93,11 +88,6 @@ func RegisterMCPTools(ctx context.Context, registry *tools.Tools) (*mcp.Manager,
 	}
 
 	return manager, nil
-}
-
-func isInternalTroubleshootingServer(name string) bool {
-	normalized := strings.ToLower(strings.ReplaceAll(name, "_", "-"))
-	return normalized == "trouble-shooting" || normalized == "troubleshooting"
 }
 
 func (r *Registry) Close() error {

@@ -84,6 +84,8 @@ func GetMetaCommands() []MetaCmd {
 		{"/kubeconfig", "kubeconfig 파일 설정"},
 		{"/kube-context", "Kubernetes 컨텍스트 관리"},
 		{"/model", "LLM 모델 변경"},
+		{"/lang", "출력 언어 조회/변경"},
+		{"/readonly", "read-only 모드 조회/변경"},
 		{"/save", "현재 설정을 저장"},
 	}
 }
@@ -451,6 +453,7 @@ func (o *Orchestrator) readAndDispatchInput(ctx context.Context) error {
 	}
 
 	o.logEntry("user_input", input)
+	o.troubleshooting.ObserveUserInput(input)
 	return o.startAgent(ctx, input)
 }
 
@@ -461,6 +464,7 @@ func (o *Orchestrator) startAgent(ctx context.Context, initialQuery string) erro
 	if o.agentWrap != nil {
 		return nil
 	}
+	o.troubleshooting.ObserveUserInput(initialQuery)
 
 	klog.Info("agent 초기화 중...", "kubeconfig", o.cfg.Kubeconfig, "context", o.cfg.CurrentContext)
 	agentWrap, err := react.New(o.cfg)
@@ -607,6 +611,7 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 	}
 
 	o.logEntry("user_input", input)
+	o.troubleshooting.ObserveUserInput(input)
 	activeAgent.SendInput(&api.UserInputResponse{Query: input})
 	return nil
 }
@@ -891,6 +896,20 @@ func (o *Orchestrator) handleMetaCommand(input string) error {
 		}
 		return o.setModel(strings.Join(args, " "))
 
+	case "lang":
+		if len(args) == 0 || args[0] == "status" {
+			o.printLangStatus()
+			return nil
+		}
+		return o.setLang(args[0])
+
+	case "readonly":
+		if len(args) == 0 || args[0] == "status" {
+			o.printReadOnlyStatus()
+			return nil
+		}
+		return o.setReadOnly(args[0])
+
 	case "save":
 		if err := o.cfg.Save(); err != nil {
 			return fmt.Errorf("설정 저장 실패: %w", err)
@@ -918,6 +937,9 @@ func (o *Orchestrator) printHelp() {
 	fmt.Printf("  예) \"현재 실행 중인 pod 목록 보여줘\"\n")
 	fmt.Printf("  예) \"nginx deployment를 3개로 스케일링해줘\"\n")
 	fmt.Println()
+	fmt.Printf("%sread-only:%s /readonly on|off|status\n", colorYellow, colorReset)
+	fmt.Printf("%s언어:%s /lang Korean|English|status\n", colorYellow, colorReset)
+	fmt.Println()
 	fmt.Printf("%s종료:%s exit 또는 Ctrl+C\n", colorYellow, colorReset)
 	fmt.Println()
 }
@@ -935,6 +957,11 @@ func (o *Orchestrator) printConfig() {
 	}
 	fmt.Printf("  Session Backend: %s\n", o.cfg.SessionBackend)
 	fmt.Printf("  Max Iterations: %d\n", o.cfg.MaxIterations)
+	fmt.Printf("  Language: %s\n", o.cfg.Lang.Language)
+	if o.cfg.Lang.Model != "" {
+		fmt.Printf("  Lang Model: openai-compatible/%s\n", o.cfg.Lang.Model)
+	}
+	fmt.Printf("  Read Only: %t\n", o.cfg.ReadOnly)
 	fmt.Println()
 }
 
@@ -1141,6 +1168,84 @@ func (o *Orchestrator) setModel(modelName string) error {
 	o.invalidateAgent("model changed")
 	fmt.Println()
 	fmt.Printf("%s✓ 모델이 변경되었습니다: %s%s\n", colorBrightGreen, modelName, colorReset)
+	fmt.Printf("%s💾 /save 명령으로 설정을 저장하세요%s\n", colorYellow, colorReset)
+	fmt.Println()
+	return nil
+}
+
+func (o *Orchestrator) printLangStatus() {
+	fmt.Println()
+	fmt.Printf("%slanguage: %s%s\n", colorBrightCyan, o.cfg.Lang.Language, colorReset)
+	if strings.EqualFold(o.cfg.Lang.Language, "Korean") {
+		if o.cfg.Lang.Model != "" && o.cfg.Lang.Endpoint != "" {
+			fmt.Printf("  번역 모델: openai-compatible/%s (%s)\n", o.cfg.Lang.Model, o.cfg.Lang.Endpoint)
+		} else {
+			fmt.Println("  번역 모델이 설정되지 않아 primary model 출력 언어 정책을 사용합니다.")
+		}
+	}
+	fmt.Println()
+}
+
+func (o *Orchestrator) setLang(value string) error {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	var language string
+	switch normalized {
+	case "korean", "ko":
+		language = "Korean"
+	case "english", "en":
+		language = "English"
+	default:
+		return fmt.Errorf("사용법: /lang Korean|English|status")
+	}
+
+	if o.cfg.Lang.Language == language {
+		o.printLangStatus()
+		return nil
+	}
+
+	o.cfg.Lang.Language = language
+	o.invalidateAgent("language changed")
+	o.printLangStatus()
+	fmt.Printf("%s💾 /save 명령으로 설정을 저장하세요%s\n", colorYellow, colorReset)
+	fmt.Println()
+	return nil
+}
+
+func (o *Orchestrator) printReadOnlyStatus() {
+	status := "off"
+	if o.cfg.ReadOnly {
+		status = "on"
+	}
+	fmt.Println()
+	fmt.Printf("%sread-only: %s%s\n", colorBrightCyan, status, colorReset)
+	if o.cfg.ReadOnly {
+		fmt.Println("  Kubernetes 리소스 변경 명령은 차단됩니다.")
+	} else {
+		fmt.Println("  Kubernetes 리소스 변경 명령은 기존 승인 흐름을 따릅니다.")
+	}
+	fmt.Println()
+}
+
+func (o *Orchestrator) setReadOnly(value string) error {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	var enabled bool
+	switch normalized {
+	case "on", "true", "yes", "y", "1", "enable", "enabled":
+		enabled = true
+	case "off", "false", "no", "n", "0", "disable", "disabled":
+		enabled = false
+	default:
+		return fmt.Errorf("사용법: /readonly on|off|status")
+	}
+
+	if o.cfg.ReadOnly == enabled {
+		o.printReadOnlyStatus()
+		return nil
+	}
+
+	o.cfg.ReadOnly = enabled
+	o.invalidateAgent("read-only mode changed")
+	o.printReadOnlyStatus()
 	fmt.Printf("%s💾 /save 명령으로 설정을 저장하세요%s\n", colorYellow, colorReset)
 	fmt.Println()
 	return nil

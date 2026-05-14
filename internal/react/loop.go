@@ -42,6 +42,7 @@ type Loop struct {
 	cfg      *config.Config
 	llm      gollm.Client
 	chat     gollm.Chat
+	lang     *langTranslator
 	registry *toolconnector.Registry
 	executor sandbox.Executor
 	workDir  string
@@ -139,7 +140,9 @@ func (l *Loop) init(ctx context.Context) error {
 	}
 	l.registry = registry
 
-	systemPrompt, err := buildSystemPrompt(l.cfg.PromptTemplateFile, registry.Tools, l.cfg.EnableToolUseShim)
+	l.lang = newLangTranslator(l.cfg)
+
+	systemPrompt, err := buildSystemPrompt(l.cfg.PromptTemplateFile, registry.Tools, l.cfg.EnableToolUseShim, l.cfg.ReadOnly, l.cfg.Lang.Language, l.lang.enabled())
 	if err != nil {
 		return err
 	}
@@ -351,6 +354,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	if strings.TrimSpace(streamedText) != "" {
+		streamedText = l.translateModelText(ctx, streamedText)
 		l.addMessage(api.MessageSourceModel, api.MessageTypeText, streamedText)
 	}
 
@@ -384,6 +388,10 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		}
 	}
 
+	if l.cfg.ReadOnly && l.hasModifyingCalls() {
+		l.rejectReadOnlyModifyingCalls()
+		return nil
+	}
 	if !l.skipPermissions && l.hasModifyingCalls() {
 		l.requestApproval()
 		l.state = StateWaitingApproval
@@ -439,7 +447,45 @@ func (l *Loop) modifiesResource(parsed *tools.ToolCall, call gollm.FunctionCall)
 	if isObservationToolName(call.Name) {
 		return "no"
 	}
+	if isReadOnlyKubectlCommand(call) {
+		return "no"
+	}
 	return parsed.GetTool().CheckModifiesResource(call.Arguments)
+}
+
+func isReadOnlyKubectlCommand(call gollm.FunctionCall) bool {
+	if strings.ToLower(call.Name) != "kubectl" {
+		return false
+	}
+	raw, ok := call.Arguments["command"].(string)
+	if !ok {
+		return false
+	}
+	command := strings.TrimSpace(raw)
+	if command == "" {
+		return false
+	}
+	lower := strings.ToLower(command)
+	for _, forbidden := range []string{
+		" apply ", " delete ", " patch ", " replace ", " edit ", " scale ",
+		" rollout restart ", " set ", " create ", " annotate ", " label ",
+		" cordon", " uncordon", " drain", " taint",
+	} {
+		if strings.Contains(" "+lower+" ", forbidden) {
+			return false
+		}
+	}
+	first := strings.TrimSpace(strings.Split(command, "|")[0])
+	fields := strings.Fields(first)
+	if len(fields) < 2 || fields[0] != "kubectl" {
+		return false
+	}
+	switch fields[1] {
+	case "get", "describe", "logs", "top", "api-resources", "api-versions", "version", "config", "auth":
+		return true
+	default:
+		return false
+	}
 }
 
 func isAssistantManagedToolName(name string) bool {
@@ -461,6 +507,33 @@ func (l *Loop) hasModifyingCalls() bool {
 		}
 	}
 	return false
+}
+
+func (l *Loop) rejectReadOnlyModifyingCalls() {
+	var descriptions []string
+	for _, call := range l.pendingCalls {
+		if call.ModifiesResource == "no" {
+			continue
+		}
+		descriptions = append(descriptions, call.ParsedToolCall.Description())
+		l.appendToolObservation(call, map[string]any{
+			"error":              "read-only mode is enabled; commands that modify Kubernetes resources are blocked.",
+			"status":             "blocked",
+			"retryable":          false,
+			"modifies_resource":  call.ModifiesResource,
+			"read_only_mode":     true,
+			"allowed_operation":  "read-only diagnostics such as get, describe, logs, top, events",
+			"blocked_operation":  call.ParsedToolCall.Description(),
+			"suggested_response": "Explain that read-only mode blocks this change and provide a non-mutating diagnostic or manual recommendation.",
+		})
+	}
+	if len(descriptions) == 0 {
+		descriptions = append(descriptions, "리소스 변경 명령")
+	}
+	l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "read-only 모드가 활성화되어 리소스 변경 명령을 차단했습니다:\n* "+strings.Join(descriptions, "\n* "))
+	l.pendingCalls = nil
+	l.currIteration++
+	l.state = StateRunning
 }
 
 func (l *Loop) requestApproval() {
@@ -548,6 +621,24 @@ func (l *Loop) appendToolObservation(call PendingCall, result map[string]any) {
 		Name:   call.FunctionCall.Name,
 		Result: result,
 	})
+}
+
+func (l *Loop) translateModelText(ctx context.Context, text string) string {
+	if l.lang == nil || !l.lang.enabled() || strings.TrimSpace(text) == "" {
+		return text
+	}
+	if strings.EqualFold(strings.TrimSpace(l.cfg.Lang.Language), "English") {
+		return text
+	}
+	translated, err := l.lang.translate(ctx, text)
+	if err != nil {
+		klog.Warningf("lang translation failed: %v", err)
+		return "번역 모델 호출에 실패했습니다. /lang status의 model과 endpoint 설정을 확인하세요."
+	}
+	if strings.TrimSpace(translated) == "" {
+		return "번역 모델이 빈 응답을 반환했습니다. /lang status의 model과 endpoint 설정을 확인하세요."
+	}
+	return translated
 }
 
 func (l *Loop) addMessage(source api.MessageSource, messageType api.MessageType, payload any) {
