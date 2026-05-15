@@ -62,6 +62,11 @@ lang:
   endpoint: ""                # OpenAI-compatible endpoint, e.g. http://1.201.177.120:4000
   apikey: ""                  # Optional API key
 
+# ===== Log Analyzer =====
+
+log_analyzer:
+  enabled: true               # Detailed source settings live in ~/.k8s-assistant/log-analyzer.yaml
+
 # ===== Advanced Settings =====
 
 mcp_client: false             # Enable MCP client support (for log-analyzer integration, etc.)

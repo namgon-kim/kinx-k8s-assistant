@@ -1,87 +1,364 @@
-// Package loganalyzer는 컨테이너 로그 분석 및 RAG 기반 트러블슈팅 기능을 제공합니다.
-//
-// 현재 상태: 기획 단계 (인터페이스 정의만 완료)
-// 구현 예정:
-//   - Filebeat 수집 로그 파일 접근
-//   - 로그 패턴 분석 (에러 스파이크, OOMKilled, CrashLoop 등)
-//   - RAG 기반 유사 장애 사례 검색 (벡터 DB 활용)
-//   - 인프라 환경별 대처 방안 제시 (Runbook, 조치 가이드)
-//
-// 이 패키지는 kubectl-ai의 MCP 클라이언트 모드를 통해 연동됩니다.
-// kubectl-ai --mcp-client 실행 시 ~/.config/kubectl-ai/mcp.yaml의
-// log-analyzer 서버가 자동으로 연결됩니다.
+// Package loganalyzer provides read-only log and metric evidence collection.
 package loganalyzer
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
-// Analyzer는 로그 분석 기능의 인터페이스를 정의합니다.
 type Analyzer interface {
-	// FetchLogs는 지정된 Pod/컨테이너의 수집된 로그를 반환합니다.
-	// Filebeat 등 로그 수집 에이전트가 저장한 파일에서 읽습니다.
 	FetchLogs(ctx context.Context, req FetchLogsRequest) (*FetchLogsResult, error)
-
-	// AnalyzePattern은 로그에서 이상 패턴을 탐지합니다.
-	// CrashLoop, OOMKilled, 에러 스파이크 등을 감지합니다.
+	QueryLokiInstant(ctx context.Context, req LokiQueryRequest) (*LogQueryResult, error)
+	QueryLoki(ctx context.Context, req LokiQueryRequest) (*LogQueryResult, error)
+	QueryLokiLabels(ctx context.Context, req LokiLabelsRequest) (*LokiLabelsResult, error)
+	QueryLokiSeries(ctx context.Context, req LokiSeriesRequest) (*LokiSeriesResult, error)
+	QueryPrometheusInstant(ctx context.Context, req PrometheusInstantRequest) (*MetricQueryResult, error)
+	QueryPrometheusRange(ctx context.Context, req PrometheusRangeRequest) (*MetricQueryResult, error)
+	ListPrometheusAlerts(ctx context.Context) (*PrometheusAlertsResult, error)
+	ListPrometheusRules(ctx context.Context) (*PrometheusRulesResult, error)
+	ListPrometheusTargets(ctx context.Context) (*PrometheusTargetsResult, error)
+	ListGrafanaDatasources(ctx context.Context) (*GrafanaDatasourcesResult, error)
+	QueryGrafanaDatasource(ctx context.Context, req GrafanaDatasourceQueryRequest) (*GrafanaDatasourceQueryResult, error)
+	SearchGrafanaDashboards(ctx context.Context, req GrafanaDashboardSearchRequest) (*GrafanaDashboardSearchResult, error)
+	GetGrafanaDashboard(ctx context.Context, req GrafanaDashboardRequest) (*GrafanaDashboardResult, error)
+	ExtractGrafanaPanelQueries(ctx context.Context, req GrafanaPanelQueryRequest) (*GrafanaPanelQueryResult, error)
+	ListGrafanaAlertRules(ctx context.Context) (*GrafanaAlertRulesResult, error)
+	ListOpenSearchIndices(ctx context.Context) (*OpenSearchIndicesResult, error)
+	GetOpenSearchMapping(ctx context.Context, req OpenSearchMappingRequest) (*OpenSearchMappingResult, error)
+	QueryOpenSearch(ctx context.Context, req OpenSearchQueryRequest) (*OpenSearchQueryResult, error)
+	CheckSources(ctx context.Context) (*SourceCheckResult, error)
 	AnalyzePattern(ctx context.Context, req AnalyzePatternRequest) (*AnalyzePatternResult, error)
-
-	// RAGLookup은 증상 설명으로 유사 장애 사례를 검색합니다.
-	RAGLookup(ctx context.Context, req RAGLookupRequest) (*RAGLookupResult, error)
-
-	// AnalyzeAndRemediate는 FetchLogs → AnalyzePattern → RAGLookup → 조치 제안을
-	// 하나의 파이프라인으로 실행합니다.
-	AnalyzeAndRemediate(ctx context.Context, req RemediateRequest) (*RemediateResult, error)
+	AnalyzeMetricPattern(ctx context.Context, req AnalyzeMetricPatternRequest) (*AnalyzeMetricPatternResult, error)
+	KeyEvidence(ctx context.Context, req KeyEvidenceRequest) (*KeyEvidenceResult, error)
+	SummarizeEvidence(ctx context.Context, req SummarizeEvidenceRequest) (*EvidenceSummaryResult, error)
+	GetArtifactSample(ctx context.Context, req ArtifactSampleRequest) (*ArtifactSampleResult, error)
+	CleanArtifacts(ctx context.Context, req CleanArtifactsRequest) (*CleanArtifactsResult, error)
 }
 
-// --- Request/Result 타입 ---
-
-// FetchLogsRequest는 로그 조회 요청입니다.
 type FetchLogsRequest struct {
-	Namespace     string
-	PodName       string
-	ContainerName string
-	// 조회 시간 범위 (Unix timestamp)
-	SinceSeconds int64
-	MaxLines     int
+	Source        string `json:"source,omitempty"`
+	Index         string `json:"index,omitempty"`
+	FilePath      string `json:"file_path,omitempty"`
+	Namespace     string `json:"namespace,omitempty"`
+	PodName       string `json:"pod_name,omitempty"`
+	ContainerName string `json:"container_name,omitempty"`
+	SinceSeconds  int64  `json:"since_seconds,omitempty"`
+	MaxLines      int    `json:"max_lines,omitempty"`
+	Level         string `json:"level,omitempty"`
 }
 
-// FetchLogsResult는 로그 조회 결과입니다.
 type FetchLogsResult struct {
-	Logs      []LogEntry
-	TotalLine int
-	Source    string // 로그 파일 경로
+	Logs       []LogEntry `json:"logs,omitempty"`
+	TotalLine  int        `json:"total_line"`
+	Source     string     `json:"source"`
+	ArtifactID string     `json:"artifact_id,omitempty"`
+	Artifact   string     `json:"artifact,omitempty"`
+	Sample     []LogEntry `json:"sample,omitempty"`
+	Summary    string     `json:"summary,omitempty"`
 }
 
-// LogEntry는 단일 로그 라인입니다.
 type LogEntry struct {
-	Timestamp string
-	Level     string // INFO, WARN, ERROR, FATAL
-	Message   string
-	Raw       string
+	Timestamp string `json:"timestamp,omitempty"`
+	Level     string `json:"level,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Raw       string `json:"raw,omitempty"`
 }
 
-// AnalyzePatternRequest는 패턴 분석 요청입니다.
+type LokiQueryRequest struct {
+	Query     string    `json:"query"`
+	Start     time.Time `json:"start,omitempty"`
+	End       time.Time `json:"end,omitempty"`
+	Step      string    `json:"step,omitempty"`
+	Limit     int       `json:"limit,omitempty"`
+	Direction string    `json:"direction,omitempty"`
+}
+
+type LokiLabelsRequest struct {
+	Name    string    `json:"name,omitempty"`
+	Matcher []string  `json:"matcher,omitempty"`
+	Query   string    `json:"query,omitempty"`
+	Start   time.Time `json:"start,omitempty"`
+	End     time.Time `json:"end,omitempty"`
+}
+
+type LokiLabelsResult struct {
+	Labels []string `json:"labels"`
+	Source string   `json:"source"`
+}
+
+type LogQueryResult struct {
+	Entries    []LogEntry `json:"entries,omitempty"`
+	TotalLine  int        `json:"total_line"`
+	Source     string     `json:"source"`
+	Query      string     `json:"query,omitempty"`
+	ArtifactID string     `json:"artifact_id,omitempty"`
+	Artifact   string     `json:"artifact,omitempty"`
+	Sample     []LogEntry `json:"sample,omitempty"`
+	Summary    string     `json:"summary,omitempty"`
+}
+
+type LokiSeriesRequest struct {
+	Matcher []string  `json:"matcher,omitempty"`
+	Query   string    `json:"query,omitempty"`
+	Start   time.Time `json:"start,omitempty"`
+	End     time.Time `json:"end,omitempty"`
+}
+
+type LokiSeriesResult struct {
+	Series []map[string]string `json:"series"`
+	Source string              `json:"source"`
+}
+
+type PrometheusInstantRequest struct {
+	Query string    `json:"query"`
+	Time  time.Time `json:"time,omitempty"`
+}
+
+type PrometheusRangeRequest struct {
+	Query string    `json:"query"`
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+	Step  string    `json:"step"`
+}
+
+type MetricQueryResult struct {
+	Query      string         `json:"query"`
+	Source     string         `json:"source"`
+	ResultType string         `json:"result_type,omitempty"`
+	Series     []MetricSeries `json:"series,omitempty"`
+	Warnings   []string       `json:"warnings,omitempty"`
+	Infos      []string       `json:"infos,omitempty"`
+	ArtifactID string         `json:"artifact_id,omitempty"`
+	Artifact   string         `json:"artifact,omitempty"`
+	Summary    string         `json:"summary,omitempty"`
+}
+
+type MetricSeries struct {
+	Metric map[string]string `json:"metric,omitempty"`
+	Values []MetricPoint     `json:"values,omitempty"`
+}
+
+type MetricPoint struct {
+	Timestamp int64   `json:"timestamp"`
+	Value     float64 `json:"value"`
+	Raw       string  `json:"raw,omitempty"`
+}
+
+type PrometheusAlertsResult struct {
+	Alerts     []PrometheusAlert `json:"alerts"`
+	Source     string            `json:"source"`
+	Warnings   []string          `json:"warnings,omitempty"`
+	Infos      []string          `json:"infos,omitempty"`
+	ArtifactID string            `json:"artifact_id,omitempty"`
+	Artifact   string            `json:"artifact,omitempty"`
+	Summary    string            `json:"summary,omitempty"`
+}
+
+type PrometheusAlert struct {
+	State       string            `json:"state,omitempty"`
+	Name        string            `json:"name,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+	ActiveAt    string            `json:"activeAt,omitempty"`
+	Value       string            `json:"value,omitempty"`
+}
+
+type PrometheusRulesResult struct {
+	Groups     []map[string]any `json:"groups"`
+	Source     string           `json:"source"`
+	Warnings   []string         `json:"warnings,omitempty"`
+	Infos      []string         `json:"infos,omitempty"`
+	ArtifactID string           `json:"artifact_id,omitempty"`
+	Artifact   string           `json:"artifact,omitempty"`
+	Summary    string           `json:"summary,omitempty"`
+}
+
+type PrometheusTargetsResult struct {
+	ActiveTargets  []map[string]any `json:"active_targets"`
+	DroppedTargets []map[string]any `json:"dropped_targets,omitempty"`
+	Source         string           `json:"source"`
+	Warnings       []string         `json:"warnings,omitempty"`
+	Infos          []string         `json:"infos,omitempty"`
+	ArtifactID     string           `json:"artifact_id,omitempty"`
+	Artifact       string           `json:"artifact,omitempty"`
+	Summary        string           `json:"summary,omitempty"`
+}
+
+type GrafanaDatasourcesResult struct {
+	Datasources []GrafanaDatasource `json:"datasources"`
+	Source      string              `json:"source"`
+	ArtifactID  string              `json:"artifact_id,omitempty"`
+	Artifact    string              `json:"artifact,omitempty"`
+	Summary     string              `json:"summary,omitempty"`
+}
+
+type GrafanaDatasource struct {
+	ID        int    `json:"id,omitempty"`
+	UID       string `json:"uid,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Type      string `json:"type,omitempty"`
+	URL       string `json:"url,omitempty"`
+	Access    string `json:"access,omitempty"`
+	IsDefault bool   `json:"isDefault,omitempty"`
+}
+
+type GrafanaDatasourceQueryRequest struct {
+	DatasourceUID string            `json:"datasource_uid"`
+	Path          string            `json:"path,omitempty"`
+	Params        map[string]string `json:"params,omitempty"`
+	Query         string            `json:"query,omitempty"`
+	Start         time.Time         `json:"start,omitempty"`
+	End           time.Time         `json:"end,omitempty"`
+	Time          time.Time         `json:"time,omitempty"`
+	Step          string            `json:"step,omitempty"`
+	Limit         int               `json:"limit,omitempty"`
+}
+
+type GrafanaDatasourceQueryResult struct {
+	DatasourceUID string         `json:"datasource_uid"`
+	Path          string         `json:"path"`
+	Source        string         `json:"source"`
+	Result        map[string]any `json:"result,omitempty"`
+	ArtifactID    string         `json:"artifact_id,omitempty"`
+	Artifact      string         `json:"artifact,omitempty"`
+	Summary       string         `json:"summary,omitempty"`
+}
+
+type GrafanaDashboardSearchRequest struct {
+	Query string `json:"query,omitempty"`
+	Type  string `json:"type,omitempty"`
+	Limit int    `json:"limit,omitempty"`
+}
+
+type GrafanaDashboardSearchResult struct {
+	Dashboards []map[string]any `json:"dashboards"`
+	Source     string           `json:"source"`
+	ArtifactID string           `json:"artifact_id,omitempty"`
+	Artifact   string           `json:"artifact,omitempty"`
+	Summary    string           `json:"summary,omitempty"`
+}
+
+type GrafanaDashboardRequest struct {
+	UID string `json:"uid"`
+}
+
+type GrafanaDashboardResult struct {
+	UID        string         `json:"uid"`
+	Title      string         `json:"title,omitempty"`
+	Dashboard  map[string]any `json:"dashboard,omitempty"`
+	Meta       map[string]any `json:"meta,omitempty"`
+	Source     string         `json:"source"`
+	ArtifactID string         `json:"artifact_id,omitempty"`
+	Artifact   string         `json:"artifact,omitempty"`
+	Summary    string         `json:"summary,omitempty"`
+}
+
+type GrafanaPanelQueryRequest struct {
+	UID        string `json:"uid,omitempty"`
+	ArtifactID string `json:"artifact_id,omitempty"`
+}
+
+type GrafanaPanelQueryResult struct {
+	UID     string              `json:"uid,omitempty"`
+	Queries []GrafanaPanelQuery `json:"queries"`
+	Source  string              `json:"source,omitempty"`
+	Summary string              `json:"summary,omitempty"`
+}
+
+type GrafanaPanelQuery struct {
+	PanelID    int            `json:"panel_id,omitempty"`
+	PanelTitle string         `json:"panel_title,omitempty"`
+	Datasource map[string]any `json:"datasource,omitempty"`
+	RefID      string         `json:"ref_id,omitempty"`
+	Expression string         `json:"expression,omitempty"`
+	Raw        map[string]any `json:"raw,omitempty"`
+}
+
+type GrafanaAlertRulesResult struct {
+	Rules      []map[string]any `json:"rules"`
+	Source     string           `json:"source"`
+	ArtifactID string           `json:"artifact_id,omitempty"`
+	Artifact   string           `json:"artifact,omitempty"`
+	Summary    string           `json:"summary,omitempty"`
+}
+
+type OpenSearchIndicesResult struct {
+	Indices    []map[string]any `json:"indices"`
+	Source     string           `json:"source"`
+	ArtifactID string           `json:"artifact_id,omitempty"`
+	Artifact   string           `json:"artifact,omitempty"`
+	Summary    string           `json:"summary,omitempty"`
+}
+
+type OpenSearchMappingRequest struct {
+	Index string `json:"index,omitempty"`
+}
+
+type OpenSearchMappingResult struct {
+	Index      string         `json:"index"`
+	Source     string         `json:"source"`
+	Fields     []string       `json:"fields,omitempty"`
+	Mapping    map[string]any `json:"mapping,omitempty"`
+	ArtifactID string         `json:"artifact_id,omitempty"`
+	Artifact   string         `json:"artifact,omitempty"`
+	Summary    string         `json:"summary,omitempty"`
+}
+
+type OpenSearchQueryRequest struct {
+	Index         string    `json:"index,omitempty"`
+	QueryString   string    `json:"query_string,omitempty"`
+	Namespace     string    `json:"namespace,omitempty"`
+	PodName       string    `json:"pod_name,omitempty"`
+	ContainerName string    `json:"container_name,omitempty"`
+	Level         string    `json:"level,omitempty"`
+	Message       string    `json:"message,omitempty"`
+	Start         time.Time `json:"start,omitempty"`
+	End           time.Time `json:"end,omitempty"`
+	Limit         int       `json:"limit,omitempty"`
+}
+
+type OpenSearchQueryResult struct {
+	Index      string     `json:"index"`
+	Source     string     `json:"source"`
+	Total      int        `json:"total"`
+	Sample     []LogEntry `json:"sample,omitempty"`
+	ArtifactID string     `json:"artifact_id,omitempty"`
+	Artifact   string     `json:"artifact,omitempty"`
+	Summary    string     `json:"summary,omitempty"`
+}
+
+type SourceCheckResult struct {
+	Sources []SourceStatus `json:"sources"`
+}
+
+type SourceStatus struct {
+	Name       string `json:"name"`
+	Enabled    bool   `json:"enabled"`
+	Configured bool   `json:"configured"`
+	Reachable  bool   `json:"reachable"`
+	Error      string `json:"error,omitempty"`
+}
+
 type AnalyzePatternRequest struct {
-	Logs      []LogEntry
-	PodName   string
-	Namespace string
+	Logs       []LogEntry `json:"logs,omitempty"`
+	ArtifactID string     `json:"artifact_id,omitempty"`
+	PodName    string     `json:"pod_name,omitempty"`
+	Namespace  string     `json:"namespace,omitempty"`
 }
 
-// AnalyzePatternResult는 패턴 분석 결과입니다.
 type AnalyzePatternResult struct {
-	Patterns  []DetectedPattern
-	Severity  string // critical, warning, info
-	Summary   string
+	Patterns []DetectedPattern `json:"patterns"`
+	Severity string            `json:"severity"`
+	Summary  string            `json:"summary"`
 }
 
-// DetectedPattern은 탐지된 이상 패턴입니다.
 type DetectedPattern struct {
-	Type        PatternType
-	Description string
-	Count       int
-	Timestamps  []string
+	Type        PatternType `json:"type"`
+	Description string      `json:"description"`
+	Count       int         `json:"count"`
+	Timestamps  []string    `json:"timestamps,omitempty"`
 }
 
-// PatternType은 이상 패턴 종류입니다.
 type PatternType string
 
 const (
@@ -92,59 +369,75 @@ const (
 	PatternDiskFull    PatternType = "DiskFull"
 )
 
-// RAGLookupRequest는 RAG 검색 요청입니다.
-type RAGLookupRequest struct {
-	Symptom    string   // 증상 설명 (자연어)
-	Patterns   []string // 탐지된 패턴 목록
-	MaxResults int
+type AnalyzeMetricPatternRequest struct {
+	Result     *MetricQueryResult `json:"result,omitempty"`
+	ArtifactID string             `json:"artifact_id,omitempty"`
+	Query      string             `json:"query,omitempty"`
 }
 
-// RAGLookupResult는 RAG 검색 결과입니다.
-type RAGLookupResult struct {
-	Cases []SimilarCase
+type AnalyzeMetricPatternResult struct {
+	Patterns []MetricPattern `json:"patterns"`
+	Severity string          `json:"severity"`
+	Summary  string          `json:"summary"`
 }
 
-// SimilarCase는 유사 장애 사례입니다.
-type SimilarCase struct {
-	Title      string
-	Similarity float64
-	Cause      string
-	Resolution string
-	Source     string // Runbook URL 또는 사내 문서 경로
+type MetricPattern struct {
+	Type        string  `json:"type"`
+	Description string  `json:"description"`
+	Series      int     `json:"series"`
+	MaxValue    float64 `json:"max_value,omitempty"`
 }
 
-// RemediateRequest는 통합 분석 및 조치 요청입니다.
-type RemediateRequest struct {
-	Namespace     string
-	PodName       string
-	ContainerName string
-	SinceSeconds  int64
+type KeyEvidenceRequest struct {
+	Logs       []LogEntry        `json:"logs,omitempty"`
+	Metrics    []MetricSeries    `json:"metrics,omitempty"`
+	Patterns   []DetectedPattern `json:"patterns,omitempty"`
+	ArtifactID string            `json:"artifact_id,omitempty"`
+	Limit      int               `json:"limit,omitempty"`
 }
 
-// RemediateResult는 통합 분석 및 조치 결과입니다.
-type RemediateResult struct {
-	Summary      string
-	Patterns     []DetectedPattern
-	SimilarCases []SimilarCase
-	Remediation  []RemediationStep
-	Confidence   ConfidenceLevel
+type KeyEvidenceResult struct {
+	Items   []EvidenceItem `json:"items"`
+	Summary string         `json:"summary"`
 }
 
-// RemediationStep은 권장 조치 단계입니다.
-type RemediationStep struct {
-	Order       int
-	Description string
-	Command     string // 실행 가능한 kubectl 명령 (있는 경우)
-	IsAutomatic bool   // true이면 자동 실행 가능
+type EvidenceItem struct {
+	Source    string `json:"source"`
+	Timestamp string `json:"timestamp,omitempty"`
+	Severity  string `json:"severity,omitempty"`
+	Message   string `json:"message"`
 }
 
-// ConfidenceLevel은 진단 확신 수준입니다 (5단계).
-type ConfidenceLevel string
+type SummarizeEvidenceRequest struct {
+	Items      []EvidenceItem `json:"items,omitempty"`
+	Patterns   []string       `json:"patterns,omitempty"`
+	ArtifactID string         `json:"artifact_id,omitempty"`
+}
 
-const (
-	ConfidenceCertain   ConfidenceLevel = "확실"
-	ConfidenceHigh      ConfidenceLevel = "높음"
-	ConfidenceMedium    ConfidenceLevel = "중간"
-	ConfidenceLow       ConfidenceLevel = "낮음"
-	ConfidenceSpeculate ConfidenceLevel = "추측"
-)
+type EvidenceSummaryResult struct {
+	Summary   string   `json:"summary"`
+	Signals   []string `json:"signals,omitempty"`
+	Artifacts []string `json:"artifacts,omitempty"`
+}
+
+type ArtifactSampleRequest struct {
+	ArtifactID string `json:"artifact_id"`
+	MaxLines   int    `json:"max_lines,omitempty"`
+}
+
+type ArtifactSampleResult struct {
+	ArtifactID string   `json:"artifact_id"`
+	Path       string   `json:"path"`
+	Lines      []string `json:"lines"`
+	Truncated  bool     `json:"truncated"`
+}
+
+type CleanArtifactsRequest struct {
+	TTLSeconds int64 `json:"ttl_seconds,omitempty"`
+	MaxBytes   int64 `json:"max_bytes,omitempty"`
+}
+
+type CleanArtifactsResult struct {
+	Removed int   `json:"removed"`
+	Bytes   int64 `json:"bytes"`
+}

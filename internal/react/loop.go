@@ -134,7 +134,8 @@ func (l *Loop) init(ctx context.Context) error {
 	l.workDir = workDir
 	l.executor = sandbox.NewLocalExecutor()
 
-	registry, err := toolconnector.NewRegistry(ctx, l.executor, l.cfg.MCPClient)
+	logAnalyzerCfg := config.LoadLogAnalyzerConfig(l.cfg.AppDir, l.cfg.LogAnalyzer.Enabled)
+	registry, err := toolconnector.NewRegistry(ctx, l.executor, l.cfg.MCPClient, toolconnector.WithLogAnalyzerConfig(logAnalyzerCfg))
 	if err != nil {
 		return fmt.Errorf("tool registry 초기화 실패: %w", err)
 	}

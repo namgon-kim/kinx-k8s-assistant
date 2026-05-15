@@ -1,0 +1,66 @@
+# Log Analyzer source settings
+# Copy to ~/.k8s-assistant/log-analyzer.yaml
+
+artifact_dir: ""            # Default: ~/.k8s-assistant/artifacts/loganalyzer
+artifact_ttl: 86400         # Seconds
+max_artifact_bytes: 52428800
+
+file:
+  enabled: true
+  root_dir: /var/log/filebeat  # Root used for namespace/pod/container discovery and relative file_path
+  max_lines: 1000              # Tail-style latest matching lines
+
+loki:
+  enabled: true
+  url: ""                   # Or set K8S_ASSISTANT_LOKI_URL
+  token: ""                 # Or set K8S_ASSISTANT_LOKI_TOKEN
+  username: ""              # Or set K8S_ASSISTANT_LOKI_USERNAME
+  password: ""              # Or set K8S_ASSISTANT_LOKI_PASSWORD
+  org_id: ""                # Or set K8S_ASSISTANT_LOKI_ORG_ID
+  headers: {}
+  tls_skip_verify: false
+  ca_file: ""
+  timeout: 30
+  query_timeout: 30
+  default_limit: 1000
+  max_entries: 5000
+
+prometheus:
+  enabled: true
+  url: ""                   # Or set K8S_ASSISTANT_PROMETHEUS_URL
+  token: ""                 # Or set K8S_ASSISTANT_PROMETHEUS_TOKEN
+  username: ""              # Or set K8S_ASSISTANT_PROMETHEUS_USERNAME
+  password: ""              # Or set K8S_ASSISTANT_PROMETHEUS_PASSWORD
+  headers: {}
+  tls_skip_verify: false
+  ca_file: ""
+  timeout: 30
+  query_timeout: 30
+
+grafana:
+  enabled: true
+  url: ""                   # Or set K8S_ASSISTANT_GRAFANA_URL
+  token: ""                 # Or set K8S_ASSISTANT_GRAFANA_TOKEN
+  username: ""              # Or set K8S_ASSISTANT_GRAFANA_USERNAME
+  password: ""              # Or set K8S_ASSISTANT_GRAFANA_PASSWORD
+  org_id: ""                # Or set K8S_ASSISTANT_GRAFANA_ORG_ID; sent as X-Grafana-Org-Id
+  headers: {}
+  tls_skip_verify: false
+  ca_file: ""
+  timeout: 30
+  query_timeout: 30
+
+opensearch:
+  enabled: true
+  url: ""                   # Or set K8S_ASSISTANT_OPENSEARCH_URL
+  token: ""                 # Or set K8S_ASSISTANT_OPENSEARCH_TOKEN
+  username: ""              # Or set K8S_ASSISTANT_OPENSEARCH_USERNAME
+  password: ""              # Or set K8S_ASSISTANT_OPENSEARCH_PASSWORD
+  headers: {}
+  tls_skip_verify: false
+  ca_file: ""
+  timeout: 30
+  query_timeout: 30
+  default_limit: 100
+  max_entries: 1000
+  default_index: ""         # Or set K8S_ASSISTANT_OPENSEARCH_DEFAULT_INDEX

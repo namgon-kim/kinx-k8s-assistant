@@ -6,7 +6,15 @@
 
 servers:
   # log-analyzer MCP 서버 (선택)
-  # 실행 방법: ./bin/log-analyzer-server --port 9090 --log-dir /var/log/filebeat
+  # 실행 방법:
+  # ./bin/log-analyzer-server \
+  #   --port 9090 \
+  #   --log-dir /var/log/filebeat \
+  #   --loki-url http://localhost:3100 \
+  #   --prometheus-url http://localhost:9090 \
+  #   --grafana-url http://localhost:3000 \
+  #   --opensearch-url https://localhost:9200 \
+  #   --opensearch-index 'logs-*'
   - name: log-analyzer
     url: http://localhost:9090/mcp
     use_streaming: true

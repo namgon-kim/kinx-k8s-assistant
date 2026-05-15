@@ -9,6 +9,8 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/mcp"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/loganalyzer"
 	"k8s.io/klog/v2"
 )
 
@@ -17,12 +19,32 @@ type Registry struct {
 	MCPManager *mcp.Manager
 }
 
-func NewRegistry(ctx context.Context, executor sandbox.Executor, enableMCP bool) (*Registry, error) {
+type RegistryOption func(*registryOptions)
+
+type registryOptions struct {
+	logAnalyzer *config.LogAnalyzerConfig
+}
+
+func WithLogAnalyzerConfig(cfg config.LogAnalyzerConfig) RegistryOption {
+	return func(opts *registryOptions) {
+		opts.logAnalyzer = &cfg
+	}
+}
+
+func NewRegistry(ctx context.Context, executor sandbox.Executor, enableMCP bool, options ...RegistryOption) (*Registry, error) {
+	opts := registryOptions{}
+	for _, option := range options {
+		option(&opts)
+	}
+
 	registry := &Registry{}
 	registry.Tools.Init()
 	registry.Tools.RegisterTool(tools.NewBashTool(executor))
 	registry.Tools.RegisterTool(tools.NewKubectlTool(executor))
 	registry.loadCustomTools(executor)
+	if opts.logAnalyzer != nil && opts.logAnalyzer.Enabled {
+		RegisterLogAnalyzerTools(&registry.Tools, loganalyzer.NewAnalyzerFromConfig(*opts.logAnalyzer))
+	}
 
 	if enableMCP {
 		manager, err := RegisterMCPTools(ctx, &registry.Tools)

@@ -173,7 +173,7 @@ mkdir -p ~/.k8s-assistant
 cp config/mcp.yaml ~/.k8s-assistant/mcp.yaml
 ```
 
-log-analyzer를 사용할 때:
+log-analyzer MCP 서버를 선택적으로 사용할 때는 endpoint만 `~/.k8s-assistant/mcp.yaml`에 등록합니다. standalone 서버 실행 방법과 source별 설정은 `internal/loganalyzer/README.md`를 기준으로 확인합니다.
 
 ```yaml
 servers:
@@ -183,7 +183,21 @@ servers:
     timeout: 60
 ```
 
+그 다음 k8s-assistant를 MCP client 모드로 실행합니다.
+
+```bash
+k8s-assistant --mcp-client
+```
+
 주의: MCP tool 이름은 kubectl-ai tool connector 규칙에 따라 `<server_name>_<tool_name>` 형태로 노출됩니다.
+
+기본 log-analyzer 기능은 MCP 서버 없이 내부 read-only tool adapter로 등록됩니다. Loki/Prometheus/Grafana/OpenSearch endpoint가 설정된 경우 로그, 메트릭, dashboard/alert 원문은 artifact에 저장하고, 대화 컨텍스트에는 요약과 제한된 샘플만 전달합니다. log-analyzer는 RAG나 조치 계획을 수행하지 않으며, 해당 역할은 trouble-shooting이 담당합니다.
+
+`~/.k8s-assistant/config.yaml`에는 `log_analyzer.enabled`만 설정합니다. 파일 로그, Loki, Prometheus, Grafana, OpenSearch 세부 설정은 `~/.k8s-assistant/log-analyzer.yaml`에 분리합니다.
+
+파일 로그 source는 `log-analyzer.yaml`의 `file.root_dir` 아래에서 namespace/pod/container 이름을 우선 매칭합니다. 특정 파일을 직접 분석해야 할 때는 `file_path`를 사용할 수 있으며, 상대 경로는 `root_dir` 기준으로 처리됩니다.
+
+Loki/Prometheus/Grafana/OpenSearch source는 source별 enable/disable, bearer/basic auth, custom headers, TLS skip verify, CA file을 지원합니다. `log_analyzer_check_sources`로 file/Loki/Prometheus/Grafana/OpenSearch의 configured/reachable 상태를 확인할 수 있습니다.
 
 ## trouble-shooting 설정
 

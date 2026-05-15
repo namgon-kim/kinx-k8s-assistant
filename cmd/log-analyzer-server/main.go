@@ -6,102 +6,84 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/loganalyzer"
-	"gopkg.in/yaml.v3"
 )
 
 func main() {
 	port := flag.Int("port", 9090, "MCP server port")
-	logDir := flag.String("log-dir", "/var/log/filebeat", "Filebeat log directory")
-	runbookDir := flag.String("runbook-dir", "", "Directory containing runbook YAML files")
+	logDir := flag.String("log-dir", "/var/log/filebeat", "file log root directory")
+	artifactDir := flag.String("artifact-dir", "", "artifact directory")
+	lokiURL := flag.String("loki-url", os.Getenv("K8S_ASSISTANT_LOKI_URL"), "Loki base URL")
+	promURL := flag.String("prometheus-url", os.Getenv("K8S_ASSISTANT_PROMETHEUS_URL"), "Prometheus base URL")
+	grafanaURL := flag.String("grafana-url", os.Getenv("K8S_ASSISTANT_GRAFANA_URL"), "Grafana base URL")
+	openSearchURL := flag.String("opensearch-url", os.Getenv("K8S_ASSISTANT_OPENSEARCH_URL"), "OpenSearch base URL")
+	openSearchIndex := flag.String("opensearch-index", os.Getenv("K8S_ASSISTANT_OPENSEARCH_DEFAULT_INDEX"), "OpenSearch default index")
+	lokiOrgID := flag.String("loki-org-id", os.Getenv("K8S_ASSISTANT_LOKI_ORG_ID"), "Loki X-Scope-OrgID")
+	grafanaOrgID := flag.String("grafana-org-id", os.Getenv("K8S_ASSISTANT_GRAFANA_ORG_ID"), "Grafana org id")
 	flag.Parse()
 
-	ctx := context.Background()
-
-	jsonParser := loganalyzer.NewJSONParser()
-	logFetcher := loganalyzer.NewLogFetcher(*logDir, jsonParser)
-
-	detector := loganalyzer.NewPatternDetector()
-
-	store := loganalyzer.NewSimpleKeywordStore()
-
-	if err := loadRunbooks(ctx, store, *runbookDir); err != nil {
-		log.Printf("warning: failed to load runbooks: %v", err)
+	cfg := config.LogAnalyzerConfig{
+		Enabled:          true,
+		ArtifactDir:      *artifactDir,
+		ArtifactTTL:      24 * 60 * 60,
+		MaxArtifactBytes: 50 * 1024 * 1024,
+		File: config.LogAnalyzerFileConfig{
+			Enabled:  true,
+			RootDir:  *logDir,
+			MaxLines: 1000,
+		},
+		Loki: config.LogAnalyzerHTTPConfig{
+			Enabled:      true,
+			URL:          *lokiURL,
+			Token:        os.Getenv("K8S_ASSISTANT_LOKI_TOKEN"),
+			Username:     os.Getenv("K8S_ASSISTANT_LOKI_USERNAME"),
+			Password:     os.Getenv("K8S_ASSISTANT_LOKI_PASSWORD"),
+			OrgID:        *lokiOrgID,
+			Timeout:      30,
+			QueryTimeout: 30,
+			DefaultLimit: 1000,
+			MaxEntries:   5000,
+		},
+		Prometheus: config.LogAnalyzerHTTPConfig{
+			Enabled:      true,
+			URL:          *promURL,
+			Token:        os.Getenv("K8S_ASSISTANT_PROMETHEUS_TOKEN"),
+			Username:     os.Getenv("K8S_ASSISTANT_PROMETHEUS_USERNAME"),
+			Password:     os.Getenv("K8S_ASSISTANT_PROMETHEUS_PASSWORD"),
+			Timeout:      30,
+			QueryTimeout: 30,
+		},
+		Grafana: config.LogAnalyzerHTTPConfig{
+			Enabled:      true,
+			URL:          *grafanaURL,
+			Token:        os.Getenv("K8S_ASSISTANT_GRAFANA_TOKEN"),
+			Username:     os.Getenv("K8S_ASSISTANT_GRAFANA_USERNAME"),
+			Password:     os.Getenv("K8S_ASSISTANT_GRAFANA_PASSWORD"),
+			OrgID:        *grafanaOrgID,
+			Timeout:      30,
+			QueryTimeout: 30,
+		},
+		OpenSearch: config.LogAnalyzerHTTPConfig{
+			Enabled:      true,
+			URL:          *openSearchURL,
+			Token:        os.Getenv("K8S_ASSISTANT_OPENSEARCH_TOKEN"),
+			Username:     os.Getenv("K8S_ASSISTANT_OPENSEARCH_USERNAME"),
+			Password:     os.Getenv("K8S_ASSISTANT_OPENSEARCH_PASSWORD"),
+			Timeout:      30,
+			QueryTimeout: 30,
+			DefaultLimit: 100,
+			MaxEntries:   1000,
+			DefaultIndex: *openSearchIndex,
+		},
 	}
 
-	analyzer := loganalyzer.NewAnalyzer(logFetcher, detector, store)
+	analyzer := loganalyzer.NewAnalyzerFromConfig(cfg)
 	server := loganalyzer.NewServer(*port, analyzer)
 
 	fmt.Printf("log-analyzer MCP server starting on port %d\n", *port)
-	if err := server.Start(ctx); err != nil {
+	if err := server.Start(context.Background()); err != nil {
 		log.Fatal("server error:", err)
 	}
-}
-
-func loadRunbooks(ctx context.Context, store loganalyzer.VectorStore, runbookDir string) error {
-	if runbookDir == "" {
-		runbookDir = defaultRunbookDir()
-	}
-
-	var cases []loganalyzer.SimilarCase
-
-	if err := loadYAMLRunbooks(filepath.Join(runbookDir, "default.yaml"), &cases); err != nil {
-		return fmt.Errorf("failed to load default runbooks: %w", err)
-	}
-
-	if len(cases) == 0 {
-		return fmt.Errorf("no cases loaded from runbooks")
-	}
-
-	if err := store.Index(ctx, cases); err != nil {
-		return fmt.Errorf("failed to index runbooks: %w", err)
-	}
-
-	fmt.Printf("loaded %d runbook cases\n", len(cases))
-	return nil
-}
-
-func defaultRunbookDir() string {
-	candidates := []string{
-		filepath.Join(filepath.Dir(os.Args[0]), "..", "internal", "loganalyzer", "rag", "runbooks"),
-		filepath.Join(filepath.Dir(os.Args[0]), "..", "..", "internal", "loganalyzer", "rag", "runbooks"),
-		filepath.Join("internal", "loganalyzer", "rag", "runbooks"),
-	}
-
-	for _, candidate := range candidates {
-		if _, err := os.Stat(filepath.Join(candidate, "default.yaml")); err == nil {
-			return candidate
-		}
-	}
-
-	return candidates[0]
-}
-
-func loadYAMLRunbooks(path string, cases *[]loganalyzer.SimilarCase) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	var wrapper struct {
-		Cases []map[string]interface{} `yaml:"cases"`
-	}
-
-	if err := yaml.Unmarshal(data, &wrapper); err != nil {
-		return err
-	}
-
-	for _, raw := range wrapper.Cases {
-		c := loganalyzer.SimilarCase{
-			Title:      fmt.Sprintf("%v", raw["title"]),
-			Cause:      fmt.Sprintf("%v", raw["cause"]),
-			Resolution: fmt.Sprintf("%v", raw["resolution"]),
-			Source:     fmt.Sprintf("%v", raw["source"]),
-		}
-		*cases = append(*cases, c)
-	}
-
-	return nil
 }

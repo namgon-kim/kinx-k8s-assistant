@@ -56,6 +56,9 @@ type Config struct {
 
 	// 사용자 출력 언어/번역 설정
 	Lang LangConfig `json:"lang"`
+
+	// 로그/메트릭 분석 설정
+	LogAnalyzer LogAnalyzerToggle `json:"log_analyzer"`
 }
 
 type LangConfig struct {
@@ -63,6 +66,10 @@ type LangConfig struct {
 	Model    string `json:"model,omitempty"`
 	Endpoint string `json:"endpoint,omitempty"`
 	APIKey   string `json:"apikey,omitempty"`
+}
+
+type LogAnalyzerToggle struct {
+	Enabled bool `json:"enabled"`
 }
 
 // NewConfig는 기본값이 설정된 Config를 반환합니다.
@@ -77,6 +84,7 @@ func NewConfig() *Config {
 		Lang: LangConfig{
 			Language: "English",
 		},
+		LogAnalyzer: LogAnalyzerToggle{Enabled: true},
 	}
 
 	home, _ := os.UserHomeDir()
