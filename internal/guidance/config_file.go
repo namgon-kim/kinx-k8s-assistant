@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"os"
@@ -9,19 +9,13 @@ import (
 )
 
 type FileConfig struct {
-	TroubleShooting TroubleShootingFileConfig `yaml:"trouble_shooting"`
+	Guidance GuidanceFileConfig `yaml:"guidance"`
 }
 
-type TroubleShootingFileConfig struct {
-	Runbook       RunbookFileConfig   `yaml:"runbook"`
+type GuidanceFileConfig struct {
 	RAG           RAGFileConfig       `yaml:"rag"`
 	IssueExport   IssueFileConfig     `yaml:"issue_export"`
 	KnowledgeBase KnowledgeFileConfig `yaml:"knowledge_base"`
-}
-
-type RunbookFileConfig struct {
-	Dir      string `yaml:"dir"`
-	MaxCases int    `yaml:"max_cases"`
 }
 
 type KnowledgeFileConfig struct {
@@ -61,7 +55,6 @@ type EmbeddingFileConfig struct {
 type QdrantFileConfig struct {
 	URL          string                 `yaml:"url"`
 	APIKey       string                 `yaml:"api_key"`
-	Collection   string                 `yaml:"collection"`
 	Limit        int                    `yaml:"limit"`
 	WithPayload  *bool                  `yaml:"with_payload"`
 	WithVectors  *bool                  `yaml:"with_vectors"`
@@ -98,9 +91,9 @@ func LoadFileConfig(path string) (*FileConfig, error) {
 func DefaultFileConfigPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return filepath.Join(".", ".k8s-assistant", "trouble-shooting.yaml")
+		return filepath.Join(".", ".k8s-assistant", "guidance.yaml")
 	}
-	return filepath.Join(home, ".k8s-assistant", "trouble-shooting.yaml")
+	return filepath.Join(home, ".k8s-assistant", "guidance.yaml")
 }
 
 func LoadOptionalFileConfig(path string) (*FileConfig, string, error) {
@@ -123,21 +116,15 @@ func (fc *FileConfig) ApplyToConfig(cfg Config) Config {
 	if fc == nil {
 		return cfg
 	}
-	ts := fc.TroubleShooting
-	if ts.Runbook.Dir != "" {
-		cfg.RunbookDir = expandConfigPath(ts.Runbook.Dir)
+	g := fc.Guidance
+	if g.IssueExport.Dir != "" {
+		cfg.IssueDir = expandConfigPath(g.IssueExport.Dir)
 	}
-	if ts.Runbook.MaxCases > 0 {
-		cfg.MaxCases = ts.Runbook.MaxCases
-	}
-	if ts.IssueExport.Dir != "" {
-		cfg.IssueDir = expandConfigPath(ts.IssueExport.Dir)
-	}
-	if ts.KnowledgeBase.Dir != "" {
-		cfg.KnowledgeDir = expandConfigPath(ts.KnowledgeBase.Dir)
+	if g.KnowledgeBase.Dir != "" {
+		cfg.KnowledgeDir = expandConfigPath(g.KnowledgeBase.Dir)
 	}
 
-	rag := ts.RAG
+	rag := g.RAG
 	if rag.Provider != "" {
 		cfg.KnowledgeProvider = KnowledgeProvider(rag.Provider)
 	}
@@ -184,9 +171,6 @@ func (fc *FileConfig) ApplyToConfig(cfg Config) Config {
 	}
 	if rag.Qdrant.APIKey != "" {
 		cfg.QdrantAPIKey = rag.Qdrant.APIKey
-	}
-	if rag.Qdrant.Collection != "" {
-		cfg.QdrantCollection = rag.Qdrant.Collection
 	}
 	if rag.Qdrant.Limit > 0 {
 		cfg.QdrantLimit = rag.Qdrant.Limit

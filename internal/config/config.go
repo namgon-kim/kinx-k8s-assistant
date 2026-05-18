@@ -56,6 +56,9 @@ type Config struct {
 
 	// 사용자 출력 언어/번역 설정
 	Lang LangConfig `json:"lang"`
+
+	// Guidance collection names used by the internal RAG client.
+	Guidance GuidanceConfig `json:"guidance"`
 }
 
 type LangConfig struct {
@@ -63,6 +66,11 @@ type LangConfig struct {
 	Model    string `json:"model,omitempty"`
 	Endpoint string `json:"endpoint,omitempty"`
 	APIKey   string `json:"apikey,omitempty"`
+}
+
+type GuidanceConfig struct {
+	ResourceGuides string `json:"resource_guides,omitempty"`
+	IncidentGuides string `json:"incident_guides,omitempty"`
 }
 
 // NewConfig는 기본값이 설정된 Config를 반환합니다.
@@ -76,6 +84,10 @@ func NewConfig() *Config {
 		LogLevel:       0,
 		Lang: LangConfig{
 			Language: "English",
+		},
+		Guidance: GuidanceConfig{
+			ResourceGuides: "k8s_resource_guides_v1",
+			IncidentGuides: "k8s_incident_guides_v1",
 		},
 	}
 
@@ -103,6 +115,7 @@ func NewConfig() *Config {
 					cfg.SystemLogDir = expandHome(cfg.SystemLogDir, home)
 				}
 				normalizeLangConfig(cfg)
+				normalizeGuidanceConfig(cfg)
 				applyEnvironmentOverrides(cfg)
 				return cfg
 			}
@@ -117,9 +130,19 @@ func NewConfig() *Config {
 		}
 	}
 	normalizeLangConfig(cfg)
+	normalizeGuidanceConfig(cfg)
 	applyEnvironmentOverrides(cfg)
 
 	return cfg
+}
+
+func normalizeGuidanceConfig(cfg *Config) {
+	if strings.TrimSpace(cfg.Guidance.ResourceGuides) == "" {
+		cfg.Guidance.ResourceGuides = "k8s_resource_guides_v1"
+	}
+	if strings.TrimSpace(cfg.Guidance.IncidentGuides) == "" {
+		cfg.Guidance.IncidentGuides = "k8s_incident_guides_v1"
+	}
 }
 
 func normalizeLangConfig(cfg *Config) {

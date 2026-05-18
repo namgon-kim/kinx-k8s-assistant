@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"sort"
@@ -7,9 +7,9 @@ import (
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/diagnostic"
 )
 
-func matchRunbooks(cases []TroubleshootingCase, req TroubleshootingSearchRequest, max int) []TroubleshootingCase {
+func matchRunbooks(cases []GuideCase, req GuideSearchRequest, max int) []GuideCase {
 	query := buildQuery(req)
-	results := make([]TroubleshootingCase, 0, len(cases))
+	results := make([]GuideCase, 0, len(cases))
 
 	for _, c := range cases {
 		score := scoreCase(c, req, query)
@@ -33,7 +33,7 @@ func matchRunbooks(cases []TroubleshootingCase, req TroubleshootingSearchRequest
 	return results
 }
 
-func scoreCase(c TroubleshootingCase, req TroubleshootingSearchRequest, query string) float64 {
+func scoreCase(c GuideCase, req GuideSearchRequest, query string) float64 {
 	score := 0.0
 	for _, want := range req.Signal.DetectionTypes {
 		for _, got := range c.MatchTypes {
@@ -82,7 +82,7 @@ func scoreCase(c TroubleshootingCase, req TroubleshootingSearchRequest, query st
 	return score
 }
 
-func buildQuery(req TroubleshootingSearchRequest) string {
+func buildQuery(req GuideSearchRequest) string {
 	parts := []string{req.Query, req.Signal.Summary}
 	for _, t := range req.Signal.DetectionTypes {
 		parts = append(parts, string(t))

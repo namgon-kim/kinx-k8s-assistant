@@ -20,7 +20,7 @@ make build-all
 ```text
 bin/k8s-assistant
 bin/log-analyzer-server
-bin/troubleshooting-upload
+bin/guidance-upload
 ```
 
 ### 설정
@@ -166,7 +166,7 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
 
 ## MCP 서버 설정
 
-`--mcp-client`는 `~/.k8s-assistant/mcp.yaml`에 선언된 서버만 kubectl-ai MCP 설정으로 동기화한 뒤, k8s-assistant의 Tool connector registry에 등록합니다. trouble-shooting은 내부 패키지로 실행되므로 MCP 서버 설정이 필요하지 않습니다.
+`--mcp-client`는 `~/.k8s-assistant/mcp.yaml`에 선언된 서버만 kubectl-ai MCP 설정으로 동기화한 뒤, k8s-assistant의 Tool connector registry에 등록합니다. guidance는 내부 패키지로 실행되므로 MCP 서버 설정이 필요하지 않습니다.
 
 ```bash
 mkdir -p ~/.k8s-assistant
@@ -185,27 +185,37 @@ servers:
 
 주의: MCP tool 이름은 kubectl-ai tool connector 규칙에 따라 `<server_name>_<tool_name>` 형태로 노출됩니다.
 
-## trouble-shooting 설정
+## guidance 설정
 
-trouble-shooting은 별도 서버를 실행하지 않습니다. k8s-assistant가 문제 감지 후 사용자 확인을 받고 내부 패키지로 runbook/RAG 검색과 조치 계획 생성을 수행합니다. Kubernetes 명령 실행은 k8s-assistant ReAct 루프와 승인 흐름이 담당합니다.
+guidance는 별도 서버를 실행하지 않습니다. k8s-assistant가 custom resource 작업/진단 요청에는 resource guide를 먼저 조회하고, 장애 흐름에는 사용자 확인 후 incident guide 검색과 조치 계획 생성을 수행합니다. Kubernetes 명령 실행은 k8s-assistant ReAct 루프와 승인 흐름이 담당합니다.
 
 기본 설정 경로:
 
 ```text
-~/.k8s-assistant/trouble-shooting.yaml
+~/.k8s-assistant/guidance.yaml
 ```
 
 예시 설정 복사:
 
 ```bash
 mkdir -p ~/.k8s-assistant
-cp config/trouble-shooting.yaml ~/.k8s-assistant/trouble-shooting.yaml
+cp config/guidance.yaml ~/.k8s-assistant/guidance.yaml
 ```
 
 주요 설정:
 
+`~/.k8s-assistant/config.yaml`:
+
 ```yaml
-trouble_shooting:
+guidance:
+  resource_guides: k8s_resource_guides_v1
+  incident_guides: k8s_incident_guides_v1
+```
+
+`~/.k8s-assistant/guidance.yaml`:
+
+```yaml
+guidance:
   rag:
     provider: qdrant
     embedding:
@@ -213,7 +223,6 @@ trouble_shooting:
       model: bge-m3
     qdrant:
       url: http://localhost:6333
-      collection: k8s_troubleshooting_runbooks_v1
     reranker:
       enabled: true
       url: http://1.201.177.120:4000
@@ -223,22 +232,22 @@ trouble_shooting:
 runbook을 Qdrant에 업로드:
 
 ```bash
-./bin/troubleshooting-upload
+./bin/guidance-upload --runbook-dir <dir> --collection <name>
 # 또는
-./bin/troubleshooting-upload --config config/trouble-shooting.yaml
+./bin/guidance-upload --config config/guidance.yaml --runbook-dir <dir> --collection <name>
 ```
 
 업로드 helper는 runbook text를 embedding endpoint로 vector화한 뒤 Qdrant에 저장합니다. 이는 런타임 필수 기능이 아니라 초기 적재/검증용 도구입니다.
 
-## trouble-shooting revise 논의
+## guidance revise 논의
 
 아직 확정되지 않은 설계 논점은 `docs/reviews/revise_troubleshooting.md`에 정리합니다.
 
 현재 논의 중인 항목:
 
-- 간단한 문제는 k8s-assistant ReAct 루프가 직접 처리하고, 불확실한 문제만 trouble-shooting/RAG를 호출할지 여부
-- LLM self assessment를 이용해 trouble-shooting 호출 여부를 판단하는 방식
-- trouble-shooting 결과와 LLM 자체 해결책이 충돌하지 않도록 최종 판단권을 어디에 둘지
+- 간단한 문제는 k8s-assistant ReAct 루프가 직접 처리하고, 불확실한 문제만 incident guidance/RAG를 호출할지 여부
+- LLM self assessment를 이용해 incident guidance 호출 여부를 판단하는 방식
+- incident guidance 결과와 LLM 자체 해결책이 충돌하지 않도록 최종 판단권을 어디에 둘지
 - delete/recreate 작업 시 YAML export, runtime field 제거, 수정안 제시, 승인, apply/delete 순서를 어떻게 강제할지
 
 ## 프롬프트

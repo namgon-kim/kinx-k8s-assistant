@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"bytes"
@@ -86,7 +86,7 @@ func (c *QdrantClient) EnsureCollection(ctx context.Context, cfg Config) error {
 	return qdrantRequest(ctx, c.client, http.MethodPut, c.baseURL+"/collections/"+cfg.QdrantCollection, c.apiKey, body, true)
 }
 
-func (c *QdrantClient) UpsertRunbooks(ctx context.Context, cfg Config, cases []TroubleshootingCase, embedder *EmbeddingClient) error {
+func (c *QdrantClient) UpsertRunbooks(ctx context.Context, cfg Config, cases []GuideCase, embedder *EmbeddingClient) error {
 	cfg = ApplyDefaults(cfg)
 	points := make([]qdrantNamedPoint, 0, len(cases))
 	for _, runbook := range cases {
@@ -111,7 +111,7 @@ func (c *QdrantClient) UpsertRunbooks(ctx context.Context, cfg Config, cases []T
 	return qdrantRequest(ctx, c.client, http.MethodPut, endpoint, c.apiKey, body, false)
 }
 
-func (c *QdrantClient) Search(ctx context.Context, cfg Config, queryVector []float32) ([]TroubleshootingCase, error) {
+func (c *QdrantClient) Search(ctx context.Context, cfg Config, queryVector []float32) ([]GuideCase, error) {
 	cfg = ApplyDefaults(cfg)
 	body, err := json.Marshal(qdrantSearchRequest{
 		Vector:      qdrantSearchVector{Name: cfg.VectorName, Vector: queryVector},
@@ -144,14 +144,14 @@ func (c *QdrantClient) Search(ctx context.Context, cfg Config, queryVector []flo
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err
 	}
-	cases := make([]TroubleshootingCase, 0, len(out.Result))
+	cases := make([]GuideCase, 0, len(out.Result))
 	for _, point := range out.Result {
 		cases = append(cases, payloadToRunbook(point.Payload, point.Score))
 	}
 	return cases, nil
 }
 
-func runbookPayload(c TroubleshootingCase) map[string]any {
+func runbookPayload(c GuideCase) map[string]any {
 	return map[string]any{
 		"id":                c.ID,
 		"title":             c.Title,
@@ -173,8 +173,8 @@ func runbookPayload(c TroubleshootingCase) map[string]any {
 	}
 }
 
-func payloadToRunbook(payload map[string]any, score float64) TroubleshootingCase {
-	return TroubleshootingCase{
+func payloadToRunbook(payload map[string]any, score float64) GuideCase {
+	return GuideCase{
 		ID:               stringFromPayload(payload, "id"),
 		Title:            stringFromPayload(payload, "title"),
 		MatchTypes:       detectionTypesFromPayload(payload, "match_types"),

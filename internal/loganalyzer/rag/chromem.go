@@ -22,7 +22,7 @@ func NewChromemStore(embedder Embedder) (*ChromemStore, error) {
 }
 
 func (cs *ChromemStore) Index(ctx context.Context, cases []loganalyzer.SimilarCase) error {
-	collection, err := cs.db.GetOrCreateCollection("troubleshooting", nil, cs.embedder.Embed)
+	collection, err := cs.db.GetOrCreateCollection("log_analyzer_cases", nil, cs.embedder.Embed)
 	if err != nil {
 		return fmt.Errorf("failed to get or create collection: %w", err)
 	}
@@ -58,7 +58,7 @@ func (cs *ChromemStore) Search(ctx context.Context, query string, maxResults int
 		maxResults = 5
 	}
 
-	collection := cs.db.GetCollection("troubleshooting", cs.embedder.Embed)
+	collection := cs.db.GetCollection("log_analyzer_cases", cs.embedder.Embed)
 	if collection == nil {
 		return []loganalyzer.SimilarCase{}, nil
 	}

@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 
 type Service struct {
 	cfg       Config
-	runbooks  []TroubleshootingCase
+	runbooks  []GuideCase
 	knowledge *KnowledgeStore
 	endpoint  *EndpointClient
 	embedder  *EmbeddingClient
@@ -19,7 +19,7 @@ type Service struct {
 	reranker  *RerankerClient
 }
 
-func NewService(cfg Config, runbooks []TroubleshootingCase) *Service {
+func NewService(cfg Config, runbooks []GuideCase) *Service {
 	cfg = ApplyDefaults(cfg)
 	var endpoint *EndpointClient
 	if cfg.KnowledgeProvider == KnowledgeProviderEndpoint {
@@ -46,7 +46,7 @@ func NewService(cfg Config, runbooks []TroubleshootingCase) *Service {
 	}
 }
 
-func (s *Service) MatchRunbook(ctx context.Context, req TroubleshootingSearchRequest) (*TroubleshootingSearchResult, error) {
+func (s *Service) MatchRunbook(ctx context.Context, req GuideSearchRequest) (*GuideSearchResult, error) {
 	_ = ctx
 	max := req.TopK
 	if max <= 0 {
@@ -57,7 +57,7 @@ func (s *Service) MatchRunbook(ctx context.Context, req TroubleshootingSearchReq
 	if len(cases) > 0 {
 		conf = confidenceForScore(cases[0].Similarity)
 	}
-	return &TroubleshootingSearchResult{
+	return &GuideSearchResult{
 		Query:      buildQuery(req),
 		Cases:      cases,
 		Confidence: conf,
@@ -66,7 +66,7 @@ func (s *Service) MatchRunbook(ctx context.Context, req TroubleshootingSearchReq
 	}, nil
 }
 
-func (s *Service) SearchKnowledge(ctx context.Context, req TroubleshootingSearchRequest) (*TroubleshootingSearchResult, error) {
+func (s *Service) SearchKnowledge(ctx context.Context, req GuideSearchRequest) (*GuideSearchResult, error) {
 	if s.cfg.KnowledgeProvider == KnowledgeProviderEndpoint {
 		return s.endpoint.Search(ctx, req)
 	}
@@ -89,7 +89,7 @@ func (s *Service) SearchKnowledge(ctx context.Context, req TroubleshootingSearch
 		if len(cases) > 0 {
 			conf = confidenceForScore(cases[0].Similarity)
 		}
-		return &TroubleshootingSearchResult{
+		return &GuideSearchResult{
 			Query:      query,
 			Cases:      cases,
 			Confidence: conf,
@@ -107,7 +107,7 @@ func (s *Service) SearchKnowledge(ctx context.Context, req TroubleshootingSearch
 	if len(cases) > 0 {
 		conf = confidenceForScore(cases[0].Similarity)
 	}
-	return &TroubleshootingSearchResult{
+	return &GuideSearchResult{
 		Query:      buildQuery(req),
 		Cases:      cases,
 		Confidence: conf,
@@ -190,7 +190,7 @@ func (s *Service) ValidatePlan(ctx context.Context, plan RemediationPlan) (*Vali
 	return result, nil
 }
 
-func summarizeCases(cases []TroubleshootingCase) string {
+func summarizeCases(cases []GuideCase) string {
 	if len(cases) == 0 {
 		return "매칭된 트러블슈팅 사례가 없습니다."
 	}

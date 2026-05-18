@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"bytes"
@@ -29,7 +29,7 @@ func NewEndpointClient(url, apiKey string, timeoutSeconds int) *EndpointClient {
 	}
 }
 
-func (c *EndpointClient) Search(ctx context.Context, req TroubleshootingSearchRequest) (*TroubleshootingSearchResult, error) {
+func (c *EndpointClient) Search(ctx context.Context, req GuideSearchRequest) (*GuideSearchResult, error) {
 	if c == nil || c.url == "" {
 		return nil, fmt.Errorf("RAG endpoint is not configured")
 	}
@@ -58,7 +58,7 @@ func (c *EndpointClient) Search(ctx context.Context, req TroubleshootingSearchRe
 		return nil, fmt.Errorf("RAG endpoint returned status %d", resp.StatusCode)
 	}
 
-	var result TroubleshootingSearchResult
+	var result GuideSearchResult
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}

@@ -285,16 +285,16 @@ func getInputWithUIEchoHistory(prompt, historyFile string, saveToHistory bool) (
 // Orchestrator는 k8s-assistant ReAct loop와 사용자 입력/출력 UX를 연결하고,
 // 컨텍스트 관리, 마스킹, 포맷팅, propose/commit 플로우를 처리합니다.
 type Orchestrator struct {
-	cfg             *config.Config
-	agentWrap       *react.Loop
-	outputCh        <-chan *api.Message
-	agentInitErr    error // agent 초기화 실패 원인 저장
-	ctx             *ConversationContext
-	troubleshooting *TroubleshootingFlow
-	formatter       *Formatter
-	logger          *Logger
-	rl              *readline.Instance
-	kubeconfigInfo  *k8s.KubeconfigInfo
+	cfg              *config.Config
+	agentWrap        *react.Loop
+	outputCh         <-chan *api.Message
+	agentInitErr     error // agent 초기화 실패 원인 저장
+	ctx              *ConversationContext
+	incidentGuidance *IncidentGuidanceFlow
+	formatter        *Formatter
+	logger           *Logger
+	rl               *readline.Instance
+	kubeconfigInfo   *k8s.KubeconfigInfo
 }
 
 // New는 새 Orchestrator를 생성하고 초기화합니다.
@@ -351,14 +351,14 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 	}
 
 	return &Orchestrator{
-		cfg:             cfg,
-		agentWrap:       nil, // 나중에 필요할 때 생성
-		ctx:             NewConversationContext(),
-		troubleshooting: NewTroubleshootingFlow(),
-		formatter:       NewFormatter(cfg.ShowToolOutput),
-		logger:          logger,
-		rl:              rl,
-		kubeconfigInfo:  kubeconfigInfo,
+		cfg:              cfg,
+		agentWrap:        nil, // 나중에 필요할 때 생성
+		ctx:              NewConversationContext(),
+		incidentGuidance: NewIncidentGuidanceFlow(),
+		formatter:        NewFormatter(cfg.ShowToolOutput),
+		logger:           logger,
+		rl:               rl,
+		kubeconfigInfo:   kubeconfigInfo,
 	}, nil
 }
 
@@ -453,7 +453,7 @@ func (o *Orchestrator) readAndDispatchInput(ctx context.Context) error {
 	}
 
 	o.logEntry("user_input", input)
-	o.troubleshooting.ObserveUserInput(input)
+	o.incidentGuidance.ObserveUserInput(input)
 	return o.startAgent(ctx, input)
 }
 
@@ -464,7 +464,7 @@ func (o *Orchestrator) startAgent(ctx context.Context, initialQuery string) erro
 	if o.agentWrap != nil {
 		return nil
 	}
-	o.troubleshooting.ObserveUserInput(initialQuery)
+	o.incidentGuidance.ObserveUserInput(initialQuery)
 
 	klog.Info("agent 초기화 중...", "kubeconfig", o.cfg.Kubeconfig, "context", o.cfg.CurrentContext)
 	agentWrap, err := react.New(o.cfg)
@@ -527,7 +527,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		masked := MaskSensitiveData(sanitizeDisplayText(text))
 		PrintMessage(o.formatter.FormatText(masked))
 		o.logEntry("response", masked)
-		return o.troubleshooting.AfterAgentText(o, masked)
+		return o.incidentGuidance.AfterAgentText(o, masked)
 
 	case api.MessageTypeError:
 		errText, ok := msg.Payload.(string)
@@ -537,7 +537,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		errText = sanitizeDisplayText(errText)
 		PrintMessage(o.formatter.FormatError(errText))
 		o.logEntry("error", errText)
-		return o.troubleshooting.AfterAgentText(o, errText)
+		return o.incidentGuidance.AfterAgentText(o, errText)
 
 	case api.MessageTypeToolCallRequest:
 		desc, ok := msg.Payload.(string)
@@ -553,7 +553,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		refID := o.ctx.AddToolResult("tool", masked)
 		PrintMessage(o.formatter.FormatToolResult(masked, refID))
 		o.logEntry("tool_result", fmt.Sprintf("[%s] %s", refID, masked))
-		o.troubleshooting.RecordEvidence(masked)
+		o.incidentGuidance.RecordEvidence(masked)
 
 	case api.MessageTypeUserInputRequest:
 		return o.handleAgentInputRequest()
@@ -574,7 +574,7 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 	if activeAgent == nil {
 		return nil
 	}
-	if handled, err := o.troubleshooting.BeforeUserInput(o, activeAgent); handled || err != nil {
+	if handled, err := o.incidentGuidance.BeforeUserInput(o, activeAgent); handled || err != nil {
 		return err
 	}
 
@@ -611,7 +611,7 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 	}
 
 	o.logEntry("user_input", input)
-	o.troubleshooting.ObserveUserInput(input)
+	o.incidentGuidance.ObserveUserInput(input)
 	activeAgent.SendInput(&api.UserInputResponse{Query: input})
 	return nil
 }

@@ -9,16 +9,26 @@ import (
 )
 
 type reActResponse struct {
-	Thought string  `json:"thought"`
-	Answer  string  `json:"answer,omitempty"`
-	Action  *action `json:"action,omitempty"`
+	Thought             string               `json:"thought"`
+	Answer              string               `json:"answer,omitempty"`
+	Action              *action              `json:"action,omitempty"`
+	ResourceGuideLookup *resourceGuideLookup `json:"resource_guide_lookup,omitempty"`
 }
 
 type action struct {
-	Name             string `json:"name"`
-	Reason           string `json:"reason"`
-	Command          string `json:"command"`
-	ModifiesResource string `json:"modifies_resource"`
+	Name                string `json:"name"`
+	Reason              string `json:"reason"`
+	Goal                string `json:"goal,omitempty"`
+	Command             string `json:"command"`
+	ExpectedObservation string `json:"expected_observation,omitempty"`
+	ModifiesResource    string `json:"modifies_resource"`
+}
+
+type resourceGuideLookup struct {
+	ResourceFamily string `json:"resource_family"`
+	ProblemFocus   string `json:"problem_focus"`
+	Reason         string `json:"reason"`
+	Evidence       string `json:"evidence"`
 }
 
 func candidateToShimCandidate(iterator gollm.ChatResponseIterator) (gollm.ChatResponseIterator, error) {
@@ -164,7 +174,7 @@ type shimCandidate struct {
 }
 
 func (c *shimCandidate) String() string {
-	return fmt.Sprintf("Thought: %s\nAnswer: %s\nAction: %v", c.candidate.Thought, c.candidate.Answer, c.candidate.Action)
+	return fmt.Sprintf("Thought: %s\nAnswer: %s\nAction: %v\nResourceGuideLookup: %v", c.candidate.Thought, c.candidate.Answer, c.candidate.Action, c.candidate.ResourceGuideLookup)
 }
 
 func (c *shimCandidate) Parts() []gollm.Part {
@@ -182,12 +192,16 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	if c.candidate.Action != nil {
 		parts = append(parts, &shimPart{action: c.candidate.Action})
 	}
+	if c.candidate.ResourceGuideLookup != nil {
+		parts = append(parts, &shimPart{resourceGuideLookup: c.candidate.ResourceGuideLookup})
+	}
 	return parts
 }
 
 type shimPart struct {
-	text   string
-	action *action
+	text                string
+	action              *action
+	resourceGuideLookup *resourceGuideLookup
 }
 
 func (p *shimPart) AsText() (string, bool) {
@@ -195,6 +209,16 @@ func (p *shimPart) AsText() (string, bool) {
 }
 
 func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
+	if p.resourceGuideLookup != nil {
+		args, err := toMap(p.resourceGuideLookup)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      internalResourceGuideLookupCall,
+			Arguments: args,
+		}}, true
+	}
 	if p.action == nil {
 		return nil, false
 	}

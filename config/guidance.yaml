@@ -1,12 +1,12 @@
-# k8s-assistant 내장 trouble-shooting 설정 예시
+# k8s-assistant 내장 guidance 설정 예시
 # 기본 경로:
-#   ~/.k8s-assistant/trouble-shooting.yaml
+#   ~/.k8s-assistant/guidance.yaml
 # 실행 예:
 #   ./bin/k8s-assistant
-#   ./bin/troubleshooting-upload
-#     - helper tool: runbook text를 embedding한 뒤 Qdrant point로 업로드한다.
+#   ./bin/guidance-upload --runbook-dir <dir> --collection <name>
+#     - helper tool: runbook text를 embedding한 뒤 지정한 Qdrant collection에 업로드한다.
 
-trouble_shooting:
+guidance:
   rag:
     provider: qdrant
     mode: hybrid
@@ -24,7 +24,6 @@ trouble_shooting:
     qdrant:
       url: http://localhost:6333
       api_key: ""
-      collection: k8s_troubleshooting_runbooks_v1
       limit: 11
       with_payload: true
       with_vectors: false

@@ -4,17 +4,17 @@
 
 This repository implements `k8s-assistant`, a Go CLI for operating Kubernetes clusters through natural language.
 
-The project intentionally owns the ReAct loop, approval UX, prompt rendering, output formatting, read-only enforcement, and troubleshooting orchestration. It uses `kubectl-ai` primarily as a library for `gollm` and Kubernetes/tool connector primitives.
+The project intentionally owns the ReAct loop, approval UX, prompt rendering, output formatting, read-only enforcement, and guidance orchestration. It uses `kubectl-ai` primarily as a library for `gollm` and Kubernetes/tool connector primitives.
 
 ## Core Architecture
 
 - `cmd/k8s-assistant`: main CLI entrypoint and flags.
 - `internal/react`: k8s-assistant-owned ReAct loop, prompt rendering, shim parser, read-only enforcement, language translation.
 - `internal/toolconnector`: kubectl-ai tool registry integration and MCP config sync.
-- `internal/orchestrator`: interactive CLI, meta commands, output formatting, troubleshooting flow coordination.
-- `internal/troubleshooting`: internal runbook/RAG client and planning logic. This is not a standalone MCP server.
+- `internal/orchestrator`: interactive CLI, meta commands, output formatting, guidance flow coordination.
+- `internal/guidance`: internal resource-guide/incident-guide RAG client and planning logic. This is not a standalone MCP server.
 - `cmd/log-analyzer-server`, `internal/loganalyzer`: log analysis service and domain logic.
-- `cmd/troubleshooting-upload`: helper for embedding runbooks/issues and uploading to Qdrant.
+- `cmd/guidance-upload`: helper for embedding runbooks and uploading them to an explicit Qdrant collection.
 - `prompts/default.tmpl`: default runtime prompt. Treat this as the primary production prompt.
 - `prompts/system_ko.tmpl`: Korean reference/convenience prompt. Do not assume it is used by default.
 - `docs/drafts`, `docs/reviews`: design and review notes.
@@ -22,14 +22,14 @@ The project intentionally owns the ReAct loop, approval UX, prompt rendering, ou
 ## Implementation Rules
 
 - Prefer existing package boundaries and local patterns.
-- Do not reintroduce `trouble-shooting-server`; troubleshooting should stay as an internal package/client.
+- guidance should stay as an internal package/client rather than a standalone server.
 - MCP servers are optional. Only servers declared in `~/.k8s-assistant/mcp.yaml` should be loaded.
-- `log-analyzer` and `troubleshooting` are separate domains:
+- `log-analyzer` and `guidance` are separate domains:
   - log-analyzer: logs/events/metrics observation and pattern analysis.
-  - troubleshooting: runbooks, operating issue RAG, remediation planning.
+  - guidance: resource guides, incident guides, operating issue RAG, remediation planning.
 - Do not use RAG for log pattern analysis unless explicitly requested.
 - Keep Kubernetes execution in the ReAct/tool loop and approval flow.
-- Do not let troubleshooting directly execute Kubernetes changes.
+- Do not let guidance directly execute Kubernetes changes.
 
 ## ReAct Loop and Prompt Rules
 
@@ -72,12 +72,12 @@ Meta command changes that affect runtime behavior should invalidate the active a
 - Korean output requires explicit config or `/lang Korean`.
 - Example config should use `language: English` unless the user explicitly asks to default to Korean.
 
-## Troubleshooting Gate
+## Incident Guidance Gate
 
-- Do not trigger troubleshooting from generic lookup/summary requests.
-- Words like “문제” in a request such as “이벤트 로그를 보고 어떤 문제가 있었는지 요약해줘” should not alone trigger troubleshooting.
-- Troubleshooting should be offered only for concrete failure signals or explicit repair/diagnostic intent.
-- No-error/stable summaries should not trigger troubleshooting.
+- Do not trigger incident guidance from generic lookup/summary requests.
+- Words like “문제” in a request such as “이벤트 로그를 보고 어떤 문제가 있었는지 요약해줘” should not alone trigger incident guidance.
+- Incident guidance should be offered only for concrete failure signals or explicit repair/diagnostic intent.
+- No-error/stable summaries should not trigger incident guidance.
 
 ## Documentation Rules
 
@@ -104,4 +104,3 @@ Meta command changes that affect runtime behavior should invalidate the active a
 - The worktree may be dirty; inspect before touching files that already have changes.
 - Avoid destructive commands.
 - Keep generated or temporary files out of the final worktree.
-

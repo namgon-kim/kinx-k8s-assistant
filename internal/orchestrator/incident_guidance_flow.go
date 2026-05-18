@@ -11,21 +11,21 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/diagnostic"
+	guidance "github.com/namgon-kim/kinx-k8s-assistant/internal/guidance"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react"
-	troubleshooting "github.com/namgon-kim/kinx-k8s-assistant/internal/troubleshooting"
 )
 
-type troubleshootingPhase int
+type incidentGuidancePhase int
 
 const (
-	troubleshootingIdle troubleshootingPhase = iota
-	troubleshootingOfferPending
-	troubleshootingSearchRequested
-	troubleshootingRemediationRequested
+	incidentGuidanceIdle incidentGuidancePhase = iota
+	incidentGuidanceOfferPending
+	incidentGuidanceSearchRequested
+	incidentGuidanceRemediationRequested
 )
 
-type TroubleshootingFlow struct {
-	phase            troubleshootingPhase
+type IncidentGuidanceFlow struct {
+	phase            incidentGuidancePhase
 	lastHash         string
 	lastUserQuery    string
 	problemText      string
@@ -34,25 +34,25 @@ type TroubleshootingFlow struct {
 	remediationBrief string
 }
 
-func NewTroubleshootingFlow() *TroubleshootingFlow {
-	return &TroubleshootingFlow{}
+func NewIncidentGuidanceFlow() *IncidentGuidanceFlow {
+	return &IncidentGuidanceFlow{}
 }
 
-func (f *TroubleshootingFlow) AfterAgentText(o *Orchestrator, text string) error {
-	if f.phase == troubleshootingSearchRequested {
+func (f *IncidentGuidanceFlow) AfterAgentText(o *Orchestrator, text string) error {
+	if f.phase == incidentGuidanceSearchRequested {
 		f.searchBrief = appendBounded(f.searchBrief, text, 4)
 		return nil
 	}
-	if f.phase != troubleshootingIdle {
+	if f.phase != incidentGuidanceIdle {
 		return nil
 	}
 	if o.agentWrap == nil {
 		return nil
 	}
-	if !shouldOfferTroubleshootingForQuery(f.lastUserQuery) {
+	if !shouldOfferIncidentGuidanceForQuery(f.lastUserQuery) {
 		return nil
 	}
-	if !looksTroubleshootable(text) {
+	if !looksIncidentGuidanceWorthy(text) {
 		return nil
 	}
 
@@ -63,22 +63,22 @@ func (f *TroubleshootingFlow) AfterAgentText(o *Orchestrator, text string) error
 	f.lastHash = hash
 	f.evidence = []string{text}
 	f.problemText = text
-	f.phase = troubleshootingOfferPending
+	f.phase = incidentGuidanceOfferPending
 
 	return nil
 }
 
-func (f *TroubleshootingFlow) RecordEvidence(text string) {
-	if f.phase == troubleshootingSearchRequested {
+func (f *IncidentGuidanceFlow) RecordEvidence(text string) {
+	if f.phase == incidentGuidanceSearchRequested {
 		f.searchBrief = appendBounded(f.searchBrief, text, 4)
 		return
 	}
-	if f.phase == troubleshootingIdle && looksTroubleshootable(text) {
+	if f.phase == incidentGuidanceIdle && looksIncidentGuidanceWorthy(text) {
 		f.evidence = appendBounded(f.evidence, text, 3)
 	}
 }
 
-func (f *TroubleshootingFlow) ObserveUserInput(query string) {
+func (f *IncidentGuidanceFlow) ObserveUserInput(query string) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return
@@ -86,21 +86,21 @@ func (f *TroubleshootingFlow) ObserveUserInput(query string) {
 	f.lastUserQuery = query
 }
 
-func (f *TroubleshootingFlow) BeforeUserInput(o *Orchestrator, activeAgent *react.Loop) (bool, error) {
-	if f.phase == troubleshootingRemediationRequested {
+func (f *IncidentGuidanceFlow) BeforeUserInput(o *Orchestrator, activeAgent *react.Loop) (bool, error) {
+	if f.phase == incidentGuidanceRemediationRequested {
 		f.reset()
 		return false, nil
 	}
-	if f.phase == troubleshootingOfferPending {
+	if f.phase == incidentGuidanceOfferPending {
 		return f.handleOffer(o, activeAgent)
 	}
-	if f.phase == troubleshootingSearchRequested {
+	if f.phase == incidentGuidanceSearchRequested {
 		return f.handleRemediationApproval(o, activeAgent)
 	}
 	return false, nil
 }
 
-func (f *TroubleshootingFlow) handleOffer(o *Orchestrator, activeAgent *react.Loop) (bool, error) {
+func (f *IncidentGuidanceFlow) handleOffer(o *Orchestrator, activeAgent *react.Loop) (bool, error) {
 	input, err := getInputWithUIEchoNoHistory("감지된 문제에 대해 해결 방법을 찾아볼까요? (y/n): ", o.cfg.HistoryFile)
 	if err != nil {
 		if err == io.EOF {
@@ -111,31 +111,31 @@ func (f *TroubleshootingFlow) handleOffer(o *Orchestrator, activeAgent *react.Lo
 		return true, err
 	}
 	if !isYes(input) {
-		o.logEntry("troubleshooting_offer", "declined")
+		o.logEntry("incident_guidance_offer", "declined")
 		f.reset()
 		activeAgent.SendInput(&api.UserInputResponse{Query: ""})
 		return true, nil
 	}
 
-	summary, err := f.runTroubleshooting(o)
+	summary, err := f.runIncidentGuidance(o)
 	if err != nil {
-		fmt.Println(colorBrightMagenta + "❌ trouble-shooting 조회 실패: " + err.Error() + colorReset)
-		o.logEntry("troubleshooting_search_error", err.Error())
+		fmt.Println(colorBrightMagenta + "❌ incident guidance 조회 실패: " + err.Error() + colorReset)
+		o.logEntry("incident_guidance_search_error", err.Error())
 		f.reset()
 		activeAgent.SendInput(&api.UserInputResponse{Query: ""})
 		return true, nil
 	}
 
 	PrintMessage(o.formatter.FormatText(summary))
-	o.logEntry("troubleshooting_search", summary)
-	f.phase = troubleshootingSearchRequested
+	o.logEntry("incident_guidance_search", summary)
+	f.phase = incidentGuidanceSearchRequested
 	f.searchBrief = []string{summary}
 	f.remediationBrief = summary
 	activeAgent.SendInput(&api.UserInputResponse{Query: ""})
 	return true, nil
 }
 
-func (f *TroubleshootingFlow) handleRemediationApproval(o *Orchestrator, activeAgent *react.Loop) (bool, error) {
+func (f *IncidentGuidanceFlow) handleRemediationApproval(o *Orchestrator, activeAgent *react.Loop) (bool, error) {
 	input, err := getInputWithUIEchoNoHistory("해결을 진행할까요? (y/n): ", o.cfg.HistoryFile)
 	if err != nil {
 		if err == io.EOF {
@@ -146,37 +146,37 @@ func (f *TroubleshootingFlow) handleRemediationApproval(o *Orchestrator, activeA
 		return true, err
 	}
 	if !isYes(input) {
-		o.logEntry("troubleshooting_remediation", "declined")
+		o.logEntry("incident_guidance_remediation", "declined")
 		f.reset()
 		activeAgent.SendInput(&api.UserInputResponse{Query: ""})
 		return true, nil
 	}
 
 	prompt := f.buildRemediationPrompt()
-	o.logEntry("troubleshooting_remediation", prompt)
-	f.phase = troubleshootingRemediationRequested
+	o.logEntry("incident_guidance_remediation", prompt)
+	f.phase = incidentGuidanceRemediationRequested
 	activeAgent.SendInput(&api.UserInputResponse{Query: prompt})
 	return true, nil
 }
 
-func (f *TroubleshootingFlow) buildRemediationPrompt() string {
-	return fmt.Sprintf(`사용자가 trouble-shooting 조치 계획 기반 진행을 승인했습니다.
+func (f *IncidentGuidanceFlow) buildRemediationPrompt() string {
+	return fmt.Sprintf(`사용자가 incident guidance 조치 계획 기반 진행을 승인했습니다.
 
-아래 trouble-shooting 결과를 바탕으로 문제 해결을 진행하세요.
+아래 incident guidance 결과를 바탕으로 문제 해결을 진행하세요.
 
 진행 규칙:
 1. 먼저 현재 클러스터 상태를 다시 확인하세요.
 2. 진단 명령은 실행해도 됩니다.
 3. 리소스 변경, 삭제, 재시작, scale, patch, apply, set resources 작업 전에는 반드시 구체적인 변경 내용을 사용자에게 승인받으세요.
-4. trouble-shooting 결과는 계획 근거입니다. 새로운 trouble-shooting/log-analyzer 도구 호출을 반복하지 마세요.
+4. incident guidance 결과는 계획 근거입니다. 새로운 incident guidance/log-analyzer 도구 호출을 반복하지 마세요.
 5. 실행 결과와 다음 조치를 한국어로 요약하세요.
 
-trouble-shooting 결과 요약:
+incident guidance 결과 요약:
 %s`, f.remediationBrief)
 }
 
-func (f *TroubleshootingFlow) runTroubleshooting(o *Orchestrator) (string, error) {
-	client, err := troubleshooting.NewClientFromDefaultConfig()
+func (f *IncidentGuidanceFlow) runIncidentGuidance(o *Orchestrator) (string, error) {
+	client, err := guidance.NewIncidentClient(o.cfg)
 	if err != nil {
 		return "", err
 	}
@@ -190,10 +190,10 @@ func (f *TroubleshootingFlow) runTroubleshooting(o *Orchestrator) (string, error
 		return "", err
 	}
 
-	return formatTroubleshootingSummary(result), nil
+	return formatIncidentGuidanceSummary(result), nil
 }
 
-func (f *TroubleshootingFlow) buildProblemSignal(o *Orchestrator) diagnostic.ProblemSignal {
+func (f *IncidentGuidanceFlow) buildProblemSignal(o *Orchestrator) diagnostic.ProblemSignal {
 	text := strings.Join(append([]string{f.problemText}, f.evidence...), "\n")
 	target := extractTarget(text)
 	if o.kubeconfigInfo != nil {
@@ -288,7 +288,7 @@ func severityForText(text string) diagnostic.Severity {
 	return diagnostic.SeverityWarning
 }
 
-func formatTroubleshootingSummary(result *troubleshooting.ClientResult) string {
+func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 	var b strings.Builder
 	b.WriteString("**해결 방법 요약**\n\n")
 	b.WriteString("- 추정 원인: " + summarizeDetectionTypes(result.Signal.DetectionTypes) + "\n")
@@ -304,7 +304,7 @@ func formatTroubleshootingSummary(result *troubleshooting.ClientResult) string {
 		b.WriteString("- 주의: 일부 runbook 명령은 대상 정보가 부족해 자동 실행 후보에서 제외했습니다.\n")
 	}
 
-	steps := executableSummarySteps(result.Plan.Steps, 5)
+	steps := executableIncidentSummarySteps(result.Plan.Steps, 5)
 	b.WriteString("\n**권장 단계**\n")
 	for i, step := range steps {
 		b.WriteString(fmt.Sprintf("%d. %s", i+1, step.Description))
@@ -313,7 +313,7 @@ func formatTroubleshootingSummary(result *troubleshooting.ClientResult) string {
 		}
 		b.WriteString("\n")
 	}
-	verifySteps := executableSummarySteps(result.Plan.Verification, 3)
+	verifySteps := executableIncidentSummarySteps(result.Plan.Verification, 3)
 	if len(verifySteps) > 0 {
 		b.WriteString("\n**검증**\n")
 		for _, step := range verifySteps {
@@ -327,8 +327,8 @@ func formatTroubleshootingSummary(result *troubleshooting.ClientResult) string {
 	return b.String()
 }
 
-func executableSummarySteps(steps []troubleshooting.PlanStep, limit int) []troubleshooting.PlanStep {
-	var result []troubleshooting.PlanStep
+func executableIncidentSummarySteps(steps []guidance.PlanStep, limit int) []guidance.PlanStep {
+	var result []guidance.PlanStep
 	for _, step := range steps {
 		cmd := strings.TrimSpace(step.RenderedCommand)
 		if strings.Contains(cmd, "{{") || strings.Contains(cmd, " -n  ") || strings.Contains(cmd, " / ") || strings.HasSuffix(cmd, " -n") || strings.HasSuffix(cmd, "-n") {
@@ -350,15 +350,15 @@ func summarizeDetectionTypes(types []diagnostic.DetectionType) string {
 	return strings.Join(values, ", ")
 }
 
-func (f *TroubleshootingFlow) reset() {
-	f.phase = troubleshootingIdle
+func (f *IncidentGuidanceFlow) reset() {
+	f.phase = incidentGuidanceIdle
 	f.problemText = ""
 	f.evidence = nil
 	f.searchBrief = nil
 	f.remediationBrief = ""
 }
 
-func looksTroubleshootable(text string) bool {
+func looksIncidentGuidanceWorthy(text string) bool {
 	lower := strings.ToLower(text)
 	keywords := []string{
 		"crashloopbackoff", "imagepullbackoff", "errimagepull", "oomkilled",
@@ -375,7 +375,7 @@ func looksTroubleshootable(text string) bool {
 	return false
 }
 
-func shouldOfferTroubleshootingForQuery(query string) bool {
+func shouldOfferIncidentGuidanceForQuery(query string) bool {
 	query = strings.TrimSpace(strings.ToLower(query))
 	if query == "" {
 		return false

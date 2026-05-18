@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"bytes"
@@ -13,7 +13,7 @@ import (
 )
 
 type RunbookUploadRequest struct {
-	Cases []TroubleshootingCase `json:"cases"`
+	Cases []GuideCase `json:"cases"`
 }
 
 type RunbookUploadResult struct {
@@ -21,7 +21,7 @@ type RunbookUploadResult struct {
 	Status   string `json:"status,omitempty"`
 }
 
-func UploadRunbooks(ctx context.Context, endpoint, apiKey string, timeoutSeconds int, cases []TroubleshootingCase) (*RunbookUploadResult, error) {
+func UploadRunbooks(ctx context.Context, endpoint, apiKey string, timeoutSeconds int, cases []GuideCase) (*RunbookUploadResult, error) {
 	if endpoint == "" {
 		return nil, fmt.Errorf("upload endpoint is required")
 	}
@@ -85,7 +85,7 @@ type qdrantVectorConfig struct {
 	Distance string `json:"distance"`
 }
 
-func UploadRunbooksToQdrant(ctx context.Context, cfg QdrantUploadConfig, cases []TroubleshootingCase) (*RunbookUploadResult, error) {
+func UploadRunbooksToQdrant(ctx context.Context, cfg QdrantUploadConfig, cases []GuideCase) (*RunbookUploadResult, error) {
 	serviceCfg := ApplyDefaults(Config{
 		EmbeddingBaseURL:    cfg.EmbeddingBaseURL,
 		EmbeddingAPIKey:     cfg.EmbeddingAPIKey,
@@ -137,7 +137,7 @@ func qdrantRequest(ctx context.Context, client *http.Client, method, url, apiKey
 	return nil
 }
 
-func runbookEmbeddingText(c TroubleshootingCase) string {
+func runbookEmbeddingText(c GuideCase) string {
 	return strings.Join([]string{
 		c.ID,
 		c.Title,

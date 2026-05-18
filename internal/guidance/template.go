@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"strings"

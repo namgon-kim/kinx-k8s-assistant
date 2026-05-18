@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"context"
@@ -13,25 +13,25 @@ import (
 )
 
 type KnowledgeStore struct {
-	cases []TroubleshootingCase
+	cases []GuideCase
 }
 
 func NewKnowledgeStore() *KnowledgeStore {
-	return &KnowledgeStore{cases: make([]TroubleshootingCase, 0)}
+	return &KnowledgeStore{cases: make([]GuideCase, 0)}
 }
 
-func (s *KnowledgeStore) Index(cases []TroubleshootingCase, rebuild bool) {
+func (s *KnowledgeStore) Index(cases []GuideCase, rebuild bool) {
 	if rebuild {
-		s.cases = make([]TroubleshootingCase, 0, len(cases))
+		s.cases = make([]GuideCase, 0, len(cases))
 	}
 	s.cases = append(s.cases, cases...)
 }
 
-func (s *KnowledgeStore) Search(query string, max int) []TroubleshootingCase {
+func (s *KnowledgeStore) Search(query string, max int) []GuideCase {
 	if max <= 0 {
 		max = 5
 	}
-	results := make([]TroubleshootingCase, 0)
+	results := make([]GuideCase, 0)
 	for _, c := range s.cases {
 		score := keywordScore(c, query)
 		if score <= 0 {
@@ -49,7 +49,7 @@ func (s *KnowledgeStore) Search(query string, max int) []TroubleshootingCase {
 	return results
 }
 
-func keywordScore(c TroubleshootingCase, query string) float64 {
+func keywordScore(c GuideCase, query string) float64 {
 	text := strings.ToLower(strings.Join([]string{
 		c.ID, c.Title, c.Cause, c.Resolution, c.Source, strings.Join(c.Tags, " "),
 		strings.Join(c.Symptoms, " "),
@@ -124,7 +124,7 @@ func (s *Service) ImportIssues(ctx context.Context, dir string) (int, error) {
 
 func (s *Service) IndexKnowledge(ctx context.Context, req KnowledgeIndexRequest) (int, error) {
 	_ = ctx
-	var cases []TroubleshootingCase
+	var cases []GuideCase
 	if req.IncludeRunbooks {
 		cases = append(cases, s.runbooks...)
 	}
@@ -143,19 +143,19 @@ func (s *Service) IndexKnowledge(ctx context.Context, req KnowledgeIndexRequest)
 	return len(cases), nil
 }
 
-func LoadIssuesAsCases(dir string) ([]TroubleshootingCase, error) {
+func LoadIssuesAsCases(dir string) ([]GuideCase, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("issue dir is not configured")
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return []TroubleshootingCase{}, nil
+			return []GuideCase{}, nil
 		}
 		return nil, err
 	}
 
-	var cases []TroubleshootingCase
+	var cases []GuideCase
 	for _, entry := range entries {
 		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), ".yaml") && !strings.HasSuffix(entry.Name(), ".yml")) {
 			continue
@@ -174,7 +174,7 @@ func LoadIssuesAsCases(dir string) ([]TroubleshootingCase, error) {
 	return cases, nil
 }
 
-func issueToCase(issue ExportedIssue, path string) TroubleshootingCase {
+func issueToCase(issue ExportedIssue, path string) GuideCase {
 	matchTypes := make([]string, 0, len(issue.Signal.DetectionTypes))
 	for _, t := range issue.Signal.DetectionTypes {
 		matchTypes = append(matchTypes, string(t))
@@ -183,7 +183,7 @@ func issueToCase(issue ExportedIssue, path string) TroubleshootingCase {
 	if title == "" {
 		title = issue.Signal.Summary
 	}
-	return TroubleshootingCase{
+	return GuideCase{
 		ID:         issue.ID,
 		Title:      title,
 		MatchTypes: issue.Signal.DetectionTypes,

@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"bytes"
@@ -12,7 +12,7 @@ import (
 )
 
 func TestMatchRunbookByDetectionType(t *testing.T) {
-	svc := NewService(Config{MaxCases: 3}, []TroubleshootingCase{
+	svc := NewService(Config{MaxCases: 3}, []GuideCase{
 		{
 			ID:         "crashloop-oom",
 			Title:      "CrashLoopBackOff - OOMKilled",
@@ -21,7 +21,7 @@ func TestMatchRunbookByDetectionType(t *testing.T) {
 		},
 	})
 
-	result, err := svc.MatchRunbook(context.Background(), TroubleshootingSearchRequest{
+	result, err := svc.MatchRunbook(context.Background(), GuideSearchRequest{
 		Signal: diagnostic.ProblemSignal{
 			DetectionTypes: []diagnostic.DetectionType{diagnostic.DetectionOOMKilled},
 			Summary:        "Pod was OOMKilled",
@@ -51,7 +51,7 @@ func TestBuildRemediationPlanMarksMutationConfirmation(t *testing.T) {
 
 	plan, err := svc.BuildRemediationPlan(context.Background(), RemediationPlanRequest{
 		Target: target,
-		SelectedCases: []TroubleshootingCase{
+		SelectedCases: []GuideCase{
 			{
 				ID:        "oom",
 				Title:     "OOM",
@@ -109,7 +109,7 @@ func TestExportAndSearchKnowledge(t *testing.T) {
 		t.Fatalf("expected 1 indexed issue, got %d", count)
 	}
 
-	result, err := svc.SearchKnowledge(context.Background(), TroubleshootingSearchRequest{
+	result, err := svc.SearchKnowledge(context.Background(), GuideSearchRequest{
 		Query: "OOMKilled memory limit",
 	})
 	if err != nil {
@@ -124,7 +124,7 @@ func TestSearchKnowledgeUsesEndpointProvider(t *testing.T) {
 	var authHeader string
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		authHeader = r.Header.Get("Authorization")
-		var req TroubleshootingSearchRequest
+		var req GuideSearchRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
 		}
@@ -132,9 +132,9 @@ func TestSearchKnowledgeUsesEndpointProvider(t *testing.T) {
 			t.Fatalf("unexpected query: %s", req.Query)
 		}
 		var body bytes.Buffer
-		_ = json.NewEncoder(&body).Encode(TroubleshootingSearchResult{
+		_ = json.NewEncoder(&body).Encode(GuideSearchResult{
 			Query: "oom memory",
-			Cases: []TroubleshootingCase{
+			Cases: []GuideCase{
 				{ID: "remote-issue", Title: "Remote OOM issue", Similarity: 0.9},
 			},
 			Confidence: diagnostic.ConfidenceHigh,
@@ -154,7 +154,7 @@ func TestSearchKnowledgeUsesEndpointProvider(t *testing.T) {
 	}, nil)
 	svc.endpoint.client = &http.Client{Transport: transport}
 
-	result, err := svc.SearchKnowledge(context.Background(), TroubleshootingSearchRequest{
+	result, err := svc.SearchKnowledge(context.Background(), GuideSearchRequest{
 		Query: "oom memory",
 	})
 	if err != nil {

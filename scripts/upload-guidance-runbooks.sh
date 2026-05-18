@@ -4,12 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARGS=(--target qdrant)
 
-if [[ -n "${TROUBLE_SHOOTING_CONFIG:-}" ]]; then
-  ARGS+=(--config "$TROUBLE_SHOOTING_CONFIG")
+if [[ -n "${GUIDANCE_CONFIG:-}" ]]; then
+  ARGS+=(--config "$GUIDANCE_CONFIG")
 fi
-if [[ -n "${RUNBOOK_DIR:-}" ]]; then
-  ARGS+=(--runbook-dir "$RUNBOOK_DIR")
-fi
+ARGS+=(--runbook-dir "${RUNBOOK_DIR:?RUNBOOK_DIR is required}")
+ARGS+=(--collection "${COLLECTION:?COLLECTION is required}")
 if [[ -n "${EMBEDDING_URL:-}" ]]; then
   ARGS+=(--embedding-url "$EMBEDDING_URL")
 fi
@@ -32,18 +31,15 @@ fi
 if [[ -n "${QDRANT_API_KEY:-}" ]]; then
   ARGS+=(--qdrant-api-key "$QDRANT_API_KEY")
 fi
-if [[ -n "${QDRANT_COLLECTION:-}" ]]; then
-  ARGS+=(--qdrant-collection "$QDRANT_COLLECTION")
-fi
 if [[ -n "${QDRANT_VECTOR_SIZE:-}" ]]; then
   ARGS+=(--qdrant-vector-size "$QDRANT_VECTOR_SIZE")
 fi
 if [[ -n "${QDRANT_DISTANCE:-}" ]]; then
   ARGS+=(--qdrant-distance "$QDRANT_DISTANCE")
 fi
-if [[ -n "${TROUBLESHOOTING_UPLOAD_TIMEOUT:-}" ]]; then
-  ARGS+=(--timeout "$TROUBLESHOOTING_UPLOAD_TIMEOUT")
+if [[ -n "${GUIDANCE_UPLOAD_TIMEOUT:-}" ]]; then
+  ARGS+=(--timeout "$GUIDANCE_UPLOAD_TIMEOUT")
 fi
 
 GOCACHE="${GOCACHE:-/private/tmp/kinx-go-cache}" \
-  go run "$ROOT_DIR/cmd/troubleshooting-upload" "${ARGS[@]}"
+  go run "$ROOT_DIR/cmd/guidance-upload" "${ARGS[@]}"

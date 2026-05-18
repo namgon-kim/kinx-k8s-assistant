@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import "github.com/namgon-kim/kinx-k8s-assistant/internal/diagnostic"
 
@@ -28,7 +28,7 @@ const (
 	RiskCritical RiskLevel = "critical"
 )
 
-type TroubleshootingSearchRequest struct {
+type GuideSearchRequest struct {
 	Signal diagnostic.ProblemSignal    `json:"signal" yaml:"signal"`
 	Query  string                      `json:"query,omitempty" yaml:"query,omitempty"`
 	Target diagnostic.KubernetesTarget `json:"target,omitempty" yaml:"target,omitempty"`
@@ -36,15 +36,15 @@ type TroubleshootingSearchRequest struct {
 	Locale string                      `json:"locale,omitempty" yaml:"locale,omitempty"`
 }
 
-type TroubleshootingSearchResult struct {
+type GuideSearchResult struct {
 	Query      string                     `json:"query" yaml:"query"`
-	Cases      []TroubleshootingCase      `json:"cases" yaml:"cases"`
+	Cases      []GuideCase                `json:"cases" yaml:"cases"`
 	Confidence diagnostic.ConfidenceLevel `json:"confidence" yaml:"confidence"`
 	Summary    string                     `json:"summary" yaml:"summary"`
 	SearchMode SearchMode                 `json:"search_mode" yaml:"search_mode"`
 }
 
-type TroubleshootingCase struct {
+type GuideCase struct {
 	ID               string                     `json:"id" yaml:"id"`
 	Title            string                     `json:"title" yaml:"title"`
 	MatchTypes       []diagnostic.DetectionType `json:"match_types,omitempty" yaml:"match_types,omitempty"`
@@ -67,7 +67,7 @@ type TroubleshootingCase struct {
 
 type RemediationPlanRequest struct {
 	Signal        diagnostic.ProblemSignal    `json:"signal" yaml:"signal"`
-	SelectedCases []TroubleshootingCase       `json:"selected_cases,omitempty" yaml:"selected_cases,omitempty"`
+	SelectedCases []GuideCase                 `json:"selected_cases,omitempty" yaml:"selected_cases,omitempty"`
 	Target        diagnostic.KubernetesTarget `json:"target,omitempty" yaml:"target,omitempty"`
 	Constraints   RemediationConstraints      `json:"constraints,omitempty" yaml:"constraints,omitempty"`
 }
@@ -111,7 +111,7 @@ type ExportedIssue struct {
 	Signal          diagnostic.ProblemSignal `json:"signal" yaml:"signal"`
 	LogSummary      string                   `json:"log_summary,omitempty" yaml:"log_summary,omitempty"`
 	MetricSummary   string                   `json:"metric_summary,omitempty" yaml:"metric_summary,omitempty"`
-	SelectedCases   []TroubleshootingCase    `json:"selected_cases,omitempty" yaml:"selected_cases,omitempty"`
+	SelectedCases   []GuideCase              `json:"selected_cases,omitempty" yaml:"selected_cases,omitempty"`
 	Plan            *RemediationPlan         `json:"plan,omitempty" yaml:"plan,omitempty"`
 	ExecutionResult string                   `json:"execution_result,omitempty" yaml:"execution_result,omitempty"`
 	Cause           string                   `json:"cause,omitempty" yaml:"cause,omitempty"`

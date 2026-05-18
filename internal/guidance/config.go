@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import "strings"
 
@@ -10,7 +10,6 @@ const (
 	DefaultDistance         = "Cosine"
 	DefaultEmbeddingMaxLen  = 1024
 	DefaultQdrantURL        = "http://localhost:6333"
-	DefaultQdrantCollection = "k8s_troubleshooting_runbooks_v1"
 	DefaultQdrantLimit      = 11
 	DefaultRerankerBaseURL  = "http://1.201.177.120:4000"
 	DefaultRerankerModel    = "bge-reranker-v2-m3"
@@ -52,9 +51,6 @@ func ApplyDefaults(cfg Config) Config {
 		cfg.QdrantURL = DefaultQdrantURL
 	}
 	cfg.QdrantURL = normalizeHTTPBaseURL(cfg.QdrantURL)
-	if cfg.QdrantCollection == "" {
-		cfg.QdrantCollection = DefaultQdrantCollection
-	}
 	if cfg.QdrantLimit <= 0 {
 		cfg.QdrantLimit = DefaultQdrantLimit
 	}

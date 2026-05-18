@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"embed"
@@ -15,10 +15,10 @@ import (
 var embeddedRunbookFS embed.FS
 
 type runbookFile struct {
-	Cases []TroubleshootingCase `yaml:"cases"`
+	Cases []GuideCase `yaml:"cases"`
 }
 
-func LoadRunbooks(dir string) ([]TroubleshootingCase, error) {
+func LoadRunbooks(dir string) ([]GuideCase, error) {
 	useDefault := dir == ""
 	if dir == "" {
 		dir = DefaultRunbookDir()
@@ -32,7 +32,7 @@ func LoadRunbooks(dir string) ([]TroubleshootingCase, error) {
 		return nil, err
 	}
 
-	var cases []TroubleshootingCase
+	var cases []GuideCase
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -61,12 +61,12 @@ func LoadRunbooks(dir string) ([]TroubleshootingCase, error) {
 	return cases, nil
 }
 
-func loadEmbeddedRunbooks() ([]TroubleshootingCase, error) {
+func loadEmbeddedRunbooks() ([]GuideCase, error) {
 	entries, err := embeddedRunbookFS.ReadDir("runbooks")
 	if err != nil {
 		return nil, err
 	}
-	var cases []TroubleshootingCase
+	var cases []GuideCase
 	for _, entry := range entries {
 		if entry.IsDir() || isDraftRunbook(entry.Name()) || (!strings.HasSuffix(entry.Name(), ".yaml") && !strings.HasSuffix(entry.Name(), ".yml")) {
 			continue
@@ -95,9 +95,9 @@ func isDraftRunbook(name string) bool {
 
 func DefaultRunbookDir() string {
 	candidates := []string{
-		filepath.Join("internal", "troubleshooting", "runbooks"),
-		filepath.Join("..", "internal", "troubleshooting", "runbooks"),
-		filepath.Join("..", "..", "internal", "troubleshooting", "runbooks"),
+		filepath.Join("internal", "guidance", "runbooks"),
+		filepath.Join("..", "internal", "guidance", "runbooks"),
+		filepath.Join("..", "..", "internal", "guidance", "runbooks"),
 	}
 	for _, candidate := range candidates {
 		if _, err := os.Stat(candidate); err == nil {
@@ -107,7 +107,7 @@ func DefaultRunbookDir() string {
 	return candidates[0]
 }
 
-func loadRunbookFile(path string) ([]TroubleshootingCase, error) {
+func loadRunbookFile(path string) ([]GuideCase, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -115,7 +115,7 @@ func loadRunbookFile(path string) ([]TroubleshootingCase, error) {
 	return parseRunbookData(data, path)
 }
 
-func parseRunbookData(data []byte, source string) ([]TroubleshootingCase, error) {
+func parseRunbookData(data []byte, source string) ([]GuideCase, error) {
 	var wrapper runbookFile
 	if err := yaml.Unmarshal(data, &wrapper); err != nil {
 		return nil, err
@@ -129,7 +129,7 @@ func parseRunbookData(data []byte, source string) ([]TroubleshootingCase, error)
 	return wrapper.Cases, nil
 }
 
-func (c *TroubleshootingCase) UnmarshalYAML(value *yaml.Node) error {
+func (c *GuideCase) UnmarshalYAML(value *yaml.Node) error {
 	var aux struct {
 		ID               string      `yaml:"id"`
 		Title            string      `yaml:"title"`
@@ -153,7 +153,7 @@ func (c *TroubleshootingCase) UnmarshalYAML(value *yaml.Node) error {
 	if err := value.Decode(&aux); err != nil {
 		return err
 	}
-	*c = TroubleshootingCase{
+	*c = GuideCase{
 		ID:               aux.ID,
 		Title:            aux.Title,
 		Symptoms:         aux.Symptoms,

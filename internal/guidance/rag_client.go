@@ -1,4 +1,4 @@
-package troubleshooting
+package guidance
 
 import (
 	"bytes"
@@ -125,7 +125,7 @@ func NewRerankerClient(cfg Config) *RerankerClient {
 	}
 }
 
-func (c *RerankerClient) Rerank(ctx context.Context, query string, cases []TroubleshootingCase, cfg Config) ([]TroubleshootingCase, error) {
+func (c *RerankerClient) Rerank(ctx context.Context, query string, cases []GuideCase, cfg Config) ([]GuideCase, error) {
 	cfg = ApplyDefaults(cfg)
 	if len(cases) == 0 {
 		return cases, nil
@@ -176,7 +176,7 @@ func (c *RerankerClient) Rerank(ctx context.Context, query string, cases []Troub
 	if len(results) == 0 {
 		return cases, nil
 	}
-	reranked := make([]TroubleshootingCase, 0, len(results))
+	reranked := make([]GuideCase, 0, len(results))
 	for _, r := range results {
 		if r.Index < 0 || r.Index >= len(cases) {
 			continue

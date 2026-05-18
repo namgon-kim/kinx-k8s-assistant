@@ -6,50 +6,54 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/namgon-kim/kinx-k8s-assistant/internal/troubleshooting"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/guidance"
 )
 
 func main() {
-	configFile := flag.String("config", "", "Trouble-shooting config YAML file (default: ~/.k8s-assistant/trouble-shooting.yaml if present)")
-	runbookDir := flag.String("runbook-dir", troubleshooting.DefaultRunbookDir(), "Directory containing troubleshooting runbook YAML files")
+	configFile := flag.String("config", "", "Guidance config YAML file (default: ~/.k8s-assistant/guidance.yaml if present)")
+	runbookDir := flag.String("runbook-dir", "", "Directory containing runbook YAML files (required)")
+	collection := flag.String("collection", "", "Qdrant collection name (required)")
 	target := flag.String("target", "qdrant", "Upload target: qdrant|endpoint")
 	endpoint := flag.String("endpoint", "", "Runbook upload endpoint URL")
 	apiKey := flag.String("api-key", "", "Upload endpoint bearer token")
-	embeddingURL := flag.String("embedding-url", troubleshooting.DefaultEmbeddingBaseURL, "Embedding endpoint base URL")
+	embeddingURL := flag.String("embedding-url", guidance.DefaultEmbeddingBaseURL, "Embedding endpoint base URL")
 	embeddingAPIKey := flag.String("embedding-api-key", "", "Embedding endpoint bearer token")
-	embeddingModel := flag.String("embedding-model", troubleshooting.DefaultEmbeddingModel, "Embedding model")
-	vectorName := flag.String("vector-name", troubleshooting.DefaultVectorName, "Qdrant vector name")
-	embeddingMaxLength := flag.Int("embedding-max-length", troubleshooting.DefaultEmbeddingMaxLen, "Embedding max length")
-	qdrantURL := flag.String("qdrant-url", troubleshooting.DefaultQdrantURL, "Qdrant base URL, e.g. http://localhost:6333")
+	embeddingModel := flag.String("embedding-model", guidance.DefaultEmbeddingModel, "Embedding model")
+	vectorName := flag.String("vector-name", guidance.DefaultVectorName, "Qdrant vector name")
+	embeddingMaxLength := flag.Int("embedding-max-length", guidance.DefaultEmbeddingMaxLen, "Embedding max length")
+	qdrantURL := flag.String("qdrant-url", guidance.DefaultQdrantURL, "Qdrant base URL, e.g. http://localhost:6333")
 	qdrantAPIKey := flag.String("qdrant-api-key", "", "Qdrant API key")
-	qdrantCollection := flag.String("qdrant-collection", troubleshooting.DefaultQdrantCollection, "Qdrant collection name")
-	qdrantVectorSize := flag.Int("qdrant-vector-size", troubleshooting.DefaultVectorSize, "Qdrant vector size")
-	qdrantDistance := flag.String("qdrant-distance", troubleshooting.DefaultDistance, "Qdrant vector distance")
+	qdrantVectorSize := flag.Int("qdrant-vector-size", guidance.DefaultVectorSize, "Qdrant vector size")
+	qdrantDistance := flag.String("qdrant-distance", guidance.DefaultDistance, "Qdrant vector distance")
 	qdrantCreate := flag.Bool("qdrant-create-collection", true, "Create Qdrant collection if missing")
 	timeout := flag.Int("timeout", 30, "Upload timeout seconds")
 	dryRun := flag.Bool("dry-run", false, "Validate and print loaded runbook count without uploading")
 	flag.Parse()
 
 	visited := visitedFlags()
-	cfg := troubleshooting.Config{
+	cfg := guidance.Config{
 		RunbookDir:          "",
-		EmbeddingModel:      troubleshooting.DefaultEmbeddingModel,
-		VectorName:          troubleshooting.DefaultVectorName,
-		VectorSize:          troubleshooting.DefaultVectorSize,
-		Distance:            troubleshooting.DefaultDistance,
-		EmbeddingMaxLength:  troubleshooting.DefaultEmbeddingMaxLen,
+		EmbeddingModel:      guidance.DefaultEmbeddingModel,
+		VectorName:          guidance.DefaultVectorName,
+		VectorSize:          guidance.DefaultVectorSize,
+		Distance:            guidance.DefaultDistance,
+		EmbeddingMaxLength:  guidance.DefaultEmbeddingMaxLen,
 		NormalizeEmbeddings: true,
-		QdrantURL:           troubleshooting.DefaultQdrantURL,
-		QdrantCollection:    troubleshooting.DefaultQdrantCollection,
+		QdrantURL:           guidance.DefaultQdrantURL,
 	}
-	if fileCfg, _, err := troubleshooting.LoadOptionalFileConfig(*configFile); err != nil {
+	if fileCfg, _, err := guidance.LoadOptionalFileConfig(*configFile); err != nil {
 		log.Fatalf("failed to load config file: %v", err)
 	} else if fileCfg != nil {
 		cfg = fileCfg.ApplyToConfig(cfg)
 	}
-	if visited["runbook-dir"] {
-		cfg.RunbookDir = *runbookDir
+	if !visited["runbook-dir"] || *runbookDir == "" {
+		log.Fatal("--runbook-dir is required")
 	}
+	if !visited["collection"] || *collection == "" {
+		log.Fatal("--collection is required")
+	}
+	cfg.RunbookDir = *runbookDir
+	cfg.QdrantCollection = *collection
 	if visited["embedding-url"] {
 		cfg.EmbeddingBaseURL = *embeddingURL
 	}
@@ -71,9 +75,6 @@ func main() {
 	if visited["qdrant-api-key"] {
 		cfg.QdrantAPIKey = *qdrantAPIKey
 	}
-	if visited["qdrant-collection"] {
-		cfg.QdrantCollection = *qdrantCollection
-	}
 	if visited["qdrant-vector-size"] {
 		cfg.VectorSize = *qdrantVectorSize
 	}
@@ -93,7 +94,7 @@ func main() {
 		apiKeyValue = cfg.EndpointAPIKey
 	}
 
-	cases, err := troubleshooting.LoadRunbooks(cfg.RunbookDir)
+	cases, err := guidance.LoadRunbooks(cfg.RunbookDir)
 	if err != nil {
 		log.Fatalf("failed to load runbooks: %v", err)
 	}
@@ -102,12 +103,12 @@ func main() {
 		return
 	}
 
-	var result *troubleshooting.RunbookUploadResult
+	var result *guidance.RunbookUploadResult
 	switch *target {
 	case "endpoint":
-		result, err = troubleshooting.UploadRunbooks(context.Background(), endpointValue, apiKeyValue, timeoutValue, cases)
+		result, err = guidance.UploadRunbooks(context.Background(), endpointValue, apiKeyValue, timeoutValue, cases)
 	case "qdrant":
-		result, err = troubleshooting.UploadRunbooksToQdrant(context.Background(), troubleshooting.QdrantUploadConfig{
+		result, err = guidance.UploadRunbooksToQdrant(context.Background(), guidance.QdrantUploadConfig{
 			URL:                 cfg.QdrantURL,
 			APIKey:              cfg.QdrantAPIKey,
 			Collection:          cfg.QdrantCollection,
