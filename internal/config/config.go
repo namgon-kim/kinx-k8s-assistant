@@ -11,10 +11,13 @@ import (
 // Config는 k8s-assistant 전체 설정을 담습니다.
 type Config struct {
 	// LLM 설정
-	LLMProvider string `json:"llmprovider"`
-	Model       string `json:"model"`
-	APIKey      string `json:"apikey"`
-	Endpoint    string `json:"endpoint"`
+	LLMProvider     string  `json:"llmprovider"`
+	Model           string  `json:"model"`
+	Temperature     float64 `json:"temperature"`
+	TopP            float64 `json:"top_p"`
+	ReasoningEffort string  `json:"reasoning_effort"`
+	APIKey          string  `json:"apikey"`
+	Endpoint        string  `json:"endpoint"`
 
 	// Provider별 인증 (환경변수가 config 값보다 우선)
 	AnthropicAPIKey     string `json:"anthropic_apikey,omitempty"`
@@ -77,11 +80,14 @@ type GuidanceConfig struct {
 // ~/.k8s-assistant/config.yaml 파일이 있으면 로드합니다.
 func NewConfig() *Config {
 	cfg := &Config{
-		LLMProvider:    "gemini",
-		Model:          "gemini-2.0-flash",
-		MaxIterations:  20,
-		SessionBackend: "memory",
-		LogLevel:       0,
+		LLMProvider:     "gemini",
+		Model:           "gemini-2.0-flash",
+		Temperature:     0.1,
+		TopP:            1.0,
+		ReasoningEffort: "",
+		MaxIterations:   20,
+		SessionBackend:  "memory",
+		LogLevel:        0,
 		Lang: LangConfig{
 			Language: "English",
 		},
@@ -116,6 +122,7 @@ func NewConfig() *Config {
 				}
 				normalizeLangConfig(cfg)
 				normalizeGuidanceConfig(cfg)
+				normalizeLLMConfig(cfg)
 				applyEnvironmentOverrides(cfg)
 				return cfg
 			}
@@ -131,9 +138,25 @@ func NewConfig() *Config {
 	}
 	normalizeLangConfig(cfg)
 	normalizeGuidanceConfig(cfg)
+	normalizeLLMConfig(cfg)
 	applyEnvironmentOverrides(cfg)
 
 	return cfg
+}
+
+func normalizeLLMConfig(cfg *Config) {
+	if cfg.Temperature < 0 || cfg.Temperature > 2 {
+		cfg.Temperature = 0.1
+	}
+	if cfg.TopP <= 0 || cfg.TopP > 1 {
+		cfg.TopP = 1.0
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.ReasoningEffort)) {
+	case "", "low", "medium", "high":
+		cfg.ReasoningEffort = strings.ToLower(strings.TrimSpace(cfg.ReasoningEffort))
+	default:
+		cfg.ReasoningEffort = ""
+	}
 }
 
 func normalizeGuidanceConfig(cfg *Config) {

@@ -11,7 +11,12 @@ func TestParseReActResponseWithAction(t *testing.T) {
     "name": "kubectl",
     "reason": "need pod status",
     "goal": "verify whether the pod is running",
-    "command": "kubectl get pods -n tests",
+    "target": {
+      "resource": "pods",
+      "namespace": "tests",
+      "name": "app"
+    },
+    "command": "kubectl get pods app -n tests",
     "expected_observation": "pod phase and readiness",
     "modifies_resource": "no"
   }
@@ -32,6 +37,9 @@ suffix`)
 	}
 	if parsed.Action.Goal != "verify whether the pod is running" {
 		t.Fatalf("unexpected action goal: %q", parsed.Action.Goal)
+	}
+	if parsed.Action.Target == nil || parsed.Action.Target.Namespace != "tests" {
+		t.Fatalf("unexpected action target: %#v", parsed.Action.Target)
 	}
 }
 
@@ -107,7 +115,8 @@ func TestShimPartConvertsActionToFunctionCall(t *testing.T) {
 		Name:                "kubectl",
 		Reason:              "need pod status",
 		Goal:                "verify whether the pod is running",
-		Command:             "kubectl get pods -n tests",
+		Target:              &actionTarget{Resource: "pods", Namespace: "tests", Name: "app"},
+		Command:             "kubectl get pods app -n tests",
 		ExpectedObservation: "pod phase and readiness",
 		ModifiesResource:    "no",
 	}}
@@ -125,7 +134,7 @@ func TestShimPartConvertsActionToFunctionCall(t *testing.T) {
 	if _, exists := calls[0].Arguments["name"]; exists {
 		t.Fatal("name should be removed from function call arguments")
 	}
-	if calls[0].Arguments["command"] != "kubectl get pods -n tests" {
+	if calls[0].Arguments["command"] != "kubectl get pods app -n tests" {
 		t.Fatalf("unexpected command: %#v", calls[0].Arguments["command"])
 	}
 	if calls[0].Arguments["goal"] != "verify whether the pod is running" {
@@ -150,5 +159,21 @@ func TestShimPartConvertsResourceGuideLookupToInternalCall(t *testing.T) {
 	}
 	if calls[0].Arguments["problem_focus"] != "worker scale / replica availability" {
 		t.Fatalf("unexpected problem focus: %#v", calls[0].Arguments["problem_focus"])
+	}
+}
+
+func TestShimPartConvertsRequestContextToInternalCall(t *testing.T) {
+	part := &shimPart{requestContext: &requestContext{
+		PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "cluster-a"},
+		Scope:         requestScope{Namespace: "tenant-a"},
+		ResourceClass: "unknown",
+	}}
+
+	calls, ok := part.AsFunctionCalls()
+	if !ok || len(calls) != 1 {
+		t.Fatalf("expected one internal request-context call, got %#v", calls)
+	}
+	if calls[0].Name != internalRequestContextCall {
+		t.Fatalf("unexpected call name: %q", calls[0].Name)
 	}
 }

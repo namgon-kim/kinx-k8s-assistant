@@ -40,6 +40,7 @@ type PendingCall struct {
 }
 
 const internalResourceGuideLookupCall = "__resource_guide_lookup__"
+const internalRequestContextCall = "__request_context__"
 
 type Loop struct {
 	cfg      *config.Config
@@ -60,6 +61,8 @@ type Loop struct {
 	skipPermissions bool
 
 	originalQuery         string
+	requestContext        *requestContext
+	initialGuideAttempted bool
 	resourceGuideInjected bool
 	resourceGuideEvidence []string
 	resourceGuideQueries  map[string]struct{}
@@ -280,6 +283,8 @@ func (l *Loop) startQuery(query string) {
 	l.currChatContent = []any{query}
 	l.pendingCalls = nil
 	l.originalQuery = query
+	l.requestContext = nil
+	l.initialGuideAttempted = false
 	l.resourceGuideInjected = false
 	l.resourceGuideEvidence = nil
 	l.resourceGuideQueries = nil
@@ -377,7 +382,17 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		return nil
 	}
 
+	var requestContextHandled bool
+	functionCalls, requestContextHandled = l.consumeRequestContext(ctx, functionCalls)
+	if requestContextHandled {
+		return nil
+	}
+
 	if handled := l.handleRequestedResourceGuideLookup(ctx, functionCalls); handled {
+		return nil
+	}
+
+	if handled := l.rejectInconsistentActionTargets(functionCalls); handled {
 		return nil
 	}
 
@@ -419,6 +434,172 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	return l.dispatchToolCalls(ctx)
+}
+
+func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
+	var remaining []gollm.FunctionCall
+	for _, call := range calls {
+		if call.Name != internalRequestContextCall {
+			remaining = append(remaining, call)
+			continue
+		}
+		if l.requestContext != nil {
+			continue
+		}
+		request, ok := requestContextFromFunctionCall(call)
+		if !ok {
+			l.currChatContent = append(l.currChatContent, "Request context was invalid. Return one corrected response with primary_target, scope, and resource_class before choosing the next action. Namespace is a scope field unless the user explicitly asks about a Namespace object; do not set primary_target.resource=namespace while also setting scope.namespace.")
+			l.currIteration++
+			l.state = StateRunning
+			return nil, true
+		}
+		l.requestContext = &request
+		if l.shouldRunInitialResourceGuideLookup(request) {
+			l.initialGuideAttempted = true
+			resource := normalizeKubectlResource(request.PrimaryTarget.Resource)
+			l.searchAndInjectResourceGuide(ctx, resource, l.initialResourceGuideQuery(request))
+			return nil, true
+		}
+	}
+	return remaining, false
+}
+
+func requestContextFromFunctionCall(call gollm.FunctionCall) (requestContext, bool) {
+	var request requestContext
+	primaryRaw, ok := call.Arguments["primary_target"].(map[string]any)
+	if !ok {
+		return request, false
+	}
+	resource, _ := primaryRaw["resource"].(string)
+	name, _ := primaryRaw["name"].(string)
+	resourceClass, _ := call.Arguments["resource_class"].(string)
+	request.PrimaryTarget = requestPrimaryTarget{
+		Resource: strings.TrimSpace(resource),
+		Name:     strings.TrimSpace(name),
+	}
+	if scopeRaw, ok := call.Arguments["scope"].(map[string]any); ok {
+		namespace, _ := scopeRaw["namespace"].(string)
+		request.Scope.Namespace = strings.TrimSpace(namespace)
+	}
+	switch strings.ToLower(strings.TrimSpace(resourceClass)) {
+	case "built_in", "custom_resource", "unknown":
+		request.ResourceClass = strings.ToLower(strings.TrimSpace(resourceClass))
+	default:
+		return requestContext{}, false
+	}
+	if request.PrimaryTarget.Resource == "" {
+		return requestContext{}, false
+	}
+	if request.PrimaryTarget.Resource == "namespace" && request.Scope.Namespace != "" {
+		return requestContext{}, false
+	}
+	return request, true
+}
+
+func (l *Loop) shouldRunInitialResourceGuideLookup(request requestContext) bool {
+	if l.initialGuideAttempted {
+		return false
+	}
+	resource := normalizeKubectlResource(strings.ToLower(request.PrimaryTarget.Resource))
+	if resource == "" || isBuiltinKubernetesResource(resource) {
+		return false
+	}
+	return true
+}
+
+func (l *Loop) initialResourceGuideQuery(request requestContext) string {
+	lines := []string{
+		l.originalQuery,
+		"primary target resource: " + request.PrimaryTarget.Resource,
+	}
+	if request.PrimaryTarget.Name != "" {
+		lines = append(lines, "primary target name: "+request.PrimaryTarget.Name)
+	}
+	if request.Scope.Namespace != "" {
+		lines = append(lines, "scope namespace: "+request.Scope.Namespace)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (l *Loop) rejectInconsistentActionTargets(calls []gollm.FunctionCall) bool {
+	for _, call := range calls {
+		message, invalid := inconsistentActionTargetMessage(call)
+		if !invalid {
+			continue
+		}
+		l.currChatContent = append(l.currChatContent, message)
+		l.pendingCalls = nil
+		l.currIteration++
+		l.state = StateRunning
+		return true
+	}
+	return false
+}
+
+func inconsistentActionTargetMessage(call gollm.FunctionCall) (string, bool) {
+	command, ok := kubectlCommandFromFunctionCall(call)
+	if !ok {
+		return "", false
+	}
+	target, ok := actionTargetFromFunctionCall(call)
+	if !ok {
+		return "", false
+	}
+	if target.Resource == "namespace" && target.Namespace != "" {
+		return fmt.Sprintf("Action target declared resource %q with namespace scope %q, but Namespace objects are cluster-scoped. Use resource=namespace only when diagnosing a Namespace object itself; otherwise keep namespace as scope for the real target resource.", target.Resource, target.Namespace), true
+	}
+	if target.Resource != "" && !commandMentionsToken(command, target.Resource) {
+		return fmt.Sprintf("Action target declared resource %q, but command %q does not include that resource. Preserve the declared target and return one corrected next action.", target.Resource, command), true
+	}
+	if target.Name != "" && !commandMentionsToken(command, target.Name) {
+		return fmt.Sprintf("Action target declared name %q, but command %q does not include that name. Preserve the declared target and return one corrected next action.", target.Name, command), true
+	}
+	if target.Namespace != "" && !commandUsesNamespace(command, target.Namespace) {
+		return fmt.Sprintf("Action target declared namespace %q, but command %q omits that namespace. Preserve the declared target and return one corrected next action with `-n %s` or `--namespace=%s`.", target.Namespace, command, target.Namespace, target.Namespace), true
+	}
+	return "", false
+}
+
+func actionTargetFromFunctionCall(call gollm.FunctionCall) (actionTarget, bool) {
+	raw, ok := call.Arguments["target"].(map[string]any)
+	if !ok {
+		return actionTarget{}, false
+	}
+	resource, _ := raw["resource"].(string)
+	namespace, _ := raw["namespace"].(string)
+	name, _ := raw["name"].(string)
+	target := actionTarget{
+		Resource:  strings.TrimSpace(resource),
+		Namespace: strings.TrimSpace(namespace),
+		Name:      strings.TrimSpace(name),
+	}
+	if target.Resource == "" && target.Namespace == "" && target.Name == "" {
+		return actionTarget{}, false
+	}
+	return target, true
+}
+
+func commandMentionsToken(command, token string) bool {
+	for _, field := range strings.Fields(command) {
+		if strings.Trim(field, "'\"") == token {
+			return true
+		}
+	}
+	return false
+}
+
+func commandUsesNamespace(command, namespace string) bool {
+	fields := strings.Fields(command)
+	for i, field := range fields {
+		trimmed := strings.Trim(field, "'\"")
+		if (trimmed == "-n" || trimmed == "--namespace") && i+1 < len(fields) && strings.Trim(fields[i+1], "'\"") == namespace {
+			return true
+		}
+		if strings.HasPrefix(trimmed, "--namespace=") && strings.TrimPrefix(trimmed, "--namespace=") == namespace {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []gollm.FunctionCall) bool {
@@ -620,13 +801,14 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 			"read_only_mode":     true,
 			"allowed_operation":  "read-only diagnostics such as get, describe, logs, top, events",
 			"blocked_operation":  call.ParsedToolCall.Description(),
-			"suggested_response": "Explain that read-only mode blocks this change and provide a non-mutating diagnostic or manual recommendation.",
+			"suggested_response": "Return one final answer now. Explain that read-only mode blocks this change, state the observed cause and evidence once, and provide the manual recommendation once. Do not issue the same mutating action again.",
 		})
 	}
 	if len(descriptions) == 0 {
 		descriptions = append(descriptions, "리소스 변경 명령")
 	}
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "read-only 모드가 활성화되어 리소스 변경 명령을 차단했습니다:\n* "+strings.Join(descriptions, "\n* "))
+	l.currChatContent = append(l.currChatContent, "Read-only mode blocked the proposed mutation. Do not repeat the same action or restate the same recommendation in another loop. Your next response must be a single final answer with the cause, evidence, and one manual recommendation.")
 	l.pendingCalls = nil
 	l.currIteration++
 	l.state = StateRunning
@@ -708,7 +890,7 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 }
 
 func (l *Loop) interceptCustomResourceFunctionCalls(ctx context.Context, calls []gollm.FunctionCall) bool {
-	if l.resourceGuideInjected {
+	if l.resourceGuideInjected || l.initialGuideAttempted {
 		return false
 	}
 	for _, call := range calls {
@@ -721,6 +903,7 @@ func (l *Loop) interceptCustomResourceFunctionCalls(ctx context.Context, calls [
 			continue
 		}
 		l.resourceGuideEvidence = append(l.resourceGuideEvidence, command)
+		l.initialGuideAttempted = true
 		l.searchAndInjectResourceGuide(ctx, resource, l.resourceGuideQuery(resource))
 		return true
 	}

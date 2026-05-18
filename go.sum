@@ -24,8 +24,6 @@ github.com/AzureAD/microsoft-authentication-library-for-go v1.4.2 h1:oygO0locgZJ
 github.com/AzureAD/microsoft-authentication-library-for-go v1.4.2/go.mod h1:wP83P5OoQ5p6ip3ScPr0BAq0BvuPAvacpEuSzyouqAI=
 github.com/GoogleCloudPlatform/kubectl-ai v0.0.31 h1:4o4LQrrph4n2NmNT1qYm4HqIOukDlG6jQMhz6CE1Cek=
 github.com/GoogleCloudPlatform/kubectl-ai v0.0.31/go.mod h1:UY5j9vdbyxIuaNrv0oKhClI+Bf8vCb+H3+B/8HzFnkE=
-github.com/GoogleCloudPlatform/kubectl-ai/gollm v0.0.0-20260325022250-08cf256aa2f5 h1:Qe/Eef5Au8SI6LN5unFi2iek3IMXe6UT/NgMhSLaAJU=
-github.com/GoogleCloudPlatform/kubectl-ai/gollm v0.0.0-20260325022250-08cf256aa2f5/go.mod h1:wMvDa4QPv2yUUlx4hd2jUJUHVRtwbdVLWY41mA98abw=
 github.com/alecthomas/assert/v2 v2.7.0 h1:QtqSACNS3tF7oasA8CU6A6sXZSBDqnm7RfpLl9bZqbE=
 github.com/alecthomas/assert/v2 v2.7.0/go.mod h1:Bze95FyfUr7x34QZrjL+XP+0qgp/zg8yS+TtBj1WA3k=
 github.com/alecthomas/chroma/v2 v2.14.0 h1:R3+wzpnUArGcQz7fCETQBzO5n9IMNi13iIs46aU4V9E=

@@ -192,6 +192,12 @@ func main() {
 		"LLM 프로바이더 (openai, gemini, anthropic, ...)")
 	f.StringVar(&cfg.Model, "model", cfg.Model,
 		"사용할 LLM 모델 (예: gpt-4o, claude-sonnet-4-5, gemini-2.0-flash)")
+	f.Float64Var(&cfg.Temperature, "temperature", cfg.Temperature,
+		"main LLM temperature")
+	f.Float64Var(&cfg.TopP, "top-p", cfg.TopP,
+		"main LLM top_p")
+	f.StringVar(&cfg.ReasoningEffort, "reasoning-effort", cfg.ReasoningEffort,
+		"main LLM reasoning effort (low, medium, high)")
 	f.StringVar(&cfg.Kubeconfig, "kubeconfig", cfg.Kubeconfig,
 		"kubeconfig 파일 경로 (기본: ~/.kube/config)")
 	f.BoolVar(&cfg.SkipVerifySSL, "skip-verify-ssl", cfg.SkipVerifySSL,

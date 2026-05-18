@@ -3,6 +3,8 @@ package react
 import (
 	"strings"
 	"testing"
+
+	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 )
 
 func TestCustomResourceCandidateFromKubectl(t *testing.T) {
@@ -84,5 +86,89 @@ func TestFormatResourceGuideUnavailableObservationDoesNotClaimNoMatch(t *testing
 	}
 	if !strings.Contains(got, "lookup was not executed") {
 		t.Fatalf("expected unavailable lookup explanation, got %q", got)
+	}
+}
+
+func TestInconsistentActionTargetMessageRequiresNamespaceAndName(t *testing.T) {
+	call := gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl get cluster -o yaml",
+			"target": map[string]any{
+				"resource":  "cluster",
+				"namespace": "tenant-a",
+				"name":      "cluster-a",
+			},
+		},
+	}
+	got, invalid := inconsistentActionTargetMessage(call)
+	if !invalid || !strings.Contains(got, `name "cluster-a"`) {
+		t.Fatalf("expected missing name to be rejected, got invalid=%v message=%q", invalid, got)
+	}
+
+	call.Arguments["command"] = "kubectl get cluster cluster-a -o yaml"
+	got, invalid = inconsistentActionTargetMessage(call)
+	if !invalid || !strings.Contains(got, `namespace "tenant-a"`) {
+		t.Fatalf("expected missing namespace to be rejected, got invalid=%v message=%q", invalid, got)
+	}
+
+	call.Arguments["command"] = "kubectl get cluster cluster-a -n tenant-a -o yaml"
+	if got, invalid = inconsistentActionTargetMessage(call); invalid {
+		t.Fatalf("expected matching command to pass, got %q", got)
+	}
+}
+
+func TestInconsistentActionTargetMessageRejectsNamespacedNamespaceTarget(t *testing.T) {
+	call := gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl get namespace tenant-a -n tenant-a -o yaml",
+			"target": map[string]any{
+				"resource":  "namespace",
+				"namespace": "tenant-a",
+				"name":      "tenant-a",
+			},
+		},
+	}
+	got, invalid := inconsistentActionTargetMessage(call)
+	if !invalid || !strings.Contains(got, "Namespace objects are cluster-scoped") {
+		t.Fatalf("expected namespaced namespace target to be rejected, got invalid=%v message=%q", invalid, got)
+	}
+}
+
+func TestRequestContextRejectsNamespaceAsPrimaryTargetWithNamespaceScope(t *testing.T) {
+	_, ok := requestContextFromFunctionCall(gollm.FunctionCall{
+		Name: internalRequestContextCall,
+		Arguments: map[string]any{
+			"primary_target": map[string]any{
+				"resource": "namespace",
+				"name":     "tenant-a",
+			},
+			"scope": map[string]any{
+				"namespace": "tenant-a",
+			},
+			"resource_class": "built_in",
+		},
+	})
+	if ok {
+		t.Fatal("expected namespace primary target with namespace scope to be rejected")
+	}
+}
+
+func TestInitialResourceGuideLookupUsesRuntimeBuiltInExclusion(t *testing.T) {
+	loop := &Loop{}
+	if !loop.shouldRunInitialResourceGuideLookup(requestContext{
+		PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "cluster-a"},
+		Scope:         requestScope{Namespace: "tenant-a"},
+		ResourceClass: "built_in",
+	}) {
+		t.Fatal("non-built-in resources should still trigger initial guide lookup even when model class hint is wrong")
+	}
+	if loop.shouldRunInitialResourceGuideLookup(requestContext{
+		PrimaryTarget: requestPrimaryTarget{Resource: "pod", Name: "pod-a"},
+		Scope:         requestScope{Namespace: "tenant-a"},
+		ResourceClass: "custom_resource",
+	}) {
+		t.Fatal("built-in resources must not trigger initial guide lookup even when model class hint is wrong")
 	}
 }
