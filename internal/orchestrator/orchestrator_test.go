@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react"
 )
 
 func TestMetaCommandFilterKubePrefix(t *testing.T) {
@@ -202,6 +203,28 @@ func TestShouldOfferIncidentGuidanceForQueryAllowsDiagnosticRequests(t *testing.
 func TestLooksIncidentGuidanceWorthyIgnoresNoErrorSummary(t *testing.T) {
 	if looksIncidentGuidanceWorthy("제공된 로그에는 오류 이벤트가 없어 클러스터가 안정적으로 작동했습니다.") {
 		t.Fatal("no-error summary should not trigger incident guidance")
+	}
+}
+
+func TestIncidentGuidanceFlowTransitionsFromEvidenceToOffer(t *testing.T) {
+	flow := NewIncidentGuidanceFlow()
+	flow.ObserveUserInput("OOMKilled 원인을 분석해줘")
+	o := &Orchestrator{agentWrap: &react.Loop{}}
+
+	if err := flow.AfterAgentText(o, "Last State: Terminated Reason: OOMKilled"); err != nil {
+		t.Fatalf("after agent text: %v", err)
+	}
+	if flow.phase != incidentGuidanceOfferPending {
+		t.Fatalf("phase = %v, want offer pending", flow.phase)
+	}
+	if flow.problemText == "" || len(flow.evidence) != 1 {
+		t.Fatalf("unexpected captured state: problem=%q evidence=%#v", flow.problemText, flow.evidence)
+	}
+
+	flow.phase = incidentGuidanceSearchRequested
+	flow.RecordEvidence("pod logs show OOMKilled")
+	if len(flow.searchBrief) != 1 {
+		t.Fatalf("search brief = %#v, want one item", flow.searchBrief)
 	}
 }
 

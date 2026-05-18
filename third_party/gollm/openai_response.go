@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/responses"
@@ -102,21 +101,21 @@ func (cs *openAIResponseChatSession) SendStreaming(ctx context.Context, contents
 			switch output.AsAny().(type) {
 			case responses.ResponseFunctionToolCall:
 				fc := output.AsFunctionCall()
-				log.Printf("Inspected function call item: %+v", fc)
+				klog.V(2).Infof("Inspected function call item: %+v", fc)
 				fpP := fc.ToParam()
 				cs.history = append(cs.history, responses.ResponseInputItemUnionParam{
 					OfFunctionCall: &fpP,
 				})
 			case responses.ResponseReasoningItem:
 				reason := output.AsReasoning()
-				log.Printf("Inspected Reasoning item: %+v", reason)
+				klog.V(2).Infof("Inspected Reasoning item: %+v", reason)
 				reasonParam := reason.ToParam()
 				cs.history = append(cs.history, responses.ResponseInputItemUnionParam{
 					OfReasoning: &reasonParam,
 				})
 			case responses.ResponseOutputMessage:
 				msg := output.AsMessage()
-				log.Printf("Inspected Output Message: %+v", msg.Content[0].Text)
+				klog.V(2).Infof("Inspected Output Message: %+v", msg.Content[0].Text)
 				cs.history = append(cs.history,
 					responses.ResponseInputItemParamOfOutputMessage([]responses.ResponseOutputMessageContentUnionParam{
 						{
@@ -129,7 +128,7 @@ func (cs *openAIResponseChatSession) SendStreaming(ctx context.Context, contents
 					}, msg.ID, msg.Status),
 				)
 			default:
-				log.Println("no variant present", output)
+				klog.V(2).Infof("no variant present: %+v", output)
 			}
 		}
 	}
@@ -198,21 +197,22 @@ func (c *openAIResponseCandidate) Parts() []Part {
 		fc := output.AsFunctionCall()
 		toolCall, err := convertResponseToolCallToFunctionCall(fc)
 		if err != nil {
-			//
+			klog.Warningf("Skipping invalid response tool call: %v", err)
+			return parts
 		}
 		parts = append(parts, &openAIResponsePart{
 			toolCall: toolCall,
 		})
 	case responses.ResponseReasoningItem:
 		reason := output.AsReasoning()
-		log.Printf("Inspected Reasoning item: %+v", reason)
+		klog.V(2).Infof("Inspected Reasoning item: %+v", reason)
 	case responses.ResponseOutputMessage:
 		msg := output.AsMessage()
 		parts = append(parts, &openAIResponsePart{
 			content: msg.Content[0].AsOutputText().Text,
 		})
 	default:
-		log.Println("no variant present", output)
+		klog.V(2).Infof("no variant present: %+v", output)
 	}
 	return parts
 }
@@ -234,7 +234,10 @@ func (p *openAIResponsePart) AsText() (string, bool) {
 }
 
 func (p *openAIResponsePart) AsFunctionCalls() ([]FunctionCall, bool) {
-	return []FunctionCall{p.toolCall}, p.content == ""
+	if p.content != "" {
+		return nil, false
+	}
+	return []FunctionCall{p.toolCall}, true
 }
 
 // convertFunctionParameters handles the conversion of gollm parameters to OpenAI format

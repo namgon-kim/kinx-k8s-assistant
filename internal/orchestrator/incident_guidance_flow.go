@@ -235,7 +235,7 @@ func extractTarget(text string) diagnostic.KubernetesTarget {
 		`(?i)([a-z0-9][a-z0-9_.-]*)이라는\s*포드`,
 		`(?i)포드\s+['"]?([a-z0-9][a-z0-9_.-]*)['"]?`,
 		`(?i)pod\s+named\s+['"]?([a-z0-9][a-z0-9_.-]*)['"]?`,
-		`(?i)pod\s+['"]?([a-z0-9][a-z0-9_.-]*)['"]?`,
+		`(?i)\bpod\s+['"]?([a-z0-9][a-z0-9_.-]*)['"]?\b`,
 	}
 	for _, pattern := range patterns {
 		if match := regexp.MustCompile(pattern).FindStringSubmatch(text); len(match) == 2 {
@@ -434,6 +434,7 @@ func appendBounded(values []string, value string, max int) []string {
 	}
 	values = append(values, value)
 	if len(values) > max {
+		// max is tiny here (3-4); retaining the backing array is acceptable.
 		return values[len(values)-max:]
 	}
 	return values

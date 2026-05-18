@@ -1,3 +1,18 @@
+# Vendored gollm
+
+This directory is vendored from `github.com/GoogleCloudPlatform/kubectl-ai/gollm`
+at pseudo-version `v0.0.0-20260325022250-08cf256aa2f5` (commit `08cf256aa2f5`),
+copied into this repository on 2026-05-18.
+
+Local modifications in this repository include:
+- OpenAI-compatible Chat Completions parameter injection used by `k8s-assistant`
+- Responses API handling adjustments in `openai_response.go`
+
+The upstream module did not include a `NOTICE` file at the vendored revision; its
+Apache-2.0 `LICENSE` is preserved in this directory.
+
+---
+
 # gollm
 
 A Go library for calling into multiple Large Language Model (LLM) providers with a unified interface.

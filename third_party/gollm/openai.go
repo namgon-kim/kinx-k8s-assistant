@@ -52,7 +52,7 @@ func init() {
 	openAIAPIBase = os.Getenv("OPENAI_API_BASE")
 	openAIModel = os.Getenv("OPENAI_MODEL")
 
-	if val := os.Getenv("OPENAI_USE_RESPONSES_API"); strings.ToLower(val) == "true" {
+	if useResponsesAPI, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("OPENAI_USE_RESPONSES_API"))); err == nil && useResponsesAPI {
 		openAIUseResponsesAPI = true
 		klog.InfoS("Using responses API for openai",
 			"baseURL", openAIAPIBase, "endpoint", openAIEndpoint, "model", openAIModel)
@@ -74,7 +74,8 @@ func init() {
 
 // OpenAIClient implements the gollm.Client interface for OpenAI models.
 type OpenAIClient struct {
-	client openai.Client
+	client     openai.Client
+	providerID string
 }
 
 // Ensure OpenAIClient implements the Client interface.
@@ -109,7 +110,8 @@ func NewOpenAIClient(ctx context.Context, opts ClientOptions) (*OpenAIClient, er
 	options = append(options, option.WithHTTPClient(httpClient))
 
 	return &OpenAIClient{
-		client: openai.NewClient(options...),
+		client:     openai.NewClient(options...),
+		providerID: opts.URL.Scheme,
 	}, nil
 }
 
@@ -126,7 +128,7 @@ func (c *OpenAIClient) StartChat(systemPrompt, model string) Chat {
 
 	klog.V(1).Infof("Starting new OpenAI chat session with model: %s", selectedModel)
 
-	if openAIUseResponsesAPI {
+	if openAIUseResponsesAPI && c.providerID == "openai" {
 		// Initialize history with system prompt if provided
 		history := responses.ResponseInputParam{}
 		if systemPrompt != "" {

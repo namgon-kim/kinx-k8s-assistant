@@ -1040,142 +1040,55 @@ func customResourceCandidateFromKubectl(command string) (string, bool) {
 	return resource, true
 }
 
+var builtinKubernetesResources = map[string]string{
+	"bindings": "binding", "componentstatuses": "componentstatus", "pods": "pod", "nodes": "node",
+	"services": "service", "endpoints": "endpoint", "limitranges": "limitrange", "deployments": "deployment",
+	"replicasets": "replicaset", "statefulsets": "statefulset", "daemonsets": "daemonset", "jobs": "job",
+	"cronjobs": "cronjob", "configmaps": "configmap", "secrets": "secret", "namespaces": "namespace",
+	"events": "event", "podtemplates": "podtemplate", "replicationcontrollers": "replicationcontroller",
+	"resourcequotas": "resourcequota", "ingresses": "ingress", "persistentvolumes": "persistentvolume",
+	"persistentvolumeclaims": "persistentvolumeclaim", "serviceaccounts": "serviceaccount", "roles": "role",
+	"rolebindings": "rolebinding", "clusterroles": "clusterrole", "clusterrolebindings": "clusterrolebinding",
+	"mutatingwebhookconfigurations": "mutatingwebhookconfiguration", "validatingwebhookconfigurations": "validatingwebhookconfiguration",
+	"customresourcedefinitions": "customresourcedefinition", "apiservices": "apiservice",
+	"controllerrevisions": "controllerrevision", "tokenreviews": "tokenreview",
+	"localsubjectaccessreviews": "localsubjectaccessreview", "selfsubjectaccessreviews": "selfsubjectaccessreview",
+	"selfsubjectrulesreviews": "selfsubjectrulesreview", "subjectaccessreviews": "subjectaccessreview",
+	"horizontalpodautoscalers": "horizontalpodautoscaler", "certificatesigningrequests": "certificatesigningrequest",
+	"leases": "lease", "flowschemas": "flowschema", "prioritylevelconfigurations": "prioritylevelconfiguration",
+	"ingressclasses": "ingressclass", "networkpolicies": "networkpolicy", "runtimeclasses": "runtimeclass",
+	"poddisruptionbudgets": "poddisruptionbudget", "podsecuritypolicies": "podsecuritypolicy",
+	"priorityclasses": "priorityclass", "csidrivers": "csidriver", "csinodes": "csinode",
+	"csistoragecapacities": "csistoragecapacity", "storageclasses": "storageclass",
+	"endpointslices": "endpointslice", "volumeattachments": "volumeattachment",
+	"cs": "componentstatus", "cm": "configmap", "ep": "endpoint", "ev": "event", "limits": "limitrange",
+	"ns": "namespace", "no": "node", "pvc": "persistentvolumeclaim", "pv": "persistentvolume",
+	"po": "pod", "rc": "replicationcontroller", "quota": "resourcequota", "sa": "serviceaccount",
+	"svc": "service", "crd": "customresourcedefinition", "crds": "customresourcedefinition",
+	"ds": "daemonset", "deploy": "deployment", "rs": "replicaset", "sts": "statefulset",
+	"hpa": "horizontalpodautoscaler", "cj": "cronjob", "csr": "certificatesigningrequest",
+	"ing": "ingress", "netpol": "networkpolicy", "pdb": "poddisruptionbudget", "psp": "podsecuritypolicy",
+	"pc": "priorityclass", "sc": "storageclass",
+}
+
 func normalizeKubectlResource(resource string) string {
-	switch resource {
-	case "bindings":
-		return "binding"
-	case "componentstatuses":
-		return "componentstatus"
-	case "pods":
-		return "pod"
-	case "nodes":
-		return "node"
-	case "services":
-		return "service"
-	case "endpoints":
-		return "endpoint"
-	case "limitranges":
-		return "limitrange"
-	case "deployments":
-		return "deployment"
-	case "replicasets":
-		return "replicaset"
-	case "statefulsets":
-		return "statefulset"
-	case "daemonsets":
-		return "daemonset"
-	case "jobs":
-		return "job"
-	case "cronjobs":
-		return "cronjob"
-	case "configmaps":
-		return "configmap"
-	case "secrets":
-		return "secret"
-	case "namespaces":
-		return "namespace"
-	case "events":
-		return "event"
-	case "podtemplates":
-		return "podtemplate"
-	case "replicationcontrollers":
-		return "replicationcontroller"
-	case "resourcequotas":
-		return "resourcequota"
-	case "ingresses":
-		return "ingress"
-	case "persistentvolumes":
-		return "persistentvolume"
-	case "persistentvolumeclaims":
-		return "persistentvolumeclaim"
-	case "serviceaccounts":
-		return "serviceaccount"
-	case "roles":
-		return "role"
-	case "rolebindings":
-		return "rolebinding"
-	case "clusterroles":
-		return "clusterrole"
-	case "clusterrolebindings":
-		return "clusterrolebinding"
-	case "mutatingwebhookconfigurations":
-		return "mutatingwebhookconfiguration"
-	case "validatingwebhookconfigurations":
-		return "validatingwebhookconfiguration"
-	case "customresourcedefinitions":
-		return "customresourcedefinition"
-	case "apiservices":
-		return "apiservice"
-	case "controllerrevisions":
-		return "controllerrevision"
-	case "tokenreviews":
-		return "tokenreview"
-	case "localsubjectaccessreviews":
-		return "localsubjectaccessreview"
-	case "selfsubjectaccessreviews":
-		return "selfsubjectaccessreview"
-	case "selfsubjectrulesreviews":
-		return "selfsubjectrulesreview"
-	case "subjectaccessreviews":
-		return "subjectaccessreview"
-	case "horizontalpodautoscalers":
-		return "horizontalpodautoscaler"
-	case "certificatesigningrequests":
-		return "certificatesigningrequest"
-	case "leases":
-		return "lease"
-	case "flowschemas":
-		return "flowschema"
-	case "prioritylevelconfigurations":
-		return "prioritylevelconfiguration"
-	case "ingressclasses":
-		return "ingressclass"
-	case "networkpolicies":
-		return "networkpolicy"
-	case "runtimeclasses":
-		return "runtimeclass"
-	case "poddisruptionbudgets":
-		return "poddisruptionbudget"
-	case "podsecuritypolicies":
-		return "podsecuritypolicy"
-	case "priorityclasses":
-		return "priorityclass"
-	case "csidrivers":
-		return "csidriver"
-	case "csinodes":
-		return "csinode"
-	case "csistoragecapacities":
-		return "csistoragecapacity"
-	case "storageclasses":
-		return "storageclass"
-	case "endpointslices":
-		return "endpointslice"
-	case "volumeattachments":
-		return "volumeattachment"
-	default:
-		return resource
+	if normalized, ok := builtinKubernetesResources[resource]; ok {
+		return normalized
 	}
+	return resource
 }
 
 func isBuiltinKubernetesResource(resource string) bool {
-	switch resource {
-	case "binding", "componentstatus", "cs", "configmap", "cm", "endpoint", "ep", "event", "ev",
-		"limitrange", "limits", "namespace", "ns", "node", "no", "persistentvolumeclaim", "pvc",
-		"persistentvolume", "pv", "pod", "po", "podtemplate", "replicationcontroller", "rc",
-		"resourcequota", "quota", "secret", "serviceaccount", "sa", "service", "svc",
-		"mutatingwebhookconfiguration", "validatingwebhookconfiguration", "customresourcedefinition", "crd", "crds",
-		"apiservice", "controllerrevision", "daemonset", "ds", "deployment", "deploy", "replicaset", "rs",
-		"statefulset", "sts", "tokenreview", "localsubjectaccessreview", "selfsubjectaccessreview",
-		"selfsubjectrulesreview", "subjectaccessreview", "horizontalpodautoscaler", "hpa", "cronjob", "cj",
-		"job", "certificatesigningrequest", "csr", "lease", "endpointslice", "flowschema",
-		"prioritylevelconfiguration", "ingressclass", "ingress", "ing", "networkpolicy", "netpol",
-		"runtimeclass", "poddisruptionbudget", "pdb", "podsecuritypolicy", "psp", "clusterrolebinding",
-		"clusterrole", "rolebinding", "role", "priorityclass", "pc", "csidriver", "csinode",
-		"csistoragecapacity", "storageclass", "sc", "volumeattachment":
+	_, ok := builtinKubernetesResources[resource]
+	if ok {
 		return true
-	default:
-		return false
 	}
+	for _, normalized := range builtinKubernetesResources {
+		if resource == normalized {
+			return true
+		}
+	}
+	return false
 }
 
 func formatResourceGuideObservation(resource string, found *guidance.GuideSearchResult) string {
