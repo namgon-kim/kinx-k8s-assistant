@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react"
 )
 
 func TestMetaCommandFilterKubePrefix(t *testing.T) {
@@ -153,26 +154,26 @@ func TestSetLangRejectsInvalidValue(t *testing.T) {
 	}
 }
 
-func TestLooksTroubleshootableIgnoresGenericUserProblemRequest(t *testing.T) {
-	if looksTroubleshootable("tests 네임스페이스의 pods의 문제를 해결해줘") {
-		t.Fatal("generic user problem request should not trigger troubleshooting offer")
+func TestLooksIncidentGuidanceWorthyIgnoresGenericUserProblemRequest(t *testing.T) {
+	if looksIncidentGuidanceWorthy("tests 네임스페이스의 pods의 문제를 해결해줘") {
+		t.Fatal("generic user problem request should not trigger incident guidance offer")
 	}
 }
 
-func TestLooksTroubleshootableDetectsConcreteKubernetesFailure(t *testing.T) {
+func TestLooksIncidentGuidanceWorthyDetectsConcreteKubernetesFailure(t *testing.T) {
 	cases := []string{
 		"pod test-oom is in CrashLoopBackOff",
 		"Last State: Terminated Reason: OOMKilled",
 		"Back-off restarting failed container",
 	}
 	for _, tc := range cases {
-		if !looksTroubleshootable(tc) {
-			t.Fatalf("expected concrete failure to trigger troubleshooting: %q", tc)
+		if !looksIncidentGuidanceWorthy(tc) {
+			t.Fatalf("expected concrete failure to trigger incident guidance: %q", tc)
 		}
 	}
 }
 
-func TestShouldOfferTroubleshootingForQuerySkipsReadOnlyRequests(t *testing.T) {
+func TestShouldOfferIncidentGuidanceForQuerySkipsReadOnlyRequests(t *testing.T) {
 	cases := []string{
 		"pods을 보여줘",
 		"default 네임스페이스의 pods 목록 조회",
@@ -180,28 +181,50 @@ func TestShouldOfferTroubleshootingForQuerySkipsReadOnlyRequests(t *testing.T) {
 		"최근 이벤트 로그를 보고 어떤 문제가 있었는지 요약해줘",
 	}
 	for _, tc := range cases {
-		if shouldOfferTroubleshootingForQuery(tc) {
-			t.Fatalf("read-only query should not offer troubleshooting: %q", tc)
+		if shouldOfferIncidentGuidanceForQuery(tc) {
+			t.Fatalf("read-only query should not offer incident guidance: %q", tc)
 		}
 	}
 }
 
-func TestShouldOfferTroubleshootingForQueryAllowsDiagnosticRequests(t *testing.T) {
+func TestShouldOfferIncidentGuidanceForQueryAllowsDiagnosticRequests(t *testing.T) {
 	cases := []string{
 		"tests 네임스페이스의 pods 문제를 해결해줘",
 		"OOMKilled 원인을 분석해줘",
 		"CrashLoopBackOff debug 해줘",
 	}
 	for _, tc := range cases {
-		if !shouldOfferTroubleshootingForQuery(tc) {
-			t.Fatalf("diagnostic query should offer troubleshooting: %q", tc)
+		if !shouldOfferIncidentGuidanceForQuery(tc) {
+			t.Fatalf("diagnostic query should offer incident guidance: %q", tc)
 		}
 	}
 }
 
-func TestLooksTroubleshootableIgnoresNoErrorSummary(t *testing.T) {
-	if looksTroubleshootable("제공된 로그에는 오류 이벤트가 없어 클러스터가 안정적으로 작동했습니다.") {
-		t.Fatal("no-error summary should not trigger troubleshooting")
+func TestLooksIncidentGuidanceWorthyIgnoresNoErrorSummary(t *testing.T) {
+	if looksIncidentGuidanceWorthy("제공된 로그에는 오류 이벤트가 없어 클러스터가 안정적으로 작동했습니다.") {
+		t.Fatal("no-error summary should not trigger incident guidance")
+	}
+}
+
+func TestIncidentGuidanceFlowTransitionsFromEvidenceToOffer(t *testing.T) {
+	flow := NewIncidentGuidanceFlow()
+	flow.ObserveUserInput("OOMKilled 원인을 분석해줘")
+	o := &Orchestrator{agentWrap: &react.Loop{}}
+
+	if err := flow.AfterAgentText(o, "Last State: Terminated Reason: OOMKilled"); err != nil {
+		t.Fatalf("after agent text: %v", err)
+	}
+	if flow.phase != incidentGuidanceOfferPending {
+		t.Fatalf("phase = %v, want offer pending", flow.phase)
+	}
+	if flow.problemText == "" || len(flow.evidence) != 1 {
+		t.Fatalf("unexpected captured state: problem=%q evidence=%#v", flow.problemText, flow.evidence)
+	}
+
+	flow.phase = incidentGuidanceSearchRequested
+	flow.RecordEvidence("pod logs show OOMKilled")
+	if len(flow.searchBrief) != 1 {
+		t.Fatalf("search brief = %#v, want one item", flow.searchBrief)
 	}
 }
 

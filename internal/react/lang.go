@@ -52,7 +52,7 @@ func (t *langTranslator) translate(ctx context.Context, text string) (string, er
 		Messages: []openAIChatMessage{
 			{
 				Role:    "system",
-				Content: "You are a precise Kubernetes operations translator. Translate the entire input into Korean. Preserve every fact, sentence, bullet, order, and level of detail. Do not summarize, omit, shorten, add commentary, or answer the content. Keep Kubernetes resource names, namespaces, commands, flags, JSON/YAML, field names, and raw command output unchanged. Return only the translated text without markdown fences.",
+				Content: "You are a precise Kubernetes operations translator. Translate the entire input into Korean. Preserve every fact, sentence, bullet, order, and level of detail. Do not summarize, omit, shorten, add commentary, or answer the content. Keep Kubernetes resource names, namespaces, commands, flags, JSON/YAML, field names, annotation keys, annotation values, label keys, label values, condition types, condition reasons, enum values, quoted literals, backticked literals, and raw command output unchanged. Never translate literal values such as cluster.x-k8s.io/paused, Paused, or WaitingForNodeRef. Return only the translated text without markdown fences.",
 			},
 			{
 				Role:    "user",

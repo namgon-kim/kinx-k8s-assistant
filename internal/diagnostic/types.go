@@ -3,9 +3,9 @@ package diagnostic
 type ComponentType string
 
 const (
-	ComponentKubectlAI    ComponentType = "kubectl_ai"
-	ComponentLogAnalyzer  ComponentType = "log_analyzer"
-	ComponentTroubleshoot ComponentType = "trouble_shooting"
+	ComponentKubectlAI   ComponentType = "kubectl_ai"
+	ComponentLogAnalyzer ComponentType = "log_analyzer"
+	ComponentGuidance    ComponentType = "guidance"
 )
 
 type DetectionSource string

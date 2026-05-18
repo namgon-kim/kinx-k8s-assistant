@@ -20,6 +20,8 @@ require (
 	sigs.k8s.io/yaml v1.6.0
 )
 
+replace github.com/GoogleCloudPlatform/kubectl-ai/gollm => ./third_party/gollm
+
 require (
 	cloud.google.com/go v0.118.3 // indirect
 	cloud.google.com/go/auth v0.15.0 // indirect

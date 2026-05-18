@@ -6,6 +6,9 @@
 # Supported providers: gemini (default), vertexai, openai, openai-compatible, azopenai, grok, bedrock, ollama, llamacpp, anthropic
 llmprovider: gemini           # LLM provider to use
 model: gemini-2.0-flash       # Model name for the provider
+temperature: 0.1              # Main LLM temperature
+top_p: 1.0                    # Main LLM nucleus sampling; keep 1.0 when temperature is the primary control
+reasoning_effort: ""          # optional: low, medium, or high; leave empty for generic OpenAI-compatible backends
 
 # ===== Provider-Specific Credentials =====
 
@@ -61,6 +64,11 @@ lang:
   model: ""                   # Translation model name, e.g. nvidia/Llama-3.3-70B-Instruct-FP8
   endpoint: ""                # OpenAI-compatible endpoint, e.g. http://1.201.177.120:4000
   apikey: ""                  # Optional API key
+
+# Collection names used by the internal guidance RAG client.
+guidance:
+  resource_guides: k8s_resource_guides_v1
+  incident_guides: k8s_incident_guides_v1
 
 # ===== Advanced Settings =====
 
