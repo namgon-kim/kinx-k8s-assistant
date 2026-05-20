@@ -218,6 +218,18 @@ cp config/guidance.yaml ~/.k8s-assistant/guidance.yaml
 
 guidance는 MCP tool로 노출하지 않습니다. k8s-assistant가 custom resource 작업/진단 요청에는 resource guide를 먼저 조회하고, 장애 흐름에는 사용자 확인 후 incident guide 검색과 조치 계획 생성을 수행합니다. Kubernetes 명령 실행은 k8s-assistant ReAct 루프와 승인 흐름에서 처리합니다.
 
+### CRD-first resource guide 조회
+
+k8s-assistant는 `cluster`, `machine`, `machinedeployment` 같은 리소스 이름만 보고 custom resource 여부를 LLM이 추측하게 하지 않습니다. 요청에서 primary target과 namespace scope를 분리한 뒤, 런타임이 Kubernetes discovery로 해당 리소스가 built-in인지 CRD인지 확인합니다.
+
+- built-in Kubernetes 리소스는 resource guide/RAG 조회를 건너뜁니다.
+- CRD로 확인된 리소스만 resource guide/RAG 조회 대상이 됩니다.
+- guide가 특정 CRD family 근거를 제공한 경우에만 관련 guardrail을 조건부로 주입합니다.
+- guide가 제공한 label selector, annotation, command template은 진단 컨텍스트에서 보존합니다.
+- ReAct action target 검증은 comma-separated resource와 CRD plural/singular 차이를 허용합니다. 예를 들어 `machinedeployment,tenantcontrolplane` 또는 `machine`/`machines` 형태가 같은 명령 안에서 일관되게 쓰이면 불필요하게 correction loop를 만들지 않습니다. 동일한 target correction이 반복되면 같은 LLM 재시도를 계속하지 않고 루프를 중단해 오류를 노출합니다.
+
+Cluster API 계열 guide가 주입된 경우, 관리 클러스터의 `kubectl get node` 결과는 workload cluster node 등록/건강/providerID 판단 근거로 사용하지 않습니다. workload cluster node를 확인해야 하면 먼저 해당 workload cluster kubeconfig/context임을 확인해야 합니다.
+
 collection 이름은 `~/.k8s-assistant/config.yaml`에서 지정합니다.
 
 ```yaml
@@ -296,13 +308,41 @@ guidance:
 | `--prompt-template` | 자동 탐색 (`prompts/default.tmpl`) | 시스템 프롬프트 템플릿 경로 |
 | `--session-backend` | `memory` | 세션 저장 방식 |
 | `--log-file` | 없음 | 대화 로그 파일 |
-
-`read-only`는 config 파일의 `readonly: true`, CLI의 `--read-only`, 또는 실행 중 `/readonly on|off|status` 메타 명령으로 제어합니다. 실행 중 변경한 값은 `/save`를 입력해야 `~/.k8s-assistant/config.yaml`에 저장됩니다.
-
-`lang.language`는 `Korean` 또는 `English`를 사용합니다. `Korean`이고 `lang.model`/`lang.endpoint`가 설정되어 있으면 primary model은 영어 중심으로 ReAct/tool loop를 수행하고, 사용자에게 보여줄 자연어 출력만 openai-compatible 번역 모델로 한국어 변환합니다.
 | `--log-dir` | `~/.k8s-assistant/logs` | 시스템 로그 디렉토리 |
 | `--log-level` | `0` | klog verbosity |
 | `--show-log-output` | `false` | 시스템 로그 콘솔 출력 |
+
+`read-only`는 config 파일의 `readonly: true`, CLI의 `--read-only`, 또는 실행 중 `/readonly on|off|status` 메타 명령으로 제어합니다. 실행 중 변경한 값은 `/save`를 입력해야 `~/.k8s-assistant/config.yaml`에 저장됩니다.
+
+read-only 모드는 `kubectl get`, `describe`, `logs`, `top`, `api-resources` 같은 진단 명령은 허용하고, `apply`, `delete`, `patch`, `scale` 같은 변경 명령은 차단합니다. `kubectl -n <namespace> get ...`처럼 global flag가 verb 앞에 오는 read-only 명령도 진단 명령으로 인식합니다. `bash -c`/`bash -lc` 안의 명령이 read-only `kubectl`과 안전한 텍스트 처리 파이프라인으로만 구성된 경우도 진단 명령으로 허용합니다.
+
+JSON ReAct shim 사용 시 모델이 최종 답변을 JSON code block 없이 plain text로 반환해도, k8s-assistant는 이를 shim parse error가 아니라 최종 답변으로 처리합니다.
+
+## Prompt / tool context 관리
+
+k8s-assistant는 runtime prompt를 section 단위로 조립합니다. core ReAct, output contract, language policy, target/scope 보존, command guideline은 항상 포함하고, read-only, guidance protocol, manifest generation, Cluster API guardrail은 현재 요청과 RAG 결과에 따라 조건부로 포함합니다.
+
+tool schema는 안전성을 위해 pruning하지 않고 등록된 전체 tool set을 유지합니다. 대신 ToolProfile hash를 사용해 동일한 tool schema 조합을 캐싱/참조 가능한 단위로 관리합니다.
+
+## Context compact
+
+긴 ReAct 진단이 이어져 LLM context가 커지면 k8s-assistant는 원문 tool 결과를 계속 누적하지 않고 compact state로 전환합니다.
+
+compact state에는 다음 정보만 보존합니다.
+
+- 원 질문
+- primary target과 namespace scope
+- CRD discovery 결과와 guide ref/hash
+- 수행한 절차와 순서
+- 각 절차에서 얻은 단서
+- result hash
+- 다음에 수행해야 할 동작
+
+compact는 추정 context 사용량이 모델 context limit의 80% 이상이 되면 실행됩니다. correction이나 guide injection만으로 낮은 token 사용량에서 compact하지 않습니다. provider가 context length 오류를 반환한 경우에도 compact 후 1회 재시도합니다. compact가 발생하면 터미널에 `↻ context compacting...`, `✓ context compacted...` 안내가 출력됩니다.
+
+context limit은 모델명으로 추정하며, 명시적으로 지정하려면 `K8S_ASSISTANT_CONTEXT_LIMIT_TOKENS` 환경변수를 사용합니다.
+
+`lang.language`는 `Korean` 또는 `English`를 사용합니다. `Korean`이고 `lang.model`/`lang.endpoint`가 설정되어 있으면 primary model은 영어 중심으로 ReAct/tool loop를 수행하고, 사용자에게 보여줄 자연어 출력만 openai-compatible 번역 모델로 한국어 변환합니다.
 
 ## 환경변수
 
@@ -315,6 +355,7 @@ guidance:
 | `GEMINI_API_KEY` | Gemini API key |
 | `LLM_PROVIDER` | 기본 LLM provider override |
 | `MODEL` | 기본 model override |
+| `K8S_ASSISTANT_CONTEXT_LIMIT_TOKENS` | context compact 기준 계산에 사용할 모델 context limit override |
 
 ## 주요 경로
 

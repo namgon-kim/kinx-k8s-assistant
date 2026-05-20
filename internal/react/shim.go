@@ -96,7 +96,11 @@ func candidateToShimCandidate(iterator gollm.ChatResponseIterator) (gollm.ChatRe
 func parseReActResponse(input string) (*reActResponse, error) {
 	cleaned, found := extractJSON(input)
 	if !found {
-		return nil, fmt.Errorf("no JSON code block found in shim response: %q", strings.TrimSpace(input))
+		answer := strings.TrimSpace(input)
+		if answer == "" {
+			return nil, fmt.Errorf("empty shim response")
+		}
+		return &reActResponse{Answer: answer}, nil
 	}
 	cleaned = repairUnescapedQuotesInJSONStrings(strings.TrimSpace(cleaned))
 

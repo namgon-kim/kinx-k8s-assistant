@@ -1,6 +1,8 @@
 package react
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestParseReActResponseWithAction(t *testing.T) {
 	parsed, err := parseReActResponse(`prefix
@@ -139,6 +141,19 @@ func TestShimPartConvertsActionToFunctionCall(t *testing.T) {
 	}
 	if calls[0].Arguments["goal"] != "verify whether the pod is running" {
 		t.Fatalf("unexpected goal: %#v", calls[0].Arguments["goal"])
+	}
+}
+
+func TestParseReActResponseTreatsPlainTextAsFinalAnswer(t *testing.T) {
+	parsed, err := parseReActResponse("plain final answer")
+	if err != nil {
+		t.Fatalf("parse plain final answer: %v", err)
+	}
+	if parsed.Answer != "plain final answer" {
+		t.Fatalf("unexpected answer: %q", parsed.Answer)
+	}
+	if parsed.Action != nil {
+		t.Fatalf("did not expect action: %#v", parsed.Action)
 	}
 }
 

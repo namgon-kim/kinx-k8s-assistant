@@ -58,6 +58,54 @@ func TestAnalyzeToolCallsMarksKubectlReadOnly(t *testing.T) {
 	}
 }
 
+func TestAnalyzeToolCallsAllowsKubectlReadOnlyWithGlobalFlagsBeforeVerb(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl -n 43e3c8fe-8674-4ccf-88e9-7084805034bb get cluster clst-pz02-shs1006-04 -o yaml",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("unexpected pending count: %d", len(pending))
+	}
+	if pending[0].ModifiesResource != "no" {
+		t.Fatalf("expected namespace-before-verb get to be read-only, got %q", pending[0].ModifiesResource)
+	}
+}
+
+func TestAnalyzeToolCallsBlocksKubectlMutationWithGlobalFlagsBeforeVerb(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl -n tests delete pod app",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("unexpected pending count: %d", len(pending))
+	}
+	if pending[0].ModifiesResource == "no" {
+		t.Fatalf("expected namespace-before-verb delete to be blocked, got %q", pending[0].ModifiesResource)
+	}
+}
+
 func TestAnalyzeToolCallsAllowsReadOnlyPipeline(t *testing.T) {
 	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
 	if err != nil {
@@ -79,6 +127,102 @@ func TestAnalyzeToolCallsAllowsReadOnlyPipeline(t *testing.T) {
 	}
 	if pending[0].ModifiesResource != "no" {
 		t.Fatalf("expected read-only pipeline command, got %q", pending[0].ModifiesResource)
+	}
+}
+
+func TestAnalyzeToolCallsAllowsReadOnlyBashCPipelineList(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "bash",
+		Arguments: map[string]any{
+			"command": `bash -c "kubectl api-resources | grep -i tenantcontrolplane; kubectl api-resources | grep -i helmreleaseproxy"`,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("unexpected pending count: %d", len(pending))
+	}
+	if pending[0].ModifiesResource != "no" {
+		t.Fatalf("expected read-only bash -c kubectl pipelines, got %q", pending[0].ModifiesResource)
+	}
+}
+
+func TestAnalyzeToolCallsAllowsReadOnlyBashLCPipelineList(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "bash",
+		Arguments: map[string]any{
+			"command": `bash -lc "kubectl api-resources | grep -i tenantcontrolplane; kubectl api-resources | grep -i helmreleaseproxy"`,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("unexpected pending count: %d", len(pending))
+	}
+	if pending[0].ModifiesResource != "no" {
+		t.Fatalf("expected read-only bash -lc kubectl pipelines, got %q", pending[0].ModifiesResource)
+	}
+}
+
+func TestAnalyzeToolCallsAllowsReadOnlyBashCCommandThroughKubectlToolName(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": `bash -c "kubectl api-resources | grep -i tenantcontrolplane"`,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("unexpected pending count: %d", len(pending))
+	}
+	if pending[0].ModifiesResource != "no" {
+		t.Fatalf("expected read-only bash -c command through kubectl tool name, got %q", pending[0].ModifiesResource)
+	}
+}
+
+func TestAnalyzeToolCallsBlocksMutatingBashCCommand(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "bash",
+		Arguments: map[string]any{
+			"command": `bash -c "kubectl get pods; kubectl delete pod app -n tests"`,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("unexpected pending count: %d", len(pending))
+	}
+	if pending[0].ModifiesResource == "no" {
+		t.Fatalf("expected mutating bash -c command to be blocked, got %q", pending[0].ModifiesResource)
 	}
 }
 
