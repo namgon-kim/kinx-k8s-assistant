@@ -14,20 +14,24 @@ type reActResponse struct {
 	RequirementAnalysis *requirementAnalysis `json:"requirement_analysis,omitempty"`
 	RequestContext      *requestContext      `json:"request_context,omitempty"`
 	Action              *action              `json:"action,omitempty"`
+	GuideProgress       *guideProgress       `json:"guide_progress,omitempty"`
 	ResourceGuideLookup *resourceGuideLookup `json:"resource_guide_lookup,omitempty"`
 	FinalReport         *finalReport         `json:"final_report,omitempty"`
 	NextDirections      *nextDirections      `json:"next_directions,omitempty"`
+	InvalidFinalReport  bool                 `json:"-"`
+	InvalidDirections   bool                 `json:"-"`
 }
 
 type requirementAnalysis struct {
-	RequestType string                    `json:"request_type"`
-	Action      string                    `json:"action"`
-	Target      requirementAnalysisTarget `json:"target"`
-	Scope       requirementScope          `json:"scope,omitempty"`
-	Resources   []requirementResource     `json:"resource_candidates,omitempty"`
-	Evidence    []string                  `json:"evidence_needs,omitempty"`
-	Constraints []string                  `json:"constraints,omitempty"`
-	Ambiguities []string                  `json:"ambiguities,omitempty"`
+	RequestType      string                       `json:"request_type"`
+	Action           string                       `json:"action"`
+	Target           requirementAnalysisTarget    `json:"target"`
+	Scope            requirementScope             `json:"scope,omitempty"`
+	Resources        []requirementResource        `json:"resource_candidates,omitempty"`
+	OperationalFocus *requirementOperationalFocus `json:"operational_focus,omitempty"`
+	Evidence         []string                     `json:"evidence_needs,omitempty"`
+	Constraints      []string                     `json:"constraints,omitempty"`
+	Ambiguities      []string                     `json:"ambiguities,omitempty"`
 }
 
 type requirementAnalysisTarget struct {
@@ -46,6 +50,25 @@ type requirementResource struct {
 	Name      string `json:"name,omitempty"`
 	Namespace string `json:"namespace,omitempty"`
 	Role      string `json:"role,omitempty"`
+	Source    string `json:"source,omitempty"`
+}
+
+type requirementOperationalFocus struct {
+	Summary               string                       `json:"summary,omitempty"`
+	RelationshipToPrimary string                       `json:"relationship_to_primary,omitempty"`
+	ChangedFromPrevious   bool                         `json:"changed_from_previous,omitempty"`
+	Reason                string                       `json:"reason,omitempty"`
+	RelatedResourceHints  []requirementRelatedResource `json:"related_resource_hints,omitempty"`
+	EvidenceNeeds         []string                     `json:"evidence_needs,omitempty"`
+}
+
+type requirementRelatedResource struct {
+	Kind      string `json:"kind,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Role      string `json:"role,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Evidence  string `json:"evidence,omitempty"`
 }
 
 type requestContext struct {
@@ -166,11 +189,81 @@ func parseReActResponse(input string) (*reActResponse, error) {
 	}
 	cleaned = repairUnescapedQuotesInJSONStrings(strings.TrimSpace(cleaned))
 
-	var parsed reActResponse
-	if err := json.Unmarshal([]byte(cleaned), &parsed); err != nil {
+	parsed, err := unmarshalReActResponse([]byte(cleaned))
+	if err != nil {
 		return nil, fmt.Errorf("parsing shim JSON %q: %w", cleaned, err)
 	}
-	return &parsed, nil
+	return parsed, nil
+}
+
+func unmarshalReActResponse(data []byte) (*reActResponse, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	parsed := &reActResponse{}
+	if err := unmarshalOptional(raw, "thought", &parsed.Thought); err != nil {
+		return nil, err
+	}
+	if err := unmarshalOptional(raw, "answer", &parsed.Answer); err != nil {
+		return nil, err
+	}
+	if err := unmarshalOptionalPointer(raw, "requirement_analysis", &parsed.RequirementAnalysis); err != nil {
+		return nil, err
+	}
+	if err := unmarshalOptionalPointer(raw, "request_context", &parsed.RequestContext); err != nil {
+		return nil, err
+	}
+	if err := unmarshalOptionalPointer(raw, "action", &parsed.Action); err != nil {
+		return nil, err
+	}
+	if err := unmarshalOptionalPointer(raw, "guide_progress", &parsed.GuideProgress); err != nil {
+		return nil, err
+	}
+	if parsed.Action != nil && parsed.Action.GuideProgress == nil && parsed.GuideProgress != nil {
+		parsed.Action.GuideProgress = parsed.GuideProgress
+	}
+	if err := unmarshalOptionalPointer(raw, "resource_guide_lookup", &parsed.ResourceGuideLookup); err != nil {
+		return nil, err
+	}
+	if rawFinal, ok := raw["final_report"]; ok && string(rawFinal) != "null" {
+		var report finalReport
+		if err := json.Unmarshal(rawFinal, &report); err != nil {
+			parsed.InvalidFinalReport = true
+		} else {
+			parsed.FinalReport = &report
+		}
+	}
+	if rawDirections, ok := raw["next_directions"]; ok && string(rawDirections) != "null" {
+		var directions nextDirections
+		if err := json.Unmarshal(rawDirections, &directions); err != nil {
+			parsed.InvalidDirections = true
+		} else {
+			parsed.NextDirections = &directions
+		}
+	}
+	return parsed, nil
+}
+
+func unmarshalOptional(raw map[string]json.RawMessage, key string, target any) error {
+	value, ok := raw[key]
+	if !ok || string(value) == "null" {
+		return nil
+	}
+	return json.Unmarshal(value, target)
+}
+
+func unmarshalOptionalPointer[T any](raw map[string]json.RawMessage, key string, target **T) error {
+	value, ok := raw[key]
+	if !ok || string(value) == "null" {
+		return nil
+	}
+	var parsed T
+	if err := json.Unmarshal(value, &parsed); err != nil {
+		return err
+	}
+	*target = &parsed
+	return nil
 }
 
 func extractJSON(input string) (string, bool) {
@@ -263,19 +356,16 @@ type shimCandidate struct {
 }
 
 func (c *shimCandidate) String() string {
-	return fmt.Sprintf("Thought: %s\nAnswer: %s\nRequirementAnalysis: %v\nRequestContext: %v\nAction: %v\nResourceGuideLookup: %v\nFinalReport: %v\nNextDirections: %v", c.candidate.Thought, c.candidate.Answer, c.candidate.RequirementAnalysis, c.candidate.RequestContext, c.candidate.Action, c.candidate.ResourceGuideLookup, c.candidate.FinalReport, c.candidate.NextDirections)
+	return fmt.Sprintf("Thought: %s\nAnswer: %s\nRequirementAnalysis: %v\nRequestContext: %v\nAction: %v\nGuideProgress: %v\nResourceGuideLookup: %v\nFinalReport: %v\nInvalidFinalReport: %v\nNextDirections: %v\nInvalidDirections: %v", c.candidate.Thought, c.candidate.Answer, c.candidate.RequirementAnalysis, c.candidate.RequestContext, c.candidate.Action, c.candidate.GuideProgress, c.candidate.ResourceGuideLookup, c.candidate.FinalReport, c.candidate.InvalidFinalReport, c.candidate.NextDirections, c.candidate.InvalidDirections)
 }
 
 func (c *shimCandidate) Parts() []gollm.Part {
 	var parts []gollm.Part
-	if c.candidate.Thought != "" {
-		text := c.candidate.Thought
-		if c.candidate.Answer != "" {
-			text += "\n\n"
-		}
-		parts = append(parts, &shimPart{text: text})
+	structured := c.hasStructuredOutput()
+	if c.candidate.Thought != "" && (structured || c.candidate.Answer == "") {
+		parts = append(parts, &shimPart{text: c.candidate.Thought})
 	}
-	if c.candidate.Answer != "" {
+	if c.candidate.Answer != "" && !structured {
 		parts = append(parts, &shimPart{text: c.candidate.Answer})
 	}
 	if c.candidate.RequirementAnalysis != nil {
@@ -292,11 +382,26 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	}
 	if c.candidate.FinalReport != nil {
 		parts = append(parts, &shimPart{finalReport: c.candidate.FinalReport})
+	} else if c.candidate.InvalidFinalReport {
+		parts = append(parts, &shimPart{invalidFinalReport: true})
 	}
 	if c.candidate.NextDirections != nil {
 		parts = append(parts, &shimPart{nextDirections: c.candidate.NextDirections})
+	} else if c.candidate.InvalidDirections {
+		parts = append(parts, &shimPart{invalidDirections: true})
 	}
 	return parts
+}
+
+func (c *shimCandidate) hasStructuredOutput() bool {
+	return c.candidate.RequirementAnalysis != nil ||
+		c.candidate.RequestContext != nil ||
+		c.candidate.Action != nil ||
+		c.candidate.ResourceGuideLookup != nil ||
+		c.candidate.FinalReport != nil ||
+		c.candidate.InvalidFinalReport ||
+		c.candidate.NextDirections != nil ||
+		c.candidate.InvalidDirections
 }
 
 type shimPart struct {
@@ -306,7 +411,9 @@ type shimPart struct {
 	action              *action
 	resourceGuideLookup *resourceGuideLookup
 	finalReport         *finalReport
+	invalidFinalReport  bool
 	nextDirections      *nextDirections
+	invalidDirections   bool
 }
 
 func (p *shimPart) AsText() (string, bool) {
@@ -354,6 +461,12 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 			Arguments: args,
 		}}, true
 	}
+	if p.invalidFinalReport {
+		return []gollm.FunctionCall{{
+			Name:      internalFinalReportCall,
+			Arguments: map[string]any{},
+		}}, true
+	}
 	if p.nextDirections != nil {
 		args, err := toMap(p.nextDirections)
 		if err != nil {
@@ -362,6 +475,12 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 		return []gollm.FunctionCall{{
 			Name:      internalNextDirectionsCall,
 			Arguments: args,
+		}}, true
+	}
+	if p.invalidDirections {
+		return []gollm.FunctionCall{{
+			Name:      internalNextDirectionsCall,
+			Arguments: map[string]any{},
 		}}, true
 	}
 	if p.action == nil {

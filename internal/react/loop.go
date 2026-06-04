@@ -65,27 +65,31 @@ type Loop struct {
 	pendingCalls       []PendingCall
 	skipPermissions    bool
 
-	systemPrompt           string
-	promptOptions          promptOptions
-	toolProfile            ToolProfile
-	requestIntent          RequestIntent
-	originalQuery          string
-	requirementAnalysis    *requirementAnalysis
-	requestContext         *requestContext
-	resourceClassification *resourceClassification
-	resourceDiscoveryCache map[string]resourceClassification
-	lastContextError       *contextError
-	injectedGuides         map[string]guideRef
-	completedActions       []actionRecord
-	actionSeq              int
-	lastCompactedActionSeq int
-	contextApproxTokens    int
-	lastAssistantText      string
-	lastProgressText       string
-	initialGuideAttempted  bool
-	resourceGuideInjected  bool
-	resourceGuideEvidence  []string
-	resourceGuideQueries   map[string]struct{}
+	systemPrompt            string
+	promptOptions           promptOptions
+	toolProfile             ToolProfile
+	requestIntent           RequestIntent
+	originalQuery           string
+	requirementAnalysis     *requirementAnalysis
+	requestContext          *requestContext
+	resourceClassification  *resourceClassification
+	lastOriginalQuery       string
+	lastRequirementAnalysis *requirementAnalysis
+	lastRequestContext      *requestContext
+	lastDiagnosisSummary    string
+	resourceDiscoveryCache  map[string]resourceClassification
+	lastContextError        *contextError
+	injectedGuides          map[string]guideRef
+	completedActions        []actionRecord
+	actionSeq               int
+	lastCompactedActionSeq  int
+	contextApproxTokens     int
+	lastAssistantText       string
+	lastProgressText        string
+	initialGuideAttempted   bool
+	resourceGuideInjected   bool
+	resourceGuideEvidence   []string
+	resourceGuideQueries    map[string]struct{}
 
 	guideStepState           *guideStepState
 	finalReportRequested     bool
@@ -112,6 +116,7 @@ type guideStepDetail struct {
 	Index           int      `json:"index"`
 	Description     string   `json:"description,omitempty"`
 	CommandTemplate string   `json:"command_template,omitempty"`
+	RenderedCommand string   `json:"rendered_command,omitempty"`
 	ExpectedOutcome string   `json:"expected_outcome,omitempty"`
 	Preconditions   []string `json:"preconditions,omitempty"`
 }
@@ -373,6 +378,7 @@ func (l *Loop) waitForApproval(ctx context.Context) bool {
 func (l *Loop) startQuery(query string) error {
 	intent := classifyRequestIntent(query)
 	l.requestIntent = intent
+	l.captureConversationMemory()
 	priorState := l.priorConversationStateMessage()
 	l.toolProfile = selectToolProfile(l.registry.Tools, intent, query)
 	l.promptOptions = l.newPromptOptions(intent, false, false)
@@ -413,6 +419,16 @@ func (l *Loop) startQuery(query string) error {
 	l.pendingDirectionPrompt = nil
 	l.state = StateRunning
 	return nil
+}
+
+func (l *Loop) captureConversationMemory() {
+	if !l.hasConversationState() {
+		return
+	}
+	l.lastOriginalQuery = l.originalQuery
+	l.lastRequirementAnalysis = cloneRequirementAnalysis(l.requirementAnalysis)
+	l.lastRequestContext = cloneRequestContext(l.requestContext)
+	l.lastDiagnosisSummary = l.compactDiagnosisSummary()
 }
 
 func (l *Loop) newPromptOptions(intent RequestIntent, includeGuidance bool, includeClusterAPI bool) promptOptions {
@@ -482,6 +498,10 @@ func (l *Loop) clearConversationState() {
 	l.requirementAnalysis = nil
 	l.requestContext = nil
 	l.resourceClassification = nil
+	l.lastOriginalQuery = ""
+	l.lastRequirementAnalysis = nil
+	l.lastRequestContext = nil
+	l.lastDiagnosisSummary = ""
 	l.lastContextError = nil
 	l.injectedGuides = nil
 	l.completedActions = nil
@@ -1371,6 +1391,8 @@ func (l *Loop) recordAction(call PendingCall, result map[string]any) {
 	if guideProgressObservationUseful(result) {
 		if step, ok := guideStepCompletedFromFunctionCall(call.FunctionCall); ok {
 			l.markGuideStepCompleted(step)
+		} else if step, ok := l.inferGuideStepCompletedFromFunctionCall(call.FunctionCall); ok {
+			l.markGuideStepCompleted(step)
 		}
 	}
 }
@@ -1417,6 +1439,38 @@ func guideStepCompletedFromFunctionCall(call gollm.FunctionCall) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func (l *Loop) inferGuideStepCompletedFromFunctionCall(call gollm.FunctionCall) (int, bool) {
+	state := l.guideStepState
+	if state == nil {
+		return 0, false
+	}
+	command, ok := commandString(call.Arguments["command"])
+	if !ok {
+		return 0, false
+	}
+	remaining := state.remainingSteps()
+	if len(remaining) == 0 {
+		return 0, false
+	}
+	nextStep := remaining[0]
+	if guideStepCommandMatches(state.stepDetail(nextStep), command) {
+		return nextStep, true
+	}
+	return 0, false
+}
+
+func guideStepCommandMatches(step guideStepDetail, command string) bool {
+	rendered := strings.TrimSpace(step.RenderedCommand)
+	if rendered == "" || strings.Contains(rendered, "{{") || strings.TrimSpace(command) == "" {
+		return false
+	}
+	return normalizeGuideCommand(rendered) == normalizeGuideCommand(command)
+}
+
+func normalizeGuideCommand(command string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(command)), " ")
 }
 
 func (l *Loop) translateModelText(ctx context.Context, text string) string {

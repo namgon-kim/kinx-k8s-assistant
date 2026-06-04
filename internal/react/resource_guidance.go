@@ -448,12 +448,40 @@ func (l *Loop) buildGuideStepState(found *guidance.GuideSearchResult) *guideStep
 			Index:           i + 1,
 			Description:     desc,
 			CommandTemplate: strings.TrimSpace(step.CommandTemplate),
+			RenderedCommand: l.renderGuideStepCommand(step),
 			ExpectedOutcome: strings.TrimSpace(step.ExpectedOutcome),
 			Preconditions:   append([]string(nil), step.Preconditions...),
 		})
 	}
 	l.persistGuideStepDetails(state)
 	return state
+}
+
+func (l *Loop) renderGuideStepCommand(step guidance.PlanStep) string {
+	rendered := strings.TrimSpace(step.RenderedCommand)
+	if rendered == "" {
+		rendered = strings.TrimSpace(step.CommandTemplate)
+	}
+	if rendered == "" {
+		return ""
+	}
+	replacements := map[string]string{}
+	if l.requestContext != nil {
+		replacements["namespace"] = l.requestContext.Scope.Namespace
+		replacements["name"] = l.requestContext.PrimaryTarget.Name
+		replacements["cluster_name"] = l.requestContext.PrimaryTarget.Name
+		replacements["kind"] = l.requestContext.PrimaryTarget.Resource
+	}
+	for key, value := range step.Variables {
+		replacements[key] = value
+	}
+	for key, value := range replacements {
+		rendered = strings.ReplaceAll(rendered, "{{"+key+"}}", value)
+	}
+	if strings.Contains(rendered, "{{") {
+		return ""
+	}
+	return rendered
 }
 
 func (l *Loop) persistGuideStepDetails(state *guideStepState) {

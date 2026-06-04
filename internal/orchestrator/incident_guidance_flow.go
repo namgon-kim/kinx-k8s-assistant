@@ -52,6 +52,9 @@ func (f *IncidentGuidanceFlow) AfterAgentText(o *Orchestrator, text string) erro
 	if !shouldOfferIncidentGuidanceForQuery(f.lastUserQuery) {
 		return nil
 	}
+	if isInternalRuntimeErrorText(text) {
+		return nil
+	}
 	if !looksIncidentGuidanceWorthy(text) {
 		return nil
 	}
@@ -71,6 +74,9 @@ func (f *IncidentGuidanceFlow) AfterAgentText(o *Orchestrator, text string) erro
 func (f *IncidentGuidanceFlow) RecordEvidence(text string) {
 	if f.phase == incidentGuidanceSearchRequested {
 		f.searchBrief = appendBounded(f.searchBrief, text, 4)
+		return
+	}
+	if isInternalRuntimeErrorText(text) {
 		return
 	}
 	if f.phase == incidentGuidanceIdle && looksIncidentGuidanceWorthy(text) {
@@ -360,6 +366,9 @@ func (f *IncidentGuidanceFlow) reset() {
 
 func looksIncidentGuidanceWorthy(text string) bool {
 	lower := strings.ToLower(text)
+	if isInternalRuntimeErrorText(lower) {
+		return false
+	}
 	keywords := []string{
 		"crashloopbackoff", "imagepullbackoff", "errimagepull", "oomkilled",
 		"failedscheduling", "pending", "back-off", "probe failed",
@@ -369,6 +378,32 @@ func looksIncidentGuidanceWorthy(text string) bool {
 	}
 	for _, keyword := range keywords {
 		if strings.Contains(lower, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func isInternalRuntimeErrorText(text string) bool {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if lower == "" {
+		return false
+	}
+	markers := []string{
+		"next_directions 형식 오류",
+		"final_report 형식 오류",
+		"resource_guide_lookup 형식 오류",
+		"requirement analysis",
+		"request context",
+		"action target",
+		"shim json",
+		"parsing shim json",
+		"context compact failed",
+		"openai streaming error",
+		"llm 응답 후보가 없습니다",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
 			return true
 		}
 	}

@@ -94,6 +94,16 @@ func TestCommandMentionsResourceAllowsCRDPluralSingularMismatch(t *testing.T) {
 	}
 }
 
+func TestCommandMentionsResourceAllowsKubectlResourceNameShorthand(t *testing.T) {
+	command := "kubectl -n tenant-a get cluster/clst-a openstackcluster/clst-a kamajicontrolplane/clst-a -o yaml"
+	if !commandMentionsResource(command, "cluster") {
+		t.Fatalf("expected resource/name shorthand to mention cluster resource: %s", command)
+	}
+	if !commandMentionsToken(command, "clst-a") {
+		t.Fatalf("expected resource/name shorthand to mention object name: %s", command)
+	}
+}
+
 func TestCommandMentionsResourceTreatsKubectlLogsAsPodTarget(t *testing.T) {
 	if !commandMentionsResource("kubectl logs clst-pz02-shs1006-04-85d5694687-5h2tz -n tenant-a -c konnectivity-server", "pod") {
 		t.Fatal("expected kubectl logs <pod> to satisfy pod action target")
@@ -237,6 +247,23 @@ func TestInconsistentActionTargetMessageAllowsCaseAndMultiResourceCommands(t *te
 	}
 }
 
+func TestInconsistentActionTargetMessageAllowsResourceNameShorthand(t *testing.T) {
+	call := gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl -n tenant-a get cluster/clst-a openstackcluster/clst-a kamajicontrolplane/clst-a -o yaml",
+			"target": map[string]any{
+				"resource":  "cluster",
+				"namespace": "tenant-a",
+				"name":      "clst-a",
+			},
+		},
+	}
+	if got, invalid := inconsistentActionTargetMessage(call); invalid {
+		t.Fatalf("expected resource/name shorthand command to pass, got %q", got)
+	}
+}
+
 func TestInconsistentActionTargetMessageRejectsNamespacedNamespaceTarget(t *testing.T) {
 	call := gollm.FunctionCall{
 		Name: "kubectl",
@@ -252,6 +279,48 @@ func TestInconsistentActionTargetMessageRejectsNamespacedNamespaceTarget(t *test
 	got, invalid := inconsistentActionTargetMessage(call)
 	if !invalid || !strings.Contains(got, "Namespace objects are cluster-scoped") {
 		t.Fatalf("expected namespaced namespace target to be rejected, got invalid=%v message=%q", invalid, got)
+	}
+}
+
+func TestInconsistentActionTargetMessageAllowsAllNamespacesScope(t *testing.T) {
+	call := gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl get machinedeployment -A -o yaml",
+			"target": map[string]any{
+				"resource":  "machinedeployment",
+				"namespace": "all",
+			},
+		},
+	}
+	if got, invalid := inconsistentActionTargetMessage(call); invalid {
+		t.Fatalf("expected all-namespaces command to pass, got %q", got)
+	}
+
+	call.Arguments["command"] = "kubectl get machinedeployment -o yaml"
+	got, invalid := inconsistentActionTargetMessage(call)
+	if !invalid {
+		t.Fatal("expected missing all-namespaces flag to be rejected")
+	}
+	if strings.Contains(got, "-n all") || strings.Contains(got, "--namespace=all") {
+		t.Fatalf("correction must not ask for namespace all, got %q", got)
+	}
+}
+
+func TestInconsistentActionTargetMessageIgnoresUnknownNamePlaceholder(t *testing.T) {
+	call := gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl get node -n tenant-a",
+			"target": map[string]any{
+				"resource":  "node",
+				"namespace": "tenant-a",
+				"name":      "unknown",
+			},
+		},
+	}
+	if got, invalid := inconsistentActionTargetMessage(call); invalid {
+		t.Fatalf("unknown target name placeholder should not be enforced, got %q", got)
 	}
 }
 
@@ -572,6 +641,256 @@ func TestGuideStepCompletedRejectsEvidenceNotUseful(t *testing.T) {
 		},
 	}); ok {
 		t.Fatal("guide_progress with evidence_useful=false must not complete a step")
+	}
+}
+
+func TestFallbackNextDirectionsUsesPendingFinalReportGaps(t *testing.T) {
+	loop := &Loop{
+		pendingFinalReport: &finalReport{
+			EvidenceMissing: []string{"workload kubeconfig was not available"},
+			Blockers:        []string{"node providerID could not be checked"},
+		},
+	}
+	got := loop.fallbackNextDirections()
+	if len(got.Options) != 1 {
+		t.Fatalf("expected one generic continuation option, got %#v", got.Options)
+	}
+	if got.Options[0].Kind != "different_approach" || !strings.Contains(got.Options[0].Instruction, "workload kubeconfig") {
+		t.Fatalf("unexpected fallback option: %#v", got.Options[0])
+	}
+}
+
+func TestFallbackNextDirectionsAllowsOnlyRuntimeChoicesWithoutReportGaps(t *testing.T) {
+	got := (&Loop{}).fallbackNextDirections()
+	if len(got.Options) != 0 {
+		t.Fatalf("expected no model-derived options when report has no gaps, got %#v", got.Options)
+	}
+}
+
+func TestPriorConversationStateUsesExplicitFollowUpMemory(t *testing.T) {
+	loop := &Loop{
+		originalQuery: "namespace tenant-a에서 clst-a cluster 문제 찾아줘",
+		requirementAnalysis: &requirementAnalysis{
+			RequestType: "diagnosis",
+			Action:      "diagnose_problem",
+			Target:      requirementAnalysisTarget{Category: "kubernetes_resource", Description: "Cluster clst-a"},
+			Scope:       requirementScope{Type: "namespaced", Namespace: "tenant-a"},
+			Resources: []requirementResource{{
+				Kind:      "cluster",
+				Name:      "clst-a",
+				Namespace: "tenant-a",
+				Role:      "primary",
+			}},
+		},
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+			Scope:         requestScope{Namespace: "tenant-a"},
+			ResourceClass: "custom_resource",
+		},
+		lastAssistantText: "MachineDeployment has zero available replicas.",
+	}
+	loop.captureConversationMemory()
+	loop.originalQuery = ""
+	loop.requirementAnalysis = nil
+	loop.requestContext = nil
+	loop.lastAssistantText = ""
+
+	got := loop.priorConversationStateMessage()
+	for _, want := range []string{
+		"previous_requirement_analysis:",
+		"previous_request_context:",
+		`"namespace":"tenant-a"`,
+		`"resource":"cluster"`,
+		"Follow-up handling:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected prior memory to contain %q, got %q", want, got)
+		}
+	}
+}
+
+func TestRequirementAnalysisDefaultsFollowUpToPriorRequestContext(t *testing.T) {
+	loop := &Loop{
+		lastRequestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+			Scope:         requestScope{Namespace: "tenant-a"},
+			ResourceClass: "custom_resource",
+		},
+	}
+	got := loop.applyPriorContextToFollowUpRequirementAnalysis(requirementAnalysis{
+		RequestType: "diagnosis",
+		Action:      "diagnose_problem",
+		Target:      requirementAnalysisTarget{Category: "unknown", Description: "node group is not working"},
+		Scope:       requirementScope{Type: "unknown"},
+		OperationalFocus: &requirementOperationalFocus{
+			Summary:               "worker group availability",
+			RelationshipToPrimary: "related_to_primary",
+			ChangedFromPrevious:   true,
+			Reason:                "follow-up narrows the previous Cluster diagnosis to worker group behavior",
+			EvidenceNeeds:         []string{"MachineDeployment status related to the previous target"},
+		},
+	})
+	resource := primaryRequirementResource(got.Resources)
+	if resource.Kind != "cluster" || resource.Name != "clst-a" || resource.Namespace != "tenant-a" {
+		t.Fatalf("expected prior cluster context as default, got %#v", resource)
+	}
+	if resource.Source != "previous_context" {
+		t.Fatalf("expected previous context source, got %#v", resource)
+	}
+	if got.Scope.Namespace != "tenant-a" {
+		t.Fatalf("expected prior namespace, got %#v", got.Scope)
+	}
+	if got.OperationalFocus == nil || !strings.Contains(got.OperationalFocus.Summary, "worker group") {
+		t.Fatalf("expected operational focus to be preserved, got %#v", got.OperationalFocus)
+	}
+}
+
+func TestRequirementAnalysisDemotesModelInferredPrimaryToOperationalFocusHint(t *testing.T) {
+	loop := &Loop{
+		lastRequestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+			Scope:         requestScope{Namespace: "tenant-a"},
+			ResourceClass: "custom_resource",
+		},
+	}
+	got := loop.applyPriorContextToFollowUpRequirementAnalysis(requirementAnalysis{
+		RequestType: "diagnosis",
+		Action:      "diagnose_problem",
+		Target:      requirementAnalysisTarget{Category: "kubernetes_resource", Description: "worker group is not working"},
+		Scope:       requirementScope{Type: "namespaced", Namespace: "tenant-a"},
+		Resources: []requirementResource{{
+			Kind:   "machinedeployment",
+			Role:   "primary",
+			Source: "model_inference",
+		}},
+		OperationalFocus: &requirementOperationalFocus{
+			Summary:               "worker group availability",
+			RelationshipToPrimary: "related_to_primary",
+			ChangedFromPrevious:   true,
+		},
+	})
+	resource := primaryRequirementResource(got.Resources)
+	if resource.Kind != "cluster" || resource.Name != "clst-a" || resource.Source != "previous_context" {
+		t.Fatalf("expected previous cluster primary, got %#v", resource)
+	}
+	if got.OperationalFocus == nil || len(got.OperationalFocus.RelatedResourceHints) == 0 {
+		t.Fatalf("expected inferred primary to become focus hint, got %#v", got.OperationalFocus)
+	}
+	hint := got.OperationalFocus.RelatedResourceHints[0]
+	if hint.Kind != "machinedeployment" || hint.Source != "model_inference" {
+		t.Fatalf("unexpected focus hint: %#v", hint)
+	}
+}
+
+func TestRequirementAnalysisKeepsUserRequestPrimary(t *testing.T) {
+	loop := &Loop{
+		lastRequestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+			Scope:         requestScope{Namespace: "tenant-a"},
+			ResourceClass: "custom_resource",
+		},
+	}
+	got := loop.applyPriorContextToFollowUpRequirementAnalysis(requirementAnalysis{
+		RequestType: "diagnosis",
+		Action:      "diagnose_problem",
+		Target:      requirementAnalysisTarget{Category: "kubernetes_resource", Description: "MachineDeployment md-a"},
+		Scope:       requirementScope{Type: "namespaced", Namespace: "tenant-a"},
+		Resources: []requirementResource{{
+			Kind:   "machinedeployment",
+			Name:   "md-a",
+			Role:   "primary",
+			Source: "user_request",
+		}},
+		OperationalFocus: &requirementOperationalFocus{
+			Summary:               "MachineDeployment health",
+			RelationshipToPrimary: "new_primary",
+			ChangedFromPrevious:   true,
+		},
+	})
+	resource := primaryRequirementResource(got.Resources)
+	if resource.Kind != "machinedeployment" || resource.Name != "md-a" || resource.Source != "user_request" {
+		t.Fatalf("expected explicit user primary to be preserved, got %#v", resource)
+	}
+}
+
+func TestRequirementAnalysisDoesNotHardcodeNodeGroupClarification(t *testing.T) {
+	if message, ok := requirementAnalysisClarificationMessage(requirementAnalysis{
+		RequestType: "diagnosis",
+		Action:      "diagnose_problem",
+		Target: requirementAnalysisTarget{
+			Category:    "kubernetes_resource",
+			Description: "node group is not working normally",
+		},
+		Resources: []requirementResource{{
+			Kind: "nodegroup",
+			Role: "primary",
+		}},
+	}); ok {
+		t.Fatalf("node group must not be runtime-hardcoded into a clarification path, got %q", message)
+	}
+}
+
+func TestRequirementAnalysisDoesNotClarifyBroadClusterEnvironmentDiagnosis(t *testing.T) {
+	if message, ok := requirementAnalysisClarificationMessage(requirementAnalysis{
+		RequestType: "diagnosis",
+		Action:      "diagnose_problem",
+		Target: requirementAnalysisTarget{
+			Category:    "cluster_environment",
+			Description: "current cluster health",
+		},
+	}); ok {
+		t.Fatalf("did not expect broad cluster environment clarification, got %q", message)
+	}
+}
+
+func TestInferGuideStepCompletedFromMatchingNextStepCommand(t *testing.T) {
+	loop := &Loop{
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+			Scope:         requestScope{Namespace: "tenant-a"},
+		},
+		guideStepState: &guideStepState{
+			TotalSteps: 2,
+			Completed:  map[int]bool{},
+			StepDetails: []guideStepDetail{
+				{
+					Index:           1,
+					Description:     "Inspect top-level cluster resources",
+					CommandTemplate: "kubectl -n {{namespace}} get cluster/{{cluster_name}} openstackcluster/{{cluster_name}} kamajicontrolplane/{{cluster_name}} -o yaml",
+					RenderedCommand: "kubectl -n tenant-a get cluster/clst-a openstackcluster/clst-a kamajicontrolplane/clst-a -o yaml",
+				},
+				{
+					Index:           2,
+					Description:     "Inspect cloud config Secrets",
+					CommandTemplate: "kubectl -n {{namespace}} get secret/{{cluster_name}}-cloud-conf secret/{{cluster_name}}-ccm-cloud-config -o yaml",
+					RenderedCommand: "kubectl -n tenant-a get secret/clst-a-cloud-conf secret/clst-a-ccm-cloud-config -o yaml",
+				},
+			},
+		},
+	}
+	step, ok := loop.inferGuideStepCompletedFromFunctionCall(gollm.FunctionCall{
+		Arguments: map[string]any{
+			"command": "kubectl -n tenant-a get cluster/clst-a openstackcluster/clst-a kamajicontrolplane/clst-a -o yaml",
+		},
+	})
+	if !ok || step != 1 {
+		t.Fatalf("expected step 1 to be inferred, got step=%d ok=%v", step, ok)
+	}
+
+	if step, ok = loop.inferGuideStepCompletedFromFunctionCall(gollm.FunctionCall{
+		Arguments: map[string]any{
+			"command": "kubectl -n tenant-a get cluster/clst-a -o yaml",
+		},
+	}); ok {
+		t.Fatalf("did not expect partial same-resource command to infer guide progress, got step=%d", step)
+	}
+
+	if step, ok = loop.inferGuideStepCompletedFromFunctionCall(gollm.FunctionCall{
+		Arguments: map[string]any{
+			"command": "kubectl -n tenant-a get events --field-selector=involvedObject.name=clst-a",
+		},
+	}); ok {
+		t.Fatalf("did not expect unrelated command to infer guide progress, got step=%d", step)
 	}
 }
 

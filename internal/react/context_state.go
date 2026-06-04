@@ -102,14 +102,55 @@ func (l *Loop) compactedStateMessage(nextInstruction string) string {
 }
 
 func (l *Loop) priorConversationStateMessage() string {
-	if !l.hasConversationState() {
+	if !l.hasPriorConversationMemory() && !l.hasConversationState() {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("Prior conversation state. Use it only if the new user request is a follow-up; explicit target/scope in the new request wins.\n")
-	l.writeConversationState(&b, false)
+	b.WriteString("Previous conversation context for requirement analysis. Use it only when the new user request is a follow-up; explicit resource, name, namespace, or all-namespaces scope in the new request wins.\n")
+	if l.hasPriorConversationMemory() {
+		l.writePriorConversationMemory(&b)
+	} else {
+		l.writeConversationState(&b, false)
+	}
+	b.WriteString("Follow-up handling: if the new request is a follow-up without naming a new target/scope, default to the previous request_context target and scope and express the new diagnostic angle in requirement_analysis.operational_focus. Do not invent a new Kubernetes resource kind from follow-up wording alone.\n")
 	b.WriteString("Do not repeat previous raw assistant JSON, guide bodies, corrections, or diagnostics unless the user asks for them.")
 	return b.String()
+}
+
+func (l *Loop) hasPriorConversationMemory() bool {
+	return l.lastOriginalQuery != "" ||
+		l.lastRequirementAnalysis != nil ||
+		l.lastRequestContext != nil ||
+		strings.TrimSpace(l.lastDiagnosisSummary) != ""
+}
+
+func (l *Loop) writePriorConversationMemory(b *strings.Builder) {
+	if l.lastOriginalQuery != "" {
+		b.WriteString("previous_original_query: ")
+		b.WriteString(l.lastOriginalQuery)
+		b.WriteString("\n")
+	}
+	if l.lastRequirementAnalysis != nil {
+		if raw, err := json.Marshal(l.lastRequirementAnalysis); err == nil {
+			b.WriteString("previous_requirement_analysis: ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
+	}
+	if l.lastRequestContext != nil {
+		if raw, err := json.Marshal(l.lastRequestContext); err == nil {
+			b.WriteString("previous_request_context: ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
+	}
+	if strings.TrimSpace(l.lastDiagnosisSummary) != "" {
+		if raw, err := json.Marshal(l.lastDiagnosisSummary); err == nil {
+			b.WriteString("previous_diagnosis_summary: ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
+	}
 }
 
 func (l *Loop) hasConversationState() bool {
@@ -121,6 +162,50 @@ func (l *Loop) hasConversationState() bool {
 		len(l.injectedGuides) > 0 ||
 		len(l.completedActions) > 0 ||
 		strings.TrimSpace(l.lastAssistantText) != ""
+}
+
+func (l *Loop) compactDiagnosisSummary() string {
+	var b strings.Builder
+	if len(l.completedActions) > 0 {
+		if raw, err := json.Marshal(l.compactedActionSummaries()); err == nil {
+			b.WriteString("completed_procedure_and_clues: ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
+	}
+	if strings.TrimSpace(l.lastAssistantText) != "" {
+		if raw, err := json.Marshal(compactStateText(l.lastAssistantText)); err == nil {
+			b.WriteString("last_assistant_text: ")
+			b.Write(raw)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func cloneRequirementAnalysis(value *requirementAnalysis) *requirementAnalysis {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	cloned.Resources = append([]requirementResource(nil), value.Resources...)
+	if value.OperationalFocus != nil {
+		focus := *value.OperationalFocus
+		focus.RelatedResourceHints = append([]requirementRelatedResource(nil), value.OperationalFocus.RelatedResourceHints...)
+		focus.EvidenceNeeds = append([]string(nil), value.OperationalFocus.EvidenceNeeds...)
+		cloned.OperationalFocus = &focus
+	}
+	cloned.Evidence = append([]string(nil), value.Evidence...)
+	cloned.Constraints = append([]string(nil), value.Constraints...)
+	cloned.Ambiguities = append([]string(nil), value.Ambiguities...)
+	return &cloned
+}
+
+func cloneRequestContext(value *requestContext) *requestContext {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func (l *Loop) writeConversationState(b *strings.Builder, includeGuideContent bool) {

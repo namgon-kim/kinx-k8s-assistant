@@ -9,6 +9,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"k8s.io/klog/v2"
 )
 
 // consumeNextDirections handles the model's next_directions response after an
@@ -25,10 +26,10 @@ func (l *Loop) consumeNextDirections(ctx context.Context, calls []gollm.Function
 		nd, ok := nextDirectionsFromFunctionCall(call)
 		if !ok {
 			if !l.appendCorrection("invalid_next_directions", "next_directions payload was invalid. Re-emit a next_directions object with 1-3 options; each option needs `kind` (another_guide|different_approach) and `summary`.") {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "next_directions 형식 오류가 반복되어 진단을 중단합니다.")
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
+				klog.Warning("next_directions remained invalid after correction; falling back to runtime continuation choices")
+				nd = l.fallbackNextDirections()
+				l.pendingNextDirections = &nd
+				l.promptDirectionChoice(nd)
 				return nil, true
 			}
 			l.pendingCalls = nil
@@ -41,6 +42,36 @@ func (l *Loop) consumeNextDirections(ctx context.Context, calls []gollm.Function
 		return nil, true
 	}
 	return remaining, false
+}
+
+func (l *Loop) fallbackNextDirections() nextDirections {
+	nd := nextDirections{
+		Note: "모델이 후속 진단 방향을 올바른 형식으로 제안하지 못해 기본 선택지를 표시합니다.",
+	}
+	opt := l.genericNextDirectionOption()
+	if strings.TrimSpace(opt.Instruction) != "" {
+		nd.Options = []nextDirectionOption{opt}
+	}
+	return nd
+}
+
+func (l *Loop) genericNextDirectionOption() nextDirectionOption {
+	report := l.pendingFinalReport
+	if report == nil {
+		return nextDirectionOption{}
+	}
+	var clues []string
+	clues = append(clues, report.Blockers...)
+	clues = append(clues, report.EvidenceMissing...)
+	if len(clues) == 0 {
+		return nextDirectionOption{}
+	}
+	return nextDirectionOption{
+		Kind:        "different_approach",
+		Summary:     "부족한 증거를 기준으로 다른 접근을 시도",
+		Why:         "이전 진단이 불충분했던 지점을 기준으로 다음 확인 대상을 좁힙니다.",
+		Instruction: "Continue diagnosis by addressing these blockers or missing evidence first: " + strings.Join(clues, "; "),
+	}
 }
 
 func nextDirectionsFromFunctionCall(call gollm.FunctionCall) (nextDirections, bool) {

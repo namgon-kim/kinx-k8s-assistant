@@ -26,9 +26,27 @@ Use this schema:
         "kind": "Concrete Kubernetes resource kind only when the request names or clearly implies one",
         "name": "Object name when provided",
         "namespace": "Object namespace when provided",
-        "role": "Use primary for the user's Kubernetes object subject; otherwise use scope, related, evidence, owner, or dependent."
+        "role": "Use primary for the user's Kubernetes object subject; otherwise use scope, related, evidence, owner, or dependent.",
+        "source": "Use user_request, previous_context, live_evidence, guide_context, or model_inference"
       }
     ],
+    "operational_focus": {
+      "summary": "Optional operational problem focus for this request; omit when the request has no separate operational focus",
+      "relationship_to_primary": "Use same_primary, related_to_primary, new_primary, or unclear",
+      "changed_from_previous": false,
+      "reason": "Why this focus is relevant to the current request",
+      "related_resource_hints": [
+        {
+          "kind": "Related Kubernetes kind suggested by the user, prior context, live evidence, or guide context",
+          "name": "Related object name when known",
+          "namespace": "Related object namespace when known",
+          "role": "Use suspected_related, suspected_blocker, evidence_source, owner, dependent, or related",
+          "source": "Use user_request, previous_context, live_evidence, guide_context, or model_inference",
+          "evidence": "Short grounding for this hint"
+        }
+      ],
+      "evidence_needs": ["Facts needed to confirm this operational focus"]
+    },
     "evidence_needs": ["Facts or live evidence needed before deciding the next action"],
     "constraints": ["Constraints from the user or runtime context"],
     "ambiguities": ["Ambiguities that matter for the next action"]
@@ -37,9 +55,13 @@ Use this schema:
 
 Rules:
 - Use only target.category and resource_candidates for target classification.
+- Use operational_focus to capture the user's operational problem focus without changing the primary target. It is not a RAG request and must not contain resource_guide_lookup instructions.
+- If a prior conversation state is present and the new user request is a follow-up without an explicit resource, name, or namespace, use the prior accepted requirement_analysis/request_context as defaults and set resource_candidates.primary.source="previous_context". Explicit target or scope in the new request always wins and should use source="user_request".
 - Treat broad phrases such as "this cluster", "current cluster", or "solve this cluster's problem" as target.category="cluster_environment" with no resource_candidates unless the user names a concrete Kubernetes resource kind/object.
 - Do not create a resource candidate just because the word "cluster" appears. Create kind="cluster" only when the user identifies a Kubernetes Cluster object by kind/name or the request clearly targets that Kubernetes object.
 - Namespace phrases are normally scope, not the target resource, unless the user explicitly asks about a Namespace object.
+- "node group" / "노드 그룹" is a natural operations term that can mean a worker group. In a Cluster API context it may relate to MachineDeployment, MachineSet, Machine, or worker-group behavior. Do not hard-map the phrase to one kind; use prior context and live evidence to decide whether it is a related problem focus or a concrete resource target.
+- If a node-group follow-up has prior Cluster/CAPI context, keep the previous target/scope as resource_candidates.primary.source="previous_context" and set operational_focus.relationship_to_primary="related_to_primary". Put MachineDeployment/MachineSet/Machine as operational_focus.related_resource_hints with source="model_inference" unless the user explicitly names one as the target. If there is no useful prior context and no namespace, cluster, resource, or name is identifiable, return target.category="unknown" with ambiguities instead of inventing a resource kind.
 - If no concrete Kubernetes resource kind is identifiable, leave resource_candidates empty and capture the ambiguity instead of inventing "unknown" as a resource kind.`
 }
 
@@ -85,6 +107,33 @@ target.category:
 - unknown: target is unclear and clarification may be needed.
 - other: target is clear but no listed category fits.
 
+natural-language operations terms:
+- node group / 노드 그룹: a worker group concept. In Cluster API contexts it can involve MachineDeployment, MachineSet, Machine, or worker lifecycle evidence. Treat it as a semantic clue, not a fixed runtime alias.
+- worker group: same operational family as node group; use prior context, named resources, labels, and live evidence to decide the concrete Kubernetes resources.
+
+operational_focus:
+- summary: concise operational problem focus, such as worker group availability, node provisioning, scheduling pressure, network reachability, or certificate expiry.
+- relationship_to_primary: same_primary when the focus is the primary target itself; related_to_primary when the focus narrows diagnosis to related/dependent behavior while keeping the primary target; new_primary when the user explicitly names a new target; unclear when the relationship cannot be determined.
+- changed_from_previous: true when a follow-up shifts the focus from the previous accepted request context.
+- reason: short grounding for why this focus matches the user request and prior context.
+- related_resource_hints: related objects or kinds that may help diagnosis. Hints do not replace resource_candidates.primary.
+- evidence_needs: live facts needed to confirm or reject this focus.
+
+operational_focus.related_resource_hints.role:
+- suspected_related: likely related to the operational focus but not established as a blocker.
+- suspected_blocker: likely blocking the primary target's health or availability.
+- evidence_source: useful source of evidence for the operational focus.
+- owner: owner/controller of the focused object or behavior.
+- dependent: child/dependent object of the primary target.
+- related: generally related when a more specific role is not clear.
+
+operational_focus.related_resource_hints.source:
+- user_request: stated directly by the user.
+- previous_context: carried from previous accepted requirement_analysis, request_context, or diagnosis summary.
+- live_evidence: observed from tool output.
+- guide_context: suggested by injected resource-guide context.
+- model_inference: inferred by the model from Kubernetes/CAPI domain knowledge.
+
 scope.type:
 - namespaced: one namespace scopes the target.
 - cluster_scoped: cluster-wide or cluster-scoped object.
@@ -101,5 +150,12 @@ resource_candidates.role:
 - related: related object that may help diagnose the primary target.
 - evidence: object or kind needed only to gather evidence.
 - owner: owner/controller of the primary target.
-- dependent: dependent/child object of the primary target.`
+- dependent: dependent/child object of the primary target.
+
+resource_candidates.source:
+- user_request: the user explicitly named this resource kind/object in the current request.
+- previous_context: carried from the previous accepted requirement_analysis or request_context.
+- live_evidence: observed in current or previous tool output.
+- guide_context: suggested by injected resource-guide context.
+- model_inference: inferred by the model from Kubernetes/CAPI domain knowledge. Do not use model_inference as primary when relationship_to_primary is related_to_primary; put it in operational_focus.related_resource_hints instead.`
 }

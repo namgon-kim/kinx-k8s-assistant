@@ -106,6 +106,9 @@ func inconsistentActionTargetMessage(call gollm.FunctionCall) (string, bool) {
 		return fmt.Sprintf("Action target declared name %q, but command %q does not include that name. Preserve the declared target and return one corrected next action.", target.Name, command), true
 	}
 	if target.Namespace != "" && !commandUsesNamespace(command, target.Namespace) {
+		if isAllNamespacesValue(target.Namespace) {
+			return fmt.Sprintf("Action target declared all-namespaces scope, but command %q does not include `-A` or `--all-namespaces`. Preserve the all-namespaces scope and return one corrected next action.", command), true
+		}
 		return fmt.Sprintf("Action target declared namespace %q, but command %q omits that namespace. Preserve the declared target and return one corrected next action with `-n %s` or `--namespace=%s`.", target.Namespace, command, target.Namespace, target.Namespace), true
 	}
 	return "", false
@@ -122,7 +125,7 @@ func actionTargetFromFunctionCall(call gollm.FunctionCall) (actionTarget, bool) 
 	target := actionTarget{
 		Resource:  strings.TrimSpace(resource),
 		Namespace: strings.TrimSpace(namespace),
-		Name:      strings.TrimSpace(name),
+		Name:      cleanUnknownPlaceholder(name),
 	}
 	if target.Resource == "" && target.Namespace == "" && target.Name == "" {
 		return actionTarget{}, false
@@ -136,8 +139,13 @@ func commandMentionsToken(command, token string) bool {
 		return true
 	}
 	for _, field := range strings.Fields(command) {
-		if strings.ToLower(strings.Trim(field, "'\"")) == token {
-			return true
+		field = strings.ToLower(strings.Trim(field, "'\""))
+		for _, part := range strings.FieldsFunc(field, func(r rune) bool {
+			return r == '/' || r == ','
+		}) {
+			if strings.TrimSpace(part) == token {
+				return true
+			}
 		}
 	}
 	return false
@@ -220,6 +228,7 @@ func kubectlMentionedResources(command string) []string {
 		}
 		if resource, ok := firstKubectlResourceArg(fields, verbIndex+1); ok {
 			for _, part := range strings.Split(resource, ",") {
+				part = kubectlResourceKindFromArg(part)
 				part = normalizeKubectlResource(strings.TrimSpace(part))
 				if part != "" {
 					resources = append(resources, part)
@@ -293,6 +302,9 @@ func commandUsesSelectorForName(command, name string) bool {
 }
 
 func commandUsesNamespace(command, namespace string) bool {
+	if isAllNamespacesValue(namespace) {
+		return commandUsesAllNamespaces(command)
+	}
 	fields := strings.Fields(command)
 	for i, field := range fields {
 		trimmed := strings.Trim(field, "'\"")
@@ -304,4 +316,40 @@ func commandUsesNamespace(command, namespace string) bool {
 		}
 	}
 	return false
+}
+
+func commandUsesAllNamespaces(command string) bool {
+	for _, field := range strings.Fields(command) {
+		trimmed := strings.Trim(field, "'\"")
+		if trimmed == "-A" || trimmed == "--all-namespaces" || strings.HasPrefix(trimmed, "--all-namespaces=") {
+			return true
+		}
+	}
+	return false
+}
+
+func isAllNamespacesValue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "all", "all_namespaces", "all-namespaces", "*":
+		return true
+	default:
+		return false
+	}
+}
+
+func cleanUnknownPlaceholder(value string) string {
+	value = strings.TrimSpace(value)
+	if isUnknownPlaceholder(value) {
+		return ""
+	}
+	return value
+}
+
+func isUnknownPlaceholder(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "unknown", "unknown_name", "unknown-name", "n/a", "na", "null", "none":
+		return true
+	default:
+		return false
+	}
 }
