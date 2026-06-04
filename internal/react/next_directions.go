@@ -24,7 +24,13 @@ func (l *Loop) consumeNextDirections(ctx context.Context, calls []gollm.Function
 		}
 		nd, ok := nextDirectionsFromFunctionCall(call)
 		if !ok {
-			l.appendCorrection("invalid_next_directions", "next_directions payload was invalid. Re-emit a next_directions object with 1-3 options; each option needs `kind` (another_guide|different_approach) and `summary`.")
+			if !l.appendCorrection("invalid_next_directions", "next_directions payload was invalid. Re-emit a next_directions object with 1-3 options; each option needs `kind` (another_guide|different_approach) and `summary`.") {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "next_directions 형식 오류가 반복되어 진단을 중단합니다.")
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return nil, true
+			}
 			l.pendingCalls = nil
 			l.currIteration++
 			l.state = StateRunning
@@ -186,6 +192,22 @@ func (l *Loop) waitForDirectionText(ctx context.Context) bool {
 			l.state = StateDone
 			return true
 		}
+		normalized := strings.TrimPrefix(strings.ToLower(text), "/")
+		switch normalized {
+		case "exit", "quit":
+			l.state = StateExited
+			return false
+		case "clear", "reset":
+			l.clearConversationState()
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "대화 상태를 초기화했습니다.")
+			l.state = StateDone
+			return true
+		}
+		if strings.HasPrefix(text, "/") {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "이 입력 단계에서는 /exit, /quit, /clear, /reset만 메타 명령으로 처리할 수 있습니다.")
+			l.state = StateWaitingDirectionText
+			return true
+		}
 		l.applyDirectionOption(ctx, nextDirectionOption{
 			Kind:        "different_approach",
 			Summary:     "사용자가 직접 지정한 방향",
@@ -202,6 +224,7 @@ func (l *Loop) applyDirectionOption(ctx context.Context, opt nextDirectionOption
 	l.pendingNextDirections = nil
 	l.pendingFinalReport = nil
 	l.finalReportRequested = false
+	l.pendingResponseDirective = ""
 
 	switch opt.Kind {
 	case "another_guide":

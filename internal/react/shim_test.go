@@ -144,16 +144,13 @@ func TestShimPartConvertsActionToFunctionCall(t *testing.T) {
 	}
 }
 
-func TestParseReActResponseTreatsPlainTextAsFinalAnswer(t *testing.T) {
+func TestParseReActResponseRejectsPlainText(t *testing.T) {
 	parsed, err := parseReActResponse("plain final answer")
-	if err != nil {
-		t.Fatalf("parse plain final answer: %v", err)
+	if err == nil {
+		t.Fatal("expected plain text shim response to be rejected")
 	}
-	if parsed.Answer != "plain final answer" {
-		t.Fatalf("unexpected answer: %q", parsed.Answer)
-	}
-	if parsed.Action != nil {
-		t.Fatalf("did not expect action: %#v", parsed.Action)
+	if parsed != nil {
+		t.Fatalf("expected nil parsed response, got %#v", parsed)
 	}
 }
 

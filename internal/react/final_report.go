@@ -44,13 +44,13 @@ func (l *Loop) requestFinalReportFromModel() {
 	b.WriteString("- conclusive: true if the gathered evidence is sufficient to answer the original_query, otherwise false.\n")
 	b.WriteString("- conclusion: when conclusive=true, a concise answer grounded in observed evidence.\n")
 	b.WriteString("- attempted: short bullets summarizing the diagnostic steps actually run.\n")
-	b.WriteString("- evidence_known: facts directly observed from tool output.\n")
-	b.WriteString("- evidence_missing: facts that would have helped but were not obtainable (when conclusive=false).\n")
+	b.WriteString("- evidence_known: facts directly observed from tool output; required when conclusive=true.\n")
+	b.WriteString("- evidence_missing: facts that would have helped but were not obtainable; for conclusive=false include this or blockers if evidence_known is empty.\n")
 	b.WriteString("- most_likely_cause: best-guess cause given partial evidence; use the literal string \"inconclusive\" if no cause is supported.\n")
 	b.WriteString("- recommended_user_actions: concrete next steps the user can run outside this session (optional).\n")
 	b.WriteString("- blockers: hard constraints that prevented full diagnosis (optional). Examples: \"workload kubeconfig not available in this session\".\n")
 	b.WriteString("Do not emit `action`, `resource_guide_lookup`, or `next_directions` in this response.")
-	l.currChatContent = append(l.currChatContent, b.String())
+	l.queueResponseDirective(b.String())
 }
 
 // consumeFinalReport intercepts the model's final_report output. If the
@@ -66,7 +66,13 @@ func (l *Loop) consumeFinalReport(ctx context.Context, calls []gollm.FunctionCal
 		}
 		report, ok := finalReportFromFunctionCall(call)
 		if !ok {
-			l.appendCorrection("invalid_final_report", "final_report payload was invalid. Re-emit a final_report with required fields (conclusive, attempted, evidence_known, most_likely_cause).")
+			if !l.appendCorrection("invalid_final_report", "final_report payload was invalid. Re-emit a final_report with required fields. Conclusive reports require attempted, evidence_known, most_likely_cause, and conclusion. Inconclusive reports require attempted, most_likely_cause, and at least one of evidence_known, evidence_missing, or blockers.") {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "final_report 형식 오류가 반복되어 진단을 중단합니다.")
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return nil, true
+			}
 			l.pendingCalls = nil
 			l.currIteration++
 			l.state = StateRunning
@@ -100,10 +106,16 @@ func finalReportFromFunctionCall(call gollm.FunctionCall) (finalReport, bool) {
 	if err := json.Unmarshal(raw, &report); err != nil {
 		return finalReport{}, false
 	}
-	if len(report.Attempted) == 0 || len(report.EvidenceKnown) == 0 || strings.TrimSpace(report.MostLikelyCause) == "" {
+	if len(report.Attempted) == 0 || strings.TrimSpace(report.MostLikelyCause) == "" {
 		return finalReport{}, false
 	}
-	if report.Conclusive && strings.TrimSpace(report.Conclusion) == "" {
+	if report.Conclusive {
+		if len(report.EvidenceKnown) == 0 || strings.TrimSpace(report.Conclusion) == "" {
+			return finalReport{}, false
+		}
+		return report, true
+	}
+	if len(report.EvidenceKnown) == 0 && len(report.EvidenceMissing) == 0 && len(report.Blockers) == 0 {
 		return finalReport{}, false
 	}
 	return report, true
@@ -169,5 +181,14 @@ func (l *Loop) requestNextDirectionsFromModel(report finalReport) {
 	b.WriteString("- For kind=another_guide: include `resource_family` and `problem_focus` so the runtime can request a refined resource-guide lookup.\n")
 	b.WriteString("- For kind=different_approach: include `instruction`, a short directive describing the alternative diagnostic angle (e.g., switch to logs of a related controller, ask the user for workload kubeconfig).\n")
 	b.WriteString("Keep options distinct. Do not repeat ideas already exhausted in the previous attempts.")
-	l.currChatContent = append(l.currChatContent, b.String())
+	l.queueResponseDirective(b.String())
+}
+
+func (l *Loop) queueResponseDirective(directive string) {
+	directive = strings.TrimSpace(directive)
+	if directive == "" {
+		return
+	}
+	l.pendingResponseDirective = directive
+	l.currChatContent = append(l.currChatContent, directive)
 }

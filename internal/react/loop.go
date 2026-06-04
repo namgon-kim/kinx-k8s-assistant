@@ -87,22 +87,33 @@ type Loop struct {
 	resourceGuideEvidence  []string
 	resourceGuideQueries   map[string]struct{}
 
-	guideStepState         *guideStepState
-	finalReportRequested   bool
-	pendingFinalReport     *finalReport
-	pendingNextDirections  *nextDirections
-	pendingDirectionPrompt *directionPromptState
+	guideStepState           *guideStepState
+	finalReportRequested     bool
+	pendingResponseDirective string
+	pendingFinalReport       *finalReport
+	pendingNextDirections    *nextDirections
+	pendingDirectionPrompt   *directionPromptState
 
 	cancel context.CancelFunc
 	once   sync.Once
 }
 
 type guideStepState struct {
-	GuideID          string
-	Title            string
-	TotalSteps       int
-	StepDescriptions []string
-	Completed        map[int]bool
+	GuideID      string
+	Title        string
+	TotalSteps   int
+	StepFilePath string
+	StepHash     string
+	StepDetails  []guideStepDetail
+	Completed    map[int]bool
+}
+
+type guideStepDetail struct {
+	Index           int      `json:"index"`
+	Description     string   `json:"description,omitempty"`
+	CommandTemplate string   `json:"command_template,omitempty"`
+	ExpectedOutcome string   `json:"expected_outcome,omitempty"`
+	Preconditions   []string `json:"preconditions,omitempty"`
 }
 
 func (g *guideStepState) allCompleted() bool {
@@ -134,10 +145,10 @@ func (g *guideStepState) remainingSteps() []int {
 // were rendered to the user, so the user's choice index can be mapped back to
 // a concrete continuation action.
 type directionPromptState struct {
-	Options       []nextDirectionOption
-	HasFreeInput  bool
-	FreeInputIdx  int
-	FinalizeIdx   int
+	Options      []nextDirectionOption
+	HasFreeInput bool
+	FreeInputIdx int
+	FinalizeIdx  int
 }
 
 func New(cfg *config.Config) (*Loop, error) {
@@ -396,6 +407,7 @@ func (l *Loop) startQuery(query string) error {
 	l.resourceGuideQueries = nil
 	l.guideStepState = nil
 	l.finalReportRequested = false
+	l.pendingResponseDirective = ""
 	l.pendingFinalReport = nil
 	l.pendingNextDirections = nil
 	l.pendingDirectionPrompt = nil
@@ -484,6 +496,7 @@ func (l *Loop) clearConversationState() {
 	l.resourceGuideQueries = nil
 	l.guideStepState = nil
 	l.finalReportRequested = false
+	l.pendingResponseDirective = ""
 	l.pendingFinalReport = nil
 	l.pendingNextDirections = nil
 	l.pendingDirectionPrompt = nil
@@ -571,6 +584,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 	l.noteContextContent(sentContent...)
 	l.currChatContent = nil
+	l.pendingResponseDirective = ""
 
 	if len(functionCalls) == 0 {
 		if l.requirementAnalysis == nil && strings.TrimSpace(streamedText) != "" {
@@ -893,12 +907,20 @@ func extractShellScript(command string) (string, bool) {
 	}
 	for i := 1; i < len(fields)-1; i++ {
 		field := strings.TrimSpace(fields[i])
-		if field == "-c" || (strings.HasPrefix(field, "-") && strings.Contains(field, "c")) {
+		if field == "-c" || isShellShortFlagWithC(field) {
 			script := strings.TrimSpace(fields[i+1])
 			return script, script != ""
 		}
 	}
 	return "", false
+}
+
+func isShellShortFlagWithC(field string) bool {
+	field = strings.TrimSpace(field)
+	return strings.HasPrefix(field, "-") &&
+		!strings.HasPrefix(field, "--") &&
+		len(field) > 2 &&
+		strings.Contains(field[1:], "c")
 }
 
 func isShellBinary(value string) bool {
@@ -912,7 +934,7 @@ func isReadOnlyKubectlPipeline(command string) bool {
 		return false
 	}
 	for _, segment := range segments {
-		if containsMutatingKubectlVerb(segment) {
+		if containsShellRedirection(segment) || containsMutatingKubectlVerb(segment) {
 			return false
 		}
 	}
@@ -932,6 +954,35 @@ func isReadOnlyKubectlPipeline(command string) bool {
 		}
 	}
 	return true
+}
+
+func containsShellRedirection(command string) bool {
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for i := 0; i < len(command); i++ {
+		ch := command[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && !inSingle {
+			escaped = true
+			continue
+		}
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if !inSingle && !inDouble && (ch == '>' || ch == '<') {
+			return true
+		}
+	}
+	return false
 }
 
 func splitShellCommandList(command string) []string {
@@ -1192,7 +1243,13 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 		descriptions = append(descriptions, "리소스 변경 명령")
 	}
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "read-only 모드가 활성화되어 리소스 변경 명령을 차단했습니다:\n* "+strings.Join(descriptions, "\n* "))
-	l.appendCorrection("readonly_mutation_blocked", "Read-only mode blocked the proposed mutation. Do not repeat the same action or restate the same recommendation in another loop. Your next response must be a single final answer with the cause, evidence, and one manual recommendation.")
+	if !l.appendCorrection("readonly_mutation_blocked", "Read-only mode blocked the proposed mutation. Do not repeat the same action or restate the same recommendation in another loop. Your next response must be a single final answer with the cause, evidence, and one manual recommendation.") {
+		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "read-only 차단 correction이 반복되어 진단을 중단합니다.")
+		l.pendingCalls = nil
+		l.currIteration = 0
+		l.state = StateDone
+		return
+	}
 	l.pendingCalls = nil
 	l.currIteration++
 	l.state = StateRunning
@@ -1227,8 +1284,8 @@ func (l *Loop) handleApproval(ctx context.Context, choice int) error {
 			return err
 		}
 	case 3:
-		if len(l.pendingCalls) > 0 {
-			l.appendToolObservation(l.pendingCalls[0], map[string]any{
+		for _, call := range l.pendingCalls {
+			l.appendToolObservation(call, map[string]any{
 				"error":     "User declined to run this operation.",
 				"status":    "declined",
 				"retryable": false,
@@ -1311,14 +1368,35 @@ func (l *Loop) recordAction(call PendingCall, result map[string]any) {
 	if len(l.completedActions) > 12 {
 		l.completedActions = l.completedActions[len(l.completedActions)-12:]
 	}
-	if step, ok := guideStepCompletedFromFunctionCall(call.FunctionCall); ok {
-		l.markGuideStepCompleted(step)
+	if guideProgressObservationUseful(result) {
+		if step, ok := guideStepCompletedFromFunctionCall(call.FunctionCall); ok {
+			l.markGuideStepCompleted(step)
+		}
+	}
+}
+
+func guideProgressObservationUseful(result map[string]any) bool {
+	if result == nil {
+		return false
+	}
+	if err, ok := result["error"].(string); ok && strings.TrimSpace(err) != "" {
+		return false
+	}
+	status, _ := result["status"].(string)
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "blocked", "declined", "failed", "failure", "error":
+		return false
+	default:
+		return true
 	}
 }
 
 func guideStepCompletedFromFunctionCall(call gollm.FunctionCall) (int, bool) {
 	raw, ok := call.Arguments["guide_progress"].(map[string]any)
 	if !ok {
+		return 0, false
+	}
+	if useful, ok := raw["evidence_useful"].(bool); ok && !useful {
 		return 0, false
 	}
 	value, ok := raw["step_completed"]

@@ -78,8 +78,8 @@ If the runtime instructs you to emit a `final_report` (all guide diagnostic step
         "conclusive": "true when the evidence is sufficient to answer original_query; otherwise false.",
         "conclusion": "Concise grounded answer when conclusive=true. Omit when conclusive=false.",
         "attempted": ["Short bullets summarizing the diagnostic steps actually run."],
-        "evidence_known": ["Facts directly observed from tool output."],
-        "evidence_missing": ["Facts that would have helped but were not obtainable. Use only when conclusive=false."],
+        "evidence_known": ["Facts directly observed from tool output. Required when conclusive=true."],
+        "evidence_missing": ["Facts that would have helped but were not obtainable. For conclusive=false include this or blockers when evidence_known is empty."],
         "most_likely_cause": "Best-guess cause given partial evidence, or the literal string \"inconclusive\".",
         "recommended_user_actions": ["Concrete next steps the user can run outside this session. Optional."],
         "blockers": ["Hard constraints that prevented full diagnosis, e.g. \"workload kubeconfig not available in this session\". Optional."]

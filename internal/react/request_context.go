@@ -344,21 +344,50 @@ func (l *Loop) guideStepAnchor() string {
 		fmt.Fprintf(&b, "guide_title: %s\n", state.Title)
 	}
 	fmt.Fprintf(&b, "steps_completed: %d / %d\n", completed, state.TotalSteps)
-	if len(state.StepDescriptions) > 0 {
-		b.WriteString("steps:\n")
-		for i, desc := range state.StepDescriptions {
-			marker := "[ ]"
-			if state.Completed[i+1] {
-				marker = "[x]"
-			}
-			fmt.Fprintf(&b, "  %s %d. %s\n", marker, i+1, desc)
+	if state.StepFilePath != "" {
+		fmt.Fprintf(&b, "step_store: %s\n", state.StepFilePath)
+	}
+	if state.StepHash != "" {
+		fmt.Fprintf(&b, "step_store_hash: %s\n", state.StepHash)
+	}
+	if remaining := state.remainingSteps(); len(remaining) > 0 {
+		fmt.Fprintf(&b, "remaining_step_indices: %s\n", formatStepIndices(remaining))
+		next := state.stepDetail(remaining[0])
+		fmt.Fprintf(&b, "next_step_index: %d\n", remaining[0])
+		if next.Description != "" {
+			fmt.Fprintf(&b, "next_step_description: %s\n", next.Description)
+		}
+		if next.CommandTemplate != "" {
+			fmt.Fprintf(&b, "next_step_command_template: %s\n", next.CommandTemplate)
+		}
+		if next.ExpectedOutcome != "" {
+			fmt.Fprintf(&b, "next_step_expected_outcome: %s\n", next.ExpectedOutcome)
+		}
+		if len(next.Preconditions) > 0 {
+			fmt.Fprintf(&b, "next_step_preconditions: %s\n", strings.Join(next.Preconditions, " | "))
 		}
 	}
 	b.WriteString("Rules:\n")
 	b.WriteString("- For each action, set `guide_progress.step_completed` to the 1-based step index this action advances, and `guide_progress.evidence_useful` to whether the observation moved diagnosis forward.\n")
-	b.WriteString("- Do not skip ahead by collapsing several steps into one command unless the guide template combined them.\n")
+	b.WriteString("- Follow the next_step unless live evidence makes it redundant; if skipping, explain why and mark only the step that was actually advanced.\n")
+	b.WriteString("- The full diagnostic step list is stored in step_store for runtime bookkeeping; do not invent step indices outside remaining_step_indices.\n")
 	b.WriteString("- When every step is completed (or further steps are clearly redundant for the live evidence), emit `final_report` instead of another `action`.\n")
 	return b.String()
+}
+
+func (g *guideStepState) stepDetail(index int) guideStepDetail {
+	if g == nil || index <= 0 || index > len(g.StepDetails) {
+		return guideStepDetail{}
+	}
+	return g.StepDetails[index-1]
+}
+
+func formatStepIndices(indices []int) string {
+	var parts []string
+	for _, index := range indices {
+		parts = append(parts, fmt.Sprintf("%d", index))
+	}
+	return strings.Join(parts, ",")
 }
 
 // requirementAnalysisAnchor returns a short authoritative restatement of the

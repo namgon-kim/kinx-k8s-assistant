@@ -202,6 +202,36 @@ func TestAnalyzeToolCallsAllowsReadOnlyBashCCommandThroughKubectlToolName(t *tes
 	}
 }
 
+func TestAnalyzeToolCallsBlocksReadOnlyBashCRedirection(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "bash",
+		Arguments: map[string]any{
+			"command": `bash -c "kubectl get secret app -o yaml > /tmp/leak.yaml"`,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("unexpected pending count: %d", len(pending))
+	}
+	if pending[0].ModifiesResource == "no" {
+		t.Fatalf("expected bash -c redirection to be blocked, got %q", pending[0].ModifiesResource)
+	}
+}
+
+func TestExtractShellScriptDoesNotTreatLongFlagAsDashC(t *testing.T) {
+	if script, ok := extractShellScript(`bash --rcfile "kubectl get pods"`); ok {
+		t.Fatalf("did not expect --rcfile to be treated as -c, got %q", script)
+	}
+}
+
 func TestAnalyzeToolCallsBlocksMutatingBashCCommand(t *testing.T) {
 	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
 	if err != nil {

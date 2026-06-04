@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 )
@@ -234,7 +235,11 @@ func (l *Loop) compactBeforeNextIteration(nextInstruction string) {
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "context compact failed: "+err.Error())
 		return
 	}
+	if l.pendingResponseDirective != "" {
+		nextInstruction = "Continue from compacted state and follow the pending runtime directive below."
+	}
 	l.currChatContent = []any{l.compactedStateMessage(nextInstruction)}
+	l.appendPendingResponseDirectiveAfterCompaction()
 	l.contextBlockHashes = nil
 	l.lastCompactedActionSeq = l.actionSeq
 	after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
@@ -254,12 +259,24 @@ func (l *Loop) compactAfterContextLengthError(err error) bool {
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "context compact failed: "+resetErr.Error())
 		return false
 	}
-	l.currChatContent = []any{l.compactedStateMessage("The previous LLM request exceeded the provider context limit. Continue from this compacted state. Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it.")}
+	nextInstruction := "The previous LLM request exceeded the provider context limit. Continue from this compacted state. Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it."
+	if l.pendingResponseDirective != "" {
+		nextInstruction = "The previous LLM request exceeded the provider context limit. Continue from this compacted state and follow the pending runtime directive below."
+	}
+	l.currChatContent = []any{l.compactedStateMessage(nextInstruction)}
+	l.appendPendingResponseDirectiveAfterCompaction()
 	l.contextBlockHashes = nil
 	l.lastCompactedActionSeq = l.actionSeq
 	after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("✓ context compacted after context-length error: estimated context %d/%d tokens; retrying now.", after, limit))
 	return true
+}
+
+func (l *Loop) appendPendingResponseDirectiveAfterCompaction() {
+	if strings.TrimSpace(l.pendingResponseDirective) == "" {
+		return
+	}
+	l.currChatContent = append(l.currChatContent, "Pending runtime directive for the next model response:\n"+l.pendingResponseDirective)
 }
 
 func (l *Loop) appendGuideObservation(ref guideRef, content string) {
@@ -315,8 +332,8 @@ func compactObservationString(value string) any {
 	const headChars = 10000
 	const tailChars = 4000
 	return map[string]any{
-		"content_head": value[:headChars],
-		"content_tail": value[len(value)-tailChars:],
+		"content_head": safeStringHead(value, headChars),
+		"content_tail": safeStringTail(value, tailChars),
 		"content_hash": contextHash(value),
 		"original_len": len(value),
 		"truncated":    true,
@@ -331,12 +348,46 @@ func compactStateText(value string) any {
 	const headChars = 5000
 	const tailChars = 2000
 	return map[string]any{
-		"content_head": value[:headChars],
-		"content_tail": value[len(value)-tailChars:],
+		"content_head": safeStringHead(value, headChars),
+		"content_tail": safeStringTail(value, tailChars),
 		"content_hash": contextHash(value),
 		"original_len": len(value),
 		"truncated":    true,
 	}
+}
+
+func safeStringHead(value string, maxBytes int) string {
+	if maxBytes <= 0 || value == "" {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	if end == 0 {
+		return ""
+	}
+	return value[:end]
+}
+
+func safeStringTail(value string, maxBytes int) string {
+	if maxBytes <= 0 || value == "" {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	start := len(value) - maxBytes
+	for start < len(value) && !utf8.RuneStart(value[start]) {
+		start++
+	}
+	if start >= len(value) {
+		return ""
+	}
+	return value[start:]
 }
 
 func extractObservationClues(result map[string]any) []string {

@@ -2,7 +2,10 @@ package react
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,20 +22,38 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 		}
 		request, ok := resourceGuideLookupFromFunctionCall(call)
 		if !ok {
-			l.appendCorrectionWithCompaction("invalid_resource_guide_lookup", "Resource guide lookup request was invalid. Continue with the next safest kubectl diagnostic.")
+			if !l.appendCorrectionWithCompaction("invalid_resource_guide_lookup", "Resource guide lookup request was invalid. Continue with the next safest kubectl diagnostic.") {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "resource_guide_lookup 형식 오류가 반복되어 진단을 중단합니다.")
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return true
+			}
 			l.currIteration++
 			l.state = StateRunning
 			return true
 		}
 		if l.resourceClassification == nil || l.resourceClassification.Kind != resourceClassificationCRD {
-			l.appendCorrectionWithCompaction("resource_guide_without_confirmed_crd", "Resource guide lookup is only available after runtime discovery confirms the primary target is a CRD. Continue with the next safest kubectl diagnostic and do not infer a CRD or Cluster API family from the name alone.")
+			if !l.appendCorrectionWithCompaction("resource_guide_without_confirmed_crd", "Resource guide lookup is only available after runtime discovery confirms the primary target is a CRD. Continue with the next safest kubectl diagnostic and do not infer a CRD or Cluster API family from the name alone.") {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "확인되지 않은 CRD resource_guide_lookup 요청이 반복되어 진단을 중단합니다.")
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return true
+			}
 			l.currIteration++
 			l.state = StateRunning
 			return true
 		}
 		query := l.resourceGuideRefinementQuery(request)
 		if l.resourceGuideQueryAlreadyUsed(query) {
-			l.appendCorrectionWithCompaction("duplicate_resource_guide_lookup", "That refined resource-guide lookup was already performed for the same problem focus and evidence. Do not repeat it; choose the next kubectl diagnostic or answer from the evidence.")
+			if !l.appendCorrectionWithCompaction("duplicate_resource_guide_lookup", "That refined resource-guide lookup was already performed for the same problem focus and evidence. Do not repeat it; choose the next kubectl diagnostic or answer from the evidence.") {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "중복 resource_guide_lookup 요청이 반복되어 진단을 중단합니다.")
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return true
+			}
 			l.currIteration++
 			l.state = StateRunning
 			return true
@@ -60,10 +81,10 @@ func (l *Loop) interceptCustomResourceFunctionCalls(ctx context.Context, calls [
 			continue
 		}
 		classification := l.classifyResourceByDiscovery(ctx, resource)
-		l.resourceClassification = &classification
 		if classification.Kind != resourceClassificationCRD {
 			continue
 		}
+		l.resourceClassification = &classification
 		l.resourceGuideEvidence = append(l.resourceGuideEvidence, command)
 		l.initialGuideAttempted = true
 		l.searchAndInjectResourceGuide(ctx, resource, l.resourceGuideQuery(resource))
@@ -112,8 +133,9 @@ func (l *Loop) markResourceGuideQuery(query string) {
 
 func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.GuideSearchResult) {
 	l.resourceGuideInjected = true
-	l.guideStepState = buildGuideStepState(found)
+	l.guideStepState = l.buildGuideStepState(found)
 	l.finalReportRequested = false
+	l.pendingResponseDirective = ""
 	includeClusterAPI := guideResultImpliesClusterAPI(found)
 	l.promptOptions = l.newPromptOptions(l.requestIntent, true, includeClusterAPI)
 	if l.shouldCompactForStateRewrite() {
@@ -131,6 +153,12 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 		after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("✓ context compacted: CRD guide context injected for %s. estimated context %d/%d tokens.", resource, after, limit))
 	} else {
+		if err := l.resetChatSessionPreservingCurrentContent(); err != nil {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+			l.pendingCalls = nil
+			l.state = StateDone
+			return
+		}
 		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
 		klog.Infof("resource guide injected for CRD %s without context compact", resource)
 	}
@@ -143,6 +171,7 @@ func (l *Loop) injectResourceGuideUnavailable(resource, reason string) {
 	l.resourceGuideInjected = true
 	l.guideStepState = nil
 	l.finalReportRequested = false
+	l.pendingResponseDirective = ""
 	l.promptOptions = l.newPromptOptions(l.requestIntent, true, false)
 	content := formatResourceGuideUnavailableObservation(resource, reason)
 	if l.shouldCompactForStateRewrite() {
@@ -160,12 +189,29 @@ func (l *Loop) injectResourceGuideUnavailable(resource, reason string) {
 		after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("✓ context compacted: unavailable CRD guide context recorded for %s. estimated context %d/%d tokens.", resource, after, limit))
 	} else {
+		if err := l.resetChatSessionPreservingCurrentContent(); err != nil {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+			l.pendingCalls = nil
+			l.state = StateDone
+			return
+		}
 		l.appendGuideObservation(guideRef{GuideID: "unavailable:" + resource + ":" + reason, Hash: contextHash(content)}, content)
 		klog.Infof("resource guide unavailable for CRD %s (%s); continuing without context compact", resource, reason)
 	}
 	l.pendingCalls = nil
 	l.currIteration++
 	l.state = StateRunning
+}
+
+func (l *Loop) resetChatSessionPreservingCurrentContent() error {
+	current := append([]any(nil), l.currChatContent...)
+	hashes := l.contextBlockHashes
+	if err := l.resetChatSession(); err != nil {
+		return err
+	}
+	l.currChatContent = current
+	l.contextBlockHashes = hashes
+	return nil
 }
 
 func (l *Loop) resourceGuideQuery(resource string) string {
@@ -247,23 +293,7 @@ func formatResourceGuideObservation(resource string, found *guidance.GuideSearch
 			fmt.Fprintf(&b, "  metadata cues to inspect: %s\n", strings.Join(cues, ", "))
 		}
 		if len(c.DiagnosticSteps) > 0 {
-			b.WriteString("  diagnostic steps; preserve label selectors, annotations, and command templates exactly when applicable:\n")
-			for j, step := range c.DiagnosticSteps {
-				if j >= 5 {
-					break
-				}
-				fmt.Fprintf(&b, "    %d. %s", j+1, step.Description)
-				if step.CommandTemplate != "" {
-					fmt.Fprintf(&b, " -> %s", step.CommandTemplate)
-				}
-				if step.ExpectedOutcome != "" {
-					fmt.Fprintf(&b, " ; expected: %s", step.ExpectedOutcome)
-				}
-				if len(step.Preconditions) > 0 {
-					fmt.Fprintf(&b, " ; preconditions: %s", strings.Join(step.Preconditions, " | "))
-				}
-				b.WriteString("\n")
-			}
+			fmt.Fprintf(&b, "  diagnostic steps: %d steps are tracked by the runtime; follow the per-iteration guide_step anchor for the current step detail.\n", len(c.DiagnosticSteps))
 		}
 		if summary := firstNonEmptyGuideText(c.Resolution, c.Cause); summary != "" {
 			fmt.Fprintf(&b, "  summary: %s\n", summary)
@@ -395,7 +425,7 @@ func firstNonEmptyGuideText(values ...string) string {
 // buildGuideStepState extracts the minimal step bookkeeping the loop needs to
 // track the model's progress through the guide's diagnostic_steps. Only the
 // top guide case is used because the runtime injects one case at a time.
-func buildGuideStepState(found *guidance.GuideSearchResult) *guideStepState {
+func (l *Loop) buildGuideStepState(found *guidance.GuideSearchResult) *guideStepState {
 	if found == nil || len(found.Cases) == 0 {
 		return nil
 	}
@@ -409,12 +439,44 @@ func buildGuideStepState(found *guidance.GuideSearchResult) *guideStepState {
 		TotalSteps: len(c.DiagnosticSteps),
 		Completed:  map[int]bool{},
 	}
-	for _, step := range c.DiagnosticSteps {
+	for i, step := range c.DiagnosticSteps {
 		desc := strings.TrimSpace(step.Description)
 		if desc == "" {
 			desc = strings.TrimSpace(step.CommandTemplate)
 		}
-		state.StepDescriptions = append(state.StepDescriptions, desc)
+		state.StepDetails = append(state.StepDetails, guideStepDetail{
+			Index:           i + 1,
+			Description:     desc,
+			CommandTemplate: strings.TrimSpace(step.CommandTemplate),
+			ExpectedOutcome: strings.TrimSpace(step.ExpectedOutcome),
+			Preconditions:   append([]string(nil), step.Preconditions...),
+		})
 	}
+	l.persistGuideStepDetails(state)
 	return state
+}
+
+func (l *Loop) persistGuideStepDetails(state *guideStepState) {
+	if state == nil || l.workDir == "" || len(state.StepDetails) == 0 {
+		return
+	}
+	data, err := json.MarshalIndent(map[string]any{
+		"guide_id": state.GuideID,
+		"title":    state.Title,
+		"steps":    state.StepDetails,
+	}, "", "  ")
+	if err != nil {
+		return
+	}
+	state.StepHash = contextHash(string(data))
+	dir := filepath.Join(l.workDir, "guides")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	name := strings.TrimPrefix(state.StepHash, "sha256:")
+	path := filepath.Join(dir, "guide-steps-"+name+".json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return
+	}
+	state.StepFilePath = path
 }

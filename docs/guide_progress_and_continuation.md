@@ -29,7 +29,7 @@ The anchor explicitly tells the model:
 
 ### guide_step anchor (L2)
 
-Re-emits a compact checklist representation of the active resource guide. The full guide body is still injected only once via `appendGuideObservation`; the anchor is the lightweight per-iteration reminder.
+Re-emits a compact progress representation of the active resource guide. The full guide body is still injected only once via `appendGuideObservation`. The complete diagnostic step list is persisted in a workspace-local temporary step store; each iteration carries only the progress counters and the next step detail needed for the current action.
 
 Format (rendered each iteration):
 
@@ -38,17 +38,21 @@ Active resource-guide progress. Continue following this guide unless final_repor
 guide_id: <id>
 guide_title: <title>
 steps_completed: <done> / <total>
-steps:
-  [x] 1. Inspect top-level cluster resources
-  [x] 2. Inspect controller-created child resources
-  [ ] 3. Inspect Cluster conditions and synchronization annotations
+step_store: <workdir>/guides/guide-steps-<hash>.json
+step_store_hash: sha256:<hash>
+remaining_step_indices: 3,4,5
+next_step_index: 3
+next_step_description: Inspect Cluster conditions and synchronization annotations
+next_step_command_template: kubectl -n <ns> get cluster <name> -o yaml
+next_step_expected_outcome: Conditions identify the reconciliation blocker
 Rules:
 - For each action, set guide_progress.step_completed to the 1-based step index this action advances, and guide_progress.evidence_useful to whether the observation moved diagnosis forward.
-- Do not skip ahead by collapsing several steps into one command unless the guide template combined them.
+- Follow next_step unless live evidence makes it redundant; if skipping, explain why and mark only the step that was actually advanced.
+- Do not invent step indices outside remaining_step_indices.
 - When every step is completed (or further steps are clearly redundant for the live evidence), emit final_report instead of another action.
 ```
 
-`guideStepState` is built from `GuideCase.DiagnosticSteps` at the moment the guide is injected. Only the top case is tracked because the runtime injects one case at a time.
+`guideStepState` is built from `GuideCase.DiagnosticSteps` at the moment the guide is injected. Only the top case is tracked because the runtime injects one case at a time. The runtime stores the full diagnostic step payload in `step_store` for bookkeeping, but the model does not need the full list in every iteration.
 
 ## Output schema additions
 
@@ -78,7 +82,7 @@ Self-reported guide progress for the action that the model is emitting.
 | `step_completed` | 1-based index of the guide step this action advances. Omit when no guide is active. |
 | `evidence_useful` | True when the previous observation moved diagnosis forward. Omit when no guide is active. |
 
-When this field is present, `recordAction` calls `markGuideStepCompleted(step)`. When `guideStepState.allCompleted()` becomes true, `dispatchToolCalls` calls `requestFinalReportFromModel()` exactly once.
+When this field is present and the tool observation is useful, `recordAction` calls `markGuideStepCompleted(step)`. Observations with explicit errors or statuses such as `blocked`, `declined`, `failed`, or `error` do not complete guide steps. When `guideStepState.allCompleted()` becomes true, `dispatchToolCalls` calls `requestFinalReportFromModel()` exactly once.
 
 ### `final_report`
 
@@ -91,8 +95,8 @@ The runtime instructs the model to emit this when all diagnostic_steps are compl
     "conclusive": true,
     "conclusion": "Grounded answer when conclusive=true. Omit when false.",
     "attempted": ["short bullets summarizing the diagnostic steps actually run"],
-    "evidence_known": ["facts directly observed from tool output"],
-    "evidence_missing": ["facts that would have helped but were not obtainable; only when conclusive=false"],
+    "evidence_known": ["facts directly observed from tool output; required when conclusive=true"],
+    "evidence_missing": ["facts that would have helped but were not obtainable; use with blockers when conclusive=false and evidence_known is empty"],
     "most_likely_cause": "best-guess cause given partial evidence, or the literal string \"inconclusive\"",
     "recommended_user_actions": ["concrete next steps the user can run outside this session (optional)"],
     "blockers": ["hard constraints that prevented full diagnosis (optional)"]
@@ -204,7 +208,7 @@ New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirec
 |---|---|
 | `internal/react/loop.go` | State enum, `guideStepState`, anchor wiring (`buildIterationSendContent`), guide step completion bookkeeping. |
 | `internal/react/request_context.go` | `requirementAnalysisAnchor()`, `guideStepAnchor()`. |
-| `internal/react/resource_guidance.go` | `buildGuideStepState` builds the checklist from `GuideCase.DiagnosticSteps` when the guide is injected. |
+| `internal/react/resource_guidance.go` | `buildGuideStepState` builds the guide progress state from `GuideCase.DiagnosticSteps` and persists the full step details to `step_store` when the guide is injected. |
 | `internal/react/final_report.go` | `requestFinalReportFromModel`, `consumeFinalReport`, `renderFinalReport`, `requestNextDirectionsFromModel`. |
 | `internal/react/next_directions.go` | `consumeNextDirections`, `promptDirectionChoice`, `waitForDirectionChoice`, `waitForDirectionText`, `applyDirectionOption`. |
 | `internal/react/shim.go` | New top-level shim fields: `action.guide_progress`, `final_report`, `next_directions`. |
@@ -221,4 +225,4 @@ New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirec
 - `guideStepState` is non-nil only between `injectResourceGuideAttempt` (or `applyDirectionOption(another_guide)`) and a successful `final_report` or `startQuery`/`clearConversationState`.
 - `finalReportRequested` is set when `requestFinalReportFromModel` queues its instruction. It prevents duplicate instruction text from being re-appended on every dispatch. It is cleared on `applyDirectionOption`, `startQuery`, `clearConversationState`, and at every `injectResourceGuide*` entry.
 - `pendingDirectionPrompt` is non-nil only while in `StateWaitingDirectionChoice`. The user's `Choice` index is mapped back to a concrete `nextDirectionOption` (or the synthetic finalize / free-input rows) using `FreeInputIdx` and `FinalizeIdx`.
-- `action.guide_progress.step_completed` is the model's self-report, not enforced by command matching. Misreported indices are accepted (the worst case is premature `final_report` instruction or a step staying open).
+- `action.guide_progress.step_completed` is the model's self-report, not enforced by command matching. It is ignored when the corresponding observation is blocked, declined, failed, or errored. Misreported indices on successful observations are accepted (the worst case is premature `final_report` instruction or a step staying open).

@@ -511,6 +511,20 @@ func TestFinalReportRequiresDocumentedFields(t *testing.T) {
 	if !ok || !report.Conclusive {
 		t.Fatalf("expected valid conclusive final report, got ok=%v report=%#v", ok, report)
 	}
+
+	report, ok = finalReportFromFunctionCall(gollm.FunctionCall{
+		Name: internalFinalReportCall,
+		Arguments: map[string]any{
+			"conclusive":        false,
+			"attempted":         []any{"checked cluster"},
+			"evidence_missing":  []any{"workload kubeconfig was not available"},
+			"blockers":          []any{"RBAC denied node inspection"},
+			"most_likely_cause": "inconclusive",
+		},
+	})
+	if !ok || report.Conclusive {
+		t.Fatalf("expected valid inconclusive final report, got ok=%v report=%#v", ok, report)
+	}
 }
 
 func TestNextDirectionsKeepsAtMostThreeValidOptions(t *testing.T) {
@@ -530,6 +544,34 @@ func TestNextDirectionsKeepsAtMostThreeValidOptions(t *testing.T) {
 	}
 	if len(got.Options) != 3 {
 		t.Fatalf("expected only three options, got %#v", got.Options)
+	}
+}
+
+func TestGuideProgressObservationUsefulRejectsBlockedResults(t *testing.T) {
+	blocked := map[string]any{"status": "blocked", "error": "read-only mode is enabled"}
+	if guideProgressObservationUseful(blocked) {
+		t.Fatal("blocked observation must not complete guide progress")
+	}
+	declined := map[string]any{"status": "declined"}
+	if guideProgressObservationUseful(declined) {
+		t.Fatal("declined observation must not complete guide progress")
+	}
+	success := map[string]any{"status": "ok", "items": []any{}}
+	if !guideProgressObservationUseful(success) {
+		t.Fatal("successful observation should be allowed to complete guide progress")
+	}
+}
+
+func TestGuideStepCompletedRejectsEvidenceNotUseful(t *testing.T) {
+	if _, ok := guideStepCompletedFromFunctionCall(gollm.FunctionCall{
+		Arguments: map[string]any{
+			"guide_progress": map[string]any{
+				"step_completed":  1,
+				"evidence_useful": false,
+			},
+		},
+	}); ok {
+		t.Fatal("guide_progress with evidence_useful=false must not complete a step")
 	}
 }
 
