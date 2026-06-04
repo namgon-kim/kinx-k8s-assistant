@@ -193,16 +193,55 @@ guidance는 별도 서버를 실행하지 않습니다. k8s-assistant가 custom 
 
 ### CRD-first resource guide 조회
 
-k8s-assistant는 LLM이 리소스 이름만 보고 custom resource 여부를 맞히는 것에 의존하지 않습니다.
+k8s-assistant는 LLM이 리소스 이름만 보고 custom resource 여부를 맞히는 것에 의존하지 않습니다. 사용자 요청은 먼저 별도 requirement-analysis 단계에서 자연어 대상과 Kubernetes 리소스 후보를 분리합니다. 대상은 리소스가 아닐 수도 있으므로, "이 클러스터의 문제를 해결해줘" 같은 요청은 구체적인 Kubernetes `Cluster` 오브젝트가 명시되지 않은 한 현재 접속한 클러스터 환경으로 분류합니다.
 
-1. 사용자 요청에서 primary target과 namespace scope를 분리합니다.
-2. 런타임이 Kubernetes discovery로 해당 리소스가 built-in인지 CRD인지 확인합니다.
-3. CRD로 확인된 경우에만 resource guide/RAG를 조회합니다.
-4. guide 결과에 근거가 있을 때만 해당 CRD family 전용 주의사항을 조건부로 주입합니다.
+1. 첫 LLM 응답은 `requirement_analysis`만 반환합니다.
+2. `target.category`, `scope.type`, `resource_candidates`, `request_type`, `action`으로 요청을 분류합니다.
+3. requirement-analysis 값 정의표는 `docs/requirement_analysis.md`를 기준으로 합니다.
+4. 예전 target 값 대신 새 `target.category`와 `resource_candidates` 계약만 사용합니다.
+5. `target.category`와 `scope.type`은 권장값을 우선 쓰되, 자연어 표현을 막지 않도록 런타임 enum으로 강제하지 않습니다.
+6. `resource_candidates`가 비어 있으면 Kubernetes 리소스 컨텍스트와 CRD resource guide/RAG 조회를 만들지 않습니다.
+7. primary Kubernetes 리소스 후보가 있을 때만 런타임이 discovery로 built-in/CRD 여부를 확인합니다.
+8. CRD로 확인된 경우에만 resource guide/RAG를 조회합니다.
+9. guide 결과에 근거가 있을 때만 해당 CRD family 전용 주의사항을 조건부로 주입합니다.
+10. resource guide/RAG 조회가 불가능하거나 결과가 없으면 guide를 가정하지 않고 일반 kubectl 증거 수집과 LLM 판단으로 진행합니다.
 
 guide가 제공한 label selector, annotation, command template은 진단 컨텍스트에서 보존됩니다. Cluster API 계열 guide가 주입된 경우, 관리 클러스터의 `kubectl get node` 결과를 workload cluster node 등록/건강/providerID 판단 근거로 사용하지 않습니다. workload cluster node를 확인하려면 먼저 해당 workload cluster kubeconfig/context임을 확인해야 합니다.
 
-ReAct action target 검증은 comma-separated resource와 CRD plural/singular 차이를 허용합니다. 예를 들어 `machinedeployment,tenantcontrolplane` 또는 `machine`/`machines` 형태가 같은 명령 안에서 일관되게 쓰이면 불필요하게 correction loop를 만들지 않습니다. 동일한 target correction이 반복되면 같은 LLM 재시도를 계속하지 않고 루프를 중단해 오류를 노출합니다.
+ReAct action target 검증은 comma-separated resource와 CRD plural/singular 차이를 허용합니다. 예를 들어 `machinedeployment,tenantcontrolplane` 또는 `machine`/`machines` 형태가 같은 명령 안에서 일관되게 쓰이면 불필요하게 correction loop를 만들지 않습니다. `kubectl logs <pod>`처럼 resource token을 생략하는 kubectl 관용형도 Pod target으로 인식합니다. 동일한 target correction이 반복되면 같은 LLM 재시도를 계속하지 않고 루프를 중단해 오류를 노출합니다.
+
+명시적인 `resource kind + name + namespace` 요청의 첫 진단은 primary `resource_candidates` 항목을 직접 조회하거나 해당 target selector를 사용해야 합니다. 예를 들어 `namespace X의 Y cluster` 요청에서 첫 명령이 단순 `kubectl get pods -n X`로 빠지면 runtime이 correction합니다.
+
+`Namespace`/`namespace` 대소문자와 무관하게, namespace는 scope로 취급합니다. 사용자가 Namespace object 자체를 묻지 않았는데 Namespace 리소스 후보와 namespace scope를 동시에 내보내면 Kubernetes 리소스 컨텍스트로 승격하지 않습니다.
+
+`unknown`은 분류 값일 뿐 Kubernetes resource kind가 아닙니다. runtime은 `resource_candidates.kind=unknown`, `action.target.resource=unknown`, `kubectl get/describe unknown ...` 형태를 Kubernetes 리소스 대상으로 사용하지 않으며, 구체적인 리소스 종류가 없으면 명확화를 요구하도록 correction합니다.
+
+### 가이드 진행 추적과 종결 선택
+
+resource guide가 주입되면 가이드의 진단 step들이 체크리스트로 추적되며, 매 iteration 시작 시 모델에 다음 두 가지를 다시 안내합니다.
+
+- 사용자 요청 분류 (`requirement_analysis`): 진단 대상이 도중에 다른 리소스로 흘러가지 않도록 고정합니다.
+- 가이드 진행도: 어떤 step이 완료됐고 어떤 step이 남았는지, 다음에 무엇을 수행해야 하는지를 짧게 다시 제공합니다.
+
+가이드의 모든 step이 완료되면 모델은 일반 `kubectl` 명령을 또 실행하지 않고 진단 결과 보고서(`final_report`)를 생성합니다.
+
+- 결론이 충분히 도출된 경우: 보고서를 사용자에게 출력하고 진단을 종료합니다.
+- 결론이 충분하지 않은 경우: 보고서를 출력한 뒤 1~3개의 다음 진단 방향 옵션을 사용자에게 묻습니다.
+
+다음과 같이 선택지가 표시됩니다.
+
+```text
+진단을 어떻게 계속할지 선택해 주세요.
+
+  1. [가이드 재검색] 다른 운영 문제 초점으로 RAG 재조회
+  2. [다른 접근] 관련 controller 로그 확인
+  3. 직접 다른 방향 입력
+  4. 여기서 진단 종료
+```
+
+`[가이드 재검색]`을 고르면 모델이 제안한 운영 문제 초점으로 새 RAG 검색이 실행되고, `[다른 접근]`을 고르면 모델이 제시한 방향으로 ReAct 루프가 계속됩니다. `직접 다른 방향 입력`을 고르면 사용자가 자유 텍스트로 진단 방향을 알려줄 수 있고, `여기서 진단 종료`를 고르면 보고서까지만 보여주고 마칩니다.
+
+내부 schema와 상태 전이는 `docs/guide_progress_and_continuation.md`에 정리되어 있습니다.
 
 기본 설정 경로:
 

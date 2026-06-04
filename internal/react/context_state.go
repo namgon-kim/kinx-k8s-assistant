@@ -113,6 +113,7 @@ func (l *Loop) priorConversationStateMessage() string {
 
 func (l *Loop) hasConversationState() bool {
 	return l.originalQuery != "" ||
+		l.requirementAnalysis != nil ||
 		l.requestContext != nil ||
 		l.resourceClassification != nil ||
 		l.lastContextError != nil ||
@@ -126,6 +127,13 @@ func (l *Loop) writeConversationState(b *strings.Builder, includeGuideContent bo
 		b.WriteString("original_query: ")
 		b.WriteString(l.originalQuery)
 		b.WriteString("\n")
+	}
+	if l.requirementAnalysis != nil {
+		if raw, err := json.Marshal(l.requirementAnalysis); err == nil {
+			b.WriteString("requirement_analysis: ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
 	}
 	if l.requestContext != nil {
 		if raw, err := json.Marshal(l.requestContext); err == nil {

@@ -1,0 +1,851 @@
+schema:
+  placeholder_policy:
+    - "{{namespace}}: management cluster에서 tenant/cluster 리소스가 생성되는 namespace"
+    - "{{cluster_name}}: IKS v2 Cluster 리소스 이름"
+    - "{{machine_deployment_name}}: 특정 MachineDeployment 이름"
+    - "{{machine_name}}: 특정 Machine 이름"
+    - "{{openstack_machine_name}}: 특정 OpenStackMachine 이름. 보통 Machine 이름과 같지만 리소스에서 확인해야 한다."
+    - "{{workload_context}}: workload cluster kubeconfig/context. {{cluster_name}}-admin-kubeconfig Secret의 admin.conf에서 kubeconfig를 추출한 뒤에만 사용할 수 있다."
+  diagnostic_policy:
+    - "management cluster 리소스는 {{namespace}}와 {{cluster_name}}을 기준으로 조회한다."
+    - "node group 단일 진단은 {{machine_deployment_name}}을 사용하고, cluster 범위 하위 리소스 조회는 {{cluster_name}} label을 사용한다."
+    - "Machine 단일 진단은 {{machine_name}}을 사용하고, cluster 범위 Machine 요약은 {{cluster_name}} label을 사용한다."
+    - "workload cluster 내부 Service/PersistentVolume 진단은 workload kubeconfig/context가 준비된 뒤에만 실행한다."
+    - "automatic_candidate=true 명령은 read-only kubectl 조회 또는 로그 조회만 포함한다."
+
+cases:
+  - id: iksv2-renew-cluster-creation-top-level
+    title: "IKS v2 Cluster Creation Top-Level Resources"
+    symptoms:
+      - "Cluster creation is stuck or incomplete"
+      - "Cluster status lacks InfrastructureReady or ControlPlaneReady"
+      - "Top-level Cluster API resources are missing after create request"
+    evidence_keywords:
+      - "OpenStackCluster"
+      - "KamajiControlPlane"
+      - "Cluster"
+      - "cloud-conf"
+      - "ccm-cloud-config"
+      - "InfrastructureReady"
+      - "ControlPlaneReady"
+      - "cluster-create-started"
+      - "cluster-create-completed"
+      - "cluster-create-failed"
+      - "cluster.x-k8s.io.ew/cluster-id"
+      - "cluster.x-k8s.io.ew/cluster-sg-id"
+    cause: "Cluster creation starts from api-manager-created top-level Kubernetes resources; child resource absence must be interpreted only after confirming the parent resources and metadata."
+    resolution: "Inspect Cluster, OpenStackCluster, KamajiControlPlane, cloud config Secrets, ownerReferences, status conditions, and cluster create annotations before diagnosing downstream child resources."
+    decision_hints:
+      - "If Cluster, OpenStackCluster, or KamajiControlPlane is missing, treat child resource absence as a parent creation problem."
+      - "InfrastructureReady=False points to CAPO or OpenStack infrastructure reconciliation."
+      - "InfrastructureReady=True with ControlPlaneReady=False requires hosted control-plane and TenantControlPlane checks."
+      - "Use cluster-create-started/completed/failed annotations as synchronization evidence, not service-internal state."
+    related_objects:
+      - Cluster
+      - OpenStackCluster
+      - KamajiControlPlane
+      - Secret
+      - ServiceAccount
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect top-level cluster resources"
+        command_template: "kubectl -n {{namespace}} get cluster/{{cluster_name}} openstackcluster/{{cluster_name}} kamajicontrolplane/{{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect cloud config Secrets"
+        command_template: "kubectl -n {{namespace}} get secret/{{cluster_name}}-cloud-conf secret/{{cluster_name}}-ccm-cloud-config -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect Cluster metadata, finalizers, and create annotations"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "cluster", "creation", "top-level", "annotations"]
+
+  - id: iksv2-renew-hosted-control-plane
+    title: "IKS v2 Hosted Control Plane Readiness"
+    symptoms:
+      - "ControlPlaneReady is False"
+      - "KamajiControlPlane exists but TenantControlPlane is missing or not ready"
+      - "Control plane upgrade or provisioning appears stalled"
+    evidence_keywords:
+      - "KamajiControlPlane"
+      - "TenantControlPlane"
+      - "ControlPlaneReady"
+      - "readyReplicas"
+      - "spec.replicas"
+      - "version"
+      - "capi-kamaji-controller-manager"
+      - "kamaji"
+    cause: "Hosted control plane readiness is derived from KamajiControlPlane and TenantControlPlane status, not from workload-cluster node state."
+    resolution: "Check KamajiControlPlane, TenantControlPlane, ready replica counts, version state, and Kamaji controller logs when the child resource is missing or not provisioning."
+    decision_hints:
+      - "KamajiControlPlane exists but TenantControlPlane is missing means the Kamaji controller has not created the child object or failed to do so."
+      - "InfrastructureReady=True and ControlPlaneReady=False with TenantControlPlane not provisioning indicates a control-plane issue."
+      - "Do not use management-cluster kubectl get node output as evidence for hosted control-plane readiness."
+    related_objects:
+      - KamajiControlPlane
+      - TenantControlPlane
+      - Cluster
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect KamajiControlPlane and TenantControlPlane"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane/{{cluster_name}} tenantcontrolplane/{{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect Kamaji controller logs for the cluster"
+        command_template: "kubectl logs -n kamaji-system deploy/capi-kamaji-controller-manager | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "control-plane", "kamaji", "tenantcontrolplane"]
+
+  - id: iksv2-renew-addon-rollout
+    title: "IKS v2 Addon and Helm Proxy Rollout"
+    symptoms:
+      - "Addon readiness is incomplete"
+      - "HelmChartProxy exists but HelmReleaseProxy is missing"
+      - "HelmRelease or HelmReleaseProxy Ready condition is False"
+      - "Initial deployment waits for addons"
+    evidence_keywords:
+      - "HelmRelease"
+      - "HelmChartProxy"
+      - "HelmReleaseProxy"
+      - "Ready"
+      - "spec.suspend"
+      - "cluster.x-k8s.io/cluster-name"
+      - "caaph-controller-manager"
+      - "calico"
+      - "cinder-csi"
+      - "nfs-csi"
+      - "manila-csi"
+    cause: "Addon rollout is declared through HelmRelease and HelmChartProxy, then reconciled into HelmReleaseProxy by the addon controller."
+    resolution: "Inspect declared Helm resources, generated HelmReleaseProxy objects, Ready conditions, and suspend state before attributing initial deployment failure to another component."
+    decision_hints:
+      - "HelmChartProxy without HelmReleaseProxy indicates addon controller reconciliation delay or failure."
+      - "HelmRelease.spec.suspend=true may be a result of initial deployment failure cleanup."
+      - "Addon readiness should be evaluated with both HelmRelease and HelmReleaseProxy conditions."
+    related_objects:
+      - HelmRelease
+      - HelmChartProxy
+      - HelmReleaseProxy
+      - Cluster
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect cluster addon resources"
+        command_template: "kubectl -n {{namespace}} get helmrelease,helmchartproxy,helmreleaseproxy -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect addon controller logs for the cluster"
+        command_template: "kubectl logs -n caaph-system deploy/caaph-controller-manager | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "addon", "helmrelease", "helmreleaseproxy", "initial-deployment"]
+
+  - id: iksv2-renew-initial-deployment-state
+    title: "IKS v2 Initial Deployment State"
+    symptoms:
+      - "Initial deployment is incomplete or failed"
+      - "Cluster creation failed after timeout"
+      - "Cluster is paused after initial deployment failure"
+      - "Only some initial components are ready"
+    evidence_keywords:
+      - "initial-deployment"
+      - "initial-deployment-completed"
+      - "initial-deployment-paused"
+      - "cluster-create-started"
+      - "cluster-create-completed"
+      - "cluster-create-failed"
+      - "ControlPlaneReady"
+      - "Ingress"
+      - "Available"
+      - "cluster.x-k8s.io.ew/initial-deployment=true"
+      - "cluster.x-k8s.io/paused"
+    cause: "Initial deployment is an aggregate operational phase, not a standalone resource; it succeeds only when bastion Ingress, control plane, initial node group, and addons are all ready."
+    resolution: "Check Cluster annotations, same-name Ingress, the initial MachineDeployment label, control-plane condition, addon readiness, and failure pause markers together."
+    decision_hints:
+      - "The initial node group is identified by MachineDeployment label cluster.x-k8s.io.ew/initial-deployment=true."
+      - "initial-deployment-completed=false plus cluster-create-failed=true means watcher recorded initial deployment failure."
+      - "initial-deployment-paused=true marks the cluster for event-processor cleanup."
+      - "Do not query workload-cluster nodes before the workload kubeconfig/context is established."
+    related_objects:
+      - Cluster
+      - Ingress
+      - MachineDeployment
+      - HelmRelease
+      - HelmReleaseProxy
+      - KamajiControlPlane
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect initial deployment metadata on Cluster"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect initial node group"
+        command_template: "kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{cluster_name}},cluster.x-k8s.io.ew/initial-deployment=true -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect initial deployment component set"
+        command_template: "kubectl -n {{namespace}} get ingress,machinedeployment,helmrelease,helmreleaseproxy -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "initial-deployment", "cluster-create", "paused", "annotations"]
+
+  - id: iksv2-renew-nodegroup-creation-rollout
+    title: "IKS v2 NodeGroup Creation and Rollout"
+    symptoms:
+      - "Node group creation is stuck"
+      - "MachineDeployment exists but MachineSet or Machine is missing"
+      - "Machine exists but OpenStackMachine is missing"
+      - "MachineDeployment is paused after create timeout"
+      - "Machine waits for Node with spec.providerID to exist"
+    evidence_keywords:
+      - "MachineDeployment"
+      - "MachineSet"
+      - "Machine"
+      - "OpenStackMachine"
+      - "MachineNodeHealthy"
+      - "InfrastructureReady"
+      - "ScalingUp"
+      - "last-created"
+      - "nodegroup-create-completed"
+      - "nodegroup-create-failed"
+      - "nodegroup-paused"
+      - "cluster.x-k8s.io/paused"
+      - "providerID"
+    cause: "Node group rollout is a controller chain: MachineDeployment creates MachineSet, MachineSet creates Machine, Machine references OpenStackMachine, and node health is observed after workload node registration."
+    resolution: "Inspect each rollout layer in order, then combine MachineDeployment phase, replica counters, Machine conditions, OpenStackMachine readiness, and node group annotations."
+    decision_hints:
+      - "MachineDeployment without MachineSet points to CAPI controller rollout delay or failure."
+      - "MachineSet without Machine points to replica rollout delay."
+      - "Machine without OpenStackMachine points to CAPO reconciliation delay or failure."
+      - "OpenStackMachine Ready with Machine waiting for providerID indicates workload node registration has not been observed; do not use management-cluster nodes as workload evidence."
+      - "nodegroup-create-failed=true plus paused annotations indicates watcher timeout and pause handling."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - Machine
+      - OpenStackMachine
+      - OpenStackMachineTemplate
+      - KubeadmConfigTemplate
+      - MachineHealthCheck
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect node group rollout hierarchy"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,machineset,machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect OpenStackMachine resources for the node group"
+        command_template: "kubectl -n {{namespace}} get openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect node group metadata and annotations"
+        command_template: "kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "nodegroup", "creation", "rollout", "machine", "providerid"]
+
+  - id: iksv2-renew-nodegroup-scale
+    title: "IKS v2 NodeGroup Scale State"
+    symptoms:
+      - "Node group scale-up or scale-down is in progress"
+      - "Desired replicas differ from current or available replicas"
+      - "Node group scale timed out and paused"
+    evidence_keywords:
+      - "ScalingUp"
+      - "ScalingDown"
+      - "spec.replicas"
+      - "status.replicas"
+      - "availableReplicas"
+      - "last-scaled"
+      - "nodegroup-scale-completed"
+      - "nodegroup-scale-failed"
+      - "nodegroup-paused"
+      - "cluster.x-k8s.io/paused"
+    cause: "Scale state is inferred from MachineDeployment desired/current/available replica convergence, phase, and watcher scale annotations."
+    resolution: "Determine whether the request is scale-up or scale-down, then compare replica counters and completion/failure annotations before declaring the operation complete or failed."
+    decision_hints:
+      - "ScalingUp with actual replicas below desired means new replicas are still being created."
+      - "ScalingDown or Running with desired below current means scale-down is still progressing."
+      - "Scale timeout may add both nodegroup-paused and CAPI paused annotations."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - Machine
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect MachineDeployment scale status"
+        command_template: "kubectl -n {{namespace}} get machinedeployment {{machine_deployment_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect node group rollout resources after scale"
+        command_template: "kubectl -n {{namespace}} get machineset,machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "nodegroup", "scale", "replicas", "paused"]
+
+  - id: iksv2-renew-nodegroup-upgrade
+    title: "IKS v2 NodeGroup Upgrade State"
+    symptoms:
+      - "Node group upgrade is in progress or timed out"
+      - "Old MachineSets remain after version change"
+      - "updatedReplicas, readyReplicas, or availableReplicas do not match desired replicas"
+    evidence_keywords:
+      - "nodegroup-upgrade-in-progress"
+      - "last-upgraded"
+      - "nodegroup-upgrade-completed"
+      - "nodegroup-upgrade-failed"
+      - "updatedReplicas"
+      - "readyReplicas"
+      - "availableReplicas"
+      - "MachineSet"
+      - "OpenStackMachineTemplate"
+      - "spec.template.spec.version"
+    cause: "Upgrade progress is identified by old MachineSets, version or image drift, replica convergence, and watcher-managed upgrade annotations."
+    resolution: "Check old and new MachineSets, compare version/image and replica counters, then use upgrade annotations to identify in-progress, completed, or failed state."
+    decision_hints:
+      - "Upgrade starts when an old MachineSet with a different version still has replicas."
+      - "Upgrade is complete only after old MachineSets are gone and updated, ready, and available replicas match desired replicas."
+      - "Watcher should remove nodegroup-upgrade-in-progress when upgrade completes."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - OpenStackMachineTemplate
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect MachineDeployment and MachineSets for upgrade state"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,machineset -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect OpenStackMachineTemplate image/version metadata"
+        command_template: "kubectl -n {{namespace}} get openstackmachinetemplate -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "nodegroup", "upgrade", "machineset", "version"]
+
+  - id: iksv2-renew-machine-state-and-deletion
+    title: "IKS v2 Machine State and Deletion"
+    symptoms:
+      - "Machine is provisioning, unhealthy, or waiting for providerID"
+      - "Machine deletion is stuck"
+      - "Node drain or volume detach has not completed"
+      - "Machine finalizer remains"
+    evidence_keywords:
+      - "Machine"
+      - "OpenStackMachine"
+      - "InfrastructureReady"
+      - "MachineNodeHealthy"
+      - "DrainingSucceeded"
+      - "VolumeDetachSucceeded"
+      - "MachineFinalizer"
+      - "deletionTimestamp"
+      - "node-create-completed"
+      - "node-delete-completed"
+      - "providerID"
+    cause: "Machine readiness and deletion require interpreting infrastructure readiness, node health, drain/detach conditions, deletionTimestamp, and finalizers together."
+    resolution: "Inspect Machine and OpenStackMachine conditions first, then use deletion conditions and finalizers to determine whether provisioning, node registration, drain, detach, or cleanup is blocking progress."
+    decision_hints:
+      - "InfrastructureReady=false usually means VM provisioning is still in progress."
+      - "InfrastructureReady=true with Machine not Running usually means node provisioning or registration is still in progress."
+      - "Machine.phase=Running and MachineNodeHealthy=True means the node is available."
+      - "DrainingSucceeded or VolumeDetachSucceeded Unknown/False means deletion is still in progress."
+      - "Machine deletion is complete only after the CAPI MachineFinalizer is gone."
+    related_objects:
+      - Machine
+      - OpenStackMachine
+      - VolumeAttachment
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect Machine status and conditions"
+        command_template: "kubectl -n {{namespace}} get machine {{machine_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect OpenStackMachine paired with the Machine"
+        command_template: "kubectl -n {{namespace}} get openstackmachine {{openstack_machine_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect Machine condition summaries for the cluster"
+        command_template: >-
+          kubectl -n {{namespace}} get machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .status.conditions[*]}  {.type}={.status} reason={.reason} message={.message}{"\n"}{end}{end}'
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "machine", "deletion", "finalizer", "providerid"]
+
+  - id: iksv2-renew-cluster-suspend
+    title: "IKS v2 Cluster Suspend"
+    symptoms:
+      - "Cluster suspend is requested but not completed"
+      - "operation-state remains suspend-requested or suspend-applied"
+      - "Control plane or addon replicas have not scaled down"
+    evidence_keywords:
+      - "operation-state"
+      - "suspend-requested"
+      - "suspend-applied"
+      - "last-suspended-done"
+      - "KamajiControlPlane"
+      - "HelmRelease"
+      - "Deployment"
+      - "spec.replicas"
+      - "readyReplicas"
+      - "spec.suspend"
+      - "cluster.x-k8s.io/paused"
+    cause: "Suspend is applied by event-processor through operation-state, component replica scale-down, HelmRelease suspend, and CAPI pause."
+    resolution: "Check operation-state, KamajiControlPlane readyReplicas, addon/component Deployment replica convergence, HelmRelease suspend state, and last-suspended-done."
+    decision_hints:
+      - "operation-state=suspend-requested means processor has not applied the suspend operation yet."
+      - "operation-state=suspend-applied means replica convergence is still pending."
+      - "Suspend is complete only when KCP ready replicas are 0, component replicas are 0, HelmRelease is suspended, CAPI pause is present, and last-suspended-done is recorded."
+    related_objects:
+      - Cluster
+      - KamajiControlPlane
+      - HelmRelease
+      - Deployment
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect Cluster suspend metadata"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect control plane and addon suspend state"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane/{{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect HelmRelease suspend state"
+        command_template: "kubectl -n {{namespace}} get helmrelease -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect component Deployment replica convergence after suspend"
+        command_template: "kubectl -n {{namespace}} get deployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "suspend", "operation-state", "processor"]
+
+  - id: iksv2-renew-cluster-resume
+    title: "IKS v2 Cluster Resume"
+    symptoms:
+      - "Cluster resume is requested but not completed"
+      - "operation-state remains resume-requested or resume-applied"
+      - "Control plane or addon replicas have not recovered"
+    evidence_keywords:
+      - "operation-state"
+      - "resume-requested"
+      - "resume-applied"
+      - "last-suspended-done"
+      - "last-resumed-done"
+      - "KamajiControlPlane"
+      - "HelmRelease"
+      - "spec.suspend"
+      - "readyReplicas"
+      - "cluster.x-k8s.io/paused"
+    cause: "Resume is applied by event-processor only after a suspended state exists; it unpauses CAPI, unsuspends HelmRelease, and scales control plane/addon components back up."
+    resolution: "Check operation-state, previous suspend marker, CAPI pause removal, HelmRelease suspend=false, KCP ready replicas, component readiness, and last-resumed-done."
+    decision_hints:
+      - "operation-state=resume-requested without last-suspended-done is an abnormal combination."
+      - "operation-state=resume-applied means replica recovery is still pending."
+      - "Resume is complete only after KCP ready replicas and addon component replicas recover and last-resumed-done is recorded."
+    related_objects:
+      - Cluster
+      - KamajiControlPlane
+      - HelmRelease
+      - Deployment
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect Cluster resume metadata"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect control plane and addon resume state"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane/{{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect HelmRelease resume state"
+        command_template: "kubectl -n {{namespace}} get helmrelease -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect component Deployment replica convergence after resume"
+        command_template: "kubectl -n {{namespace}} get deployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "resume", "operation-state", "processor"]
+
+  - id: iksv2-renew-servicegatewayclaim
+    title: "IKS v2 ServiceGatewayClaim"
+    symptoms:
+      - "ServiceGatewayClaim is missing or stuck"
+      - "Node group create failure requires data plane cleanup"
+      - "Service gateway resource remains during cleanup"
+    evidence_keywords:
+      - "ServiceGatewayClaim"
+      - "KinxServiceGateway"
+      - "iksv2.kinx.net/cluster-name"
+      - "cluster.x-k8s.io.ew/nodegroup-id"
+      - "nodegroup-create-failed"
+      - "cluster.x-k8s.io/paused"
+      - "deletionTimestamp"
+      - "ownerReferences"
+    cause: "ServiceGatewayClaim creation depends on MachineDeployment and Cluster not being deleted, node group ID metadata, and absence of an existing claim; cleanup is triggered after node group create failure with pause."
+    resolution: "Check MachineDeployment deletion state, Cluster deletion state, nodegroup-id annotation, existing ServiceGatewayClaim label, ownerReferences, and create-failed/pause annotations."
+    decision_hints:
+      - "No nodegroup-id means ServiceGatewayClaim cannot be created."
+      - "nodegroup-create-failed=true without CAPI pause is not enough for data plane cleanup."
+      - "create failed plus paused means event-processor may request data plane deletion."
+    related_objects:
+      - MachineDeployment
+      - Cluster
+      - ServiceGatewayClaim
+      - KinxServiceGateway
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect ServiceGatewayClaim for the cluster"
+        command_template: "kubectl -n {{namespace}} get servicegatewayclaim -l iksv2.kinx.net/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect MachineDeployment metadata required for ServiceGatewayClaim"
+        command_template: "kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "servicegateway", "nodegroup", "cleanup"]
+
+  - id: iksv2-renew-service-loadbalancer
+    title: "IKS v2 Workload Service LoadBalancer"
+    symptoms:
+      - "Workload Service LoadBalancer creation, update, or deletion is not synchronized"
+      - "Service has no LB ID annotation"
+      - "OpenStack load balancer is pending or in error"
+      - "Service deletion is stuck on load balancer cleanup"
+    evidence_keywords:
+      - "Service"
+      - "LoadBalancer"
+      - "tenant.meta.x-k8s.io/id"
+      - "cluster.meta.x-k8s.io/name"
+      - "service.beta.kubernetes.io/kinx-load-balancer-id"
+      - "cluster.x-k8s.io.ew/resource-id"
+      - "service.kubernetes.io/load-balancer-cleanup"
+      - "PENDING_CREATE"
+      - "PENDING_UPDATE"
+      - "PENDING_DELETE"
+      - "ACTIVE"
+      - "ERROR"
+      - "resource-create-completed"
+      - "resource-update-completed"
+      - "resource-delete-completed"
+    cause: "Workload Service LB state is synchronized from Kubernetes Service annotations and external OpenStack LB provisioning state."
+    resolution: "Confirm the Service is a managed workload LoadBalancer, then compare Service annotations, deletionTimestamp/finalizers, and OpenStack LB provisioning status."
+    decision_hints:
+      - "Missing LB ID annotation means LB creation may still be pending."
+      - "OpenStack ACTIVE permits create/update completion synchronization."
+      - "OpenStack ERROR indicates LB-side failure."
+      - "Service deletion completes only after load-balancer-cleanup finalizer is gone and external LB is deleted or not found."
+      - "Service metadata uses tenant.meta.x-k8s.io/id and cluster.meta.x-k8s.io/name annotations, so label selectors may not find the object."
+      - "This command must run against the workload cluster context, not the management cluster context."
+    related_objects:
+      - Service
+      - OpenStackLoadBalancer
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect workload LoadBalancer Services for the cluster"
+        command_template: "kubectl --context {{workload_context}} get service --all-namespaces -o yaml"
+        automatic_candidate: false
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect event-watcher logs for workload Service synchronization"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-watcher | grep {{cluster_name}} | grep Service"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: medium
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "service", "loadbalancer", "openstack", "workload-resource"]
+
+  - id: iksv2-renew-persistentvolume
+    title: "IKS v2 Workload PersistentVolume"
+    symptoms:
+      - "PersistentVolume create, attach, detach, or delete is not synchronized"
+      - "PV remains in unexpected phase"
+      - "VolumeAttachment is not attached"
+      - "PV deletion is blocked by finalizers"
+    evidence_keywords:
+      - "PersistentVolume"
+      - "PersistentVolumeClaim"
+      - "VolumeAttachment"
+      - "cinder.csi.openstack.org"
+      - "manila.csi.openstack.org"
+      - "tenant.meta.x-k8s.io/id"
+      - "cluster.meta.x-k8s.io/name"
+      - "cluster.x-k8s.io.ew/resource-id"
+      - "resource-create-completed"
+      - "resource-attach-completed"
+      - "resource-detach-completed"
+      - "resource-delete-completed"
+      - "kubernetes.io/pv-protection"
+      - "Retain"
+    cause: "PV synchronization is primarily handled by event-watcher soot PersistentVolume controller using CSI driver, PV phase, VolumeAttachment attached state, deletionTimestamp, protection finalizers, and external volume metadata. Event-processor only participates in cluster deletion cleanup for persisted PV OpenStack resource metadata."
+    resolution: "Check whether the PV belongs to the workload cluster, inspect CSI driver and volume handle, compare PV phase with VolumeAttachment status, and verify finalizer removal on deletion. PV inspection requires workload cluster kubeconfig/context from {{cluster_name}}-admin-kubeconfig Secret data admin.conf, so direct command execution is intentionally disabled here."
+    decision_hints:
+      - "Cinder and Manila CSI PVs are managed resources when tenant/cluster metadata connects them to the root cluster."
+      - "PV phase Available or Bound with a CSI volume handle means volume creation can be synchronized."
+      - "VolumeAttachment.status.attached=true means attach completion can be synchronized."
+      - "Released phase is detach evidence."
+      - "PV deletion requires pv-protection finalizer removal before delete completion synchronization."
+      - "PersistentVolume is a workload cluster resource. Do not run PV inspection against the management cluster context."
+      - "Prepare {{workload_context}} from {{cluster_name}}-admin-kubeconfig Secret data admin.conf first, then inspect PV/PVC/VolumeAttachment in that context."
+      - "Use event-watcher logs for normal PV create/attach/detach/delete synchronization."
+      - "Use event-processor logs only when diagnosing cluster deletion cleanup for remaining PV OpenStack resource metadata."
+    related_objects:
+      - PersistentVolume
+      - PersistentVolumeClaim
+      - VolumeAttachment
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect event-watcher logs for PV synchronization"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-watcher | grep {{cluster_name}} | grep -E 'PersistentVolume|VolumeAttachment'"
+        automatic_candidate: true
+        requires_confirmation: false
+    # PersistentVolume 진단은 workload cluster kubeconfig/context가 필요하므로 자동 실행 명령을 비활성화한다.
+    # kubeconfig를 {{cluster_name}}-admin-kubeconfig Secret의 admin.conf에서 추출해 {{workload_context}}를 준비한 뒤, 필요 시 아래 명령을 수동으로 사용한다.
+    # - kubectl --context {{workload_context}} get persistentvolume -o yaml
+    # - kubectl --context {{workload_context}} get persistentvolumeclaim --all-namespaces -o yaml
+    # - kubectl --context {{workload_context}} get volumeattachment -o yaml
+    risk_level: medium
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "persistentvolume", "volumeattachment", "csi", "workload-resource"]
+
+  - id: iksv2-renew-cluster-deletion
+    title: "IKS v2 Cluster Deletion and Cleanup"
+    symptoms:
+      - "Cluster deletion is stuck"
+      - "Cluster delete failed annotation is present"
+      - "Addon, Ingress, ServiceGatewayClaim, Secret, or finalizer remains"
+      - "event-processor cleanup has not removed its finalizer"
+    evidence_keywords:
+      - "deletionTimestamp"
+      - "cluster-delete-started"
+      - "cluster-delete-completed"
+      - "cluster-delete-failed"
+      - "cluster.x-k8s.io/paused"
+      - "cluster.x-k8s.io.ew/paused"
+      - "HelmRelease"
+      - "HelmChartProxy"
+      - "HelmReleaseProxy"
+      - "Ingress"
+      - "ServiceGatewayClaim"
+      - "cloud-conf"
+      - "ccm-cloud-config"
+      - "admin-kubeconfig"
+      - "finalizers"
+    cause: "Cluster deletion completion requires more than deletionTimestamp; watcher checks child resource absence and finalizer removal, while processor handles external resource and credential cleanup."
+    resolution: "Inspect deletionTimestamp, addon resources, same-name Ingress, CAPI and processor finalizers, cloud-conf Secret, ServiceGatewayClaim, and delete annotations."
+    decision_hints:
+      - "HelmRelease, HelmChartProxy, or Ingress remaining prevents deletion completion."
+      - "CAPI cluster finalizer remaining means CAPI cleanup is still pending."
+      - "Processor cleanup should not start while finalizers other than event-processor finalizer remain."
+      - "cluster-delete-failed=true with pause annotations indicates watcher timeout failure."
+    related_objects:
+      - Cluster
+      - HelmRelease
+      - HelmChartProxy
+      - HelmReleaseProxy
+      - Ingress
+      - ServiceGatewayClaim
+      - Secret
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect Cluster deletion state"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect resources that block cluster delete completion"
+        command_template: "kubectl -n {{namespace}} get helmrelease,helmchartproxy,helmreleaseproxy -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect same-name Ingress, cloud config Secrets, and kubeconfig Secret that may block cluster delete completion"
+        command_template: "kubectl -n {{namespace}} get ingress/{{cluster_name}} secret/{{cluster_name}}-cloud-conf secret/{{cluster_name}}-ccm-cloud-config secret/{{cluster_name}}-admin-kubeconfig -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect ServiceGatewayClaims for processor cleanup"
+        command_template: "kubectl -n {{namespace}} get servicegatewayclaim -l iksv2.kinx.net/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect processor cleanup logs"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-processor | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: medium
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "cluster", "deletion", "cleanup", "finalizer"]
+
+  - id: iksv2-renew-nodegroup-deletion
+    title: "IKS v2 NodeGroup Deletion"
+    symptoms:
+      - "Node group deletion is stuck"
+      - "MachineDeployment deletionTimestamp is present"
+      - "MachineSet, Machine, or OpenStackMachine remains"
+      - "nodegroup-delete-failed annotation is present"
+    evidence_keywords:
+      - "MachineDeployment"
+      - "MachineSet"
+      - "Machine"
+      - "OpenStackMachine"
+      - "deletionTimestamp"
+      - "MachineDeploymentFinalizer"
+      - "nodegroup-delete-completed"
+      - "nodegroup-delete-failed"
+      - "cluster.x-k8s.io/paused"
+    cause: "Node group deletion requires unpausing MachineDeployment, deleting child resources through CAPI/CAPO, and removing the MachineDeployment finalizer."
+    resolution: "Inspect MachineDeployment deletion state, pause annotation removal, child resource cleanup, delete annotations, and finalizers."
+    decision_hints:
+      - "Paused MachineDeployment may need unpause before deletion can progress, but do not execute mutation in read-only mode."
+      - "MachineSet, Machine, or OpenStackMachine remaining means child cleanup is still in progress."
+      - "Deletion is complete only after the CAPI MachineDeploymentFinalizer is gone."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - Machine
+      - OpenStackMachine
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect node group deletion hierarchy"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,machineset,machine,openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: medium
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "nodegroup", "deletion", "finalizer"]
+
+  - id: iksv2-renew-soot-manager-workload-observation
+    title: "IKS v2 Soot Manager and Workload Cluster Observation"
+    symptoms:
+      - "Workload resources are not observed or synchronized"
+      - "Remote watcher registration appears missing"
+      - "Webhook labels or CA bundles are not corrected"
+      - "Workload cluster cache connection errors occur"
+    evidence_keywords:
+      - "soot-manager-start-completed"
+      - "soot manager"
+      - "workload watcher"
+      - "cluster cache"
+      - "remote client"
+      - "ValidatingWebhookConfiguration"
+      - "MutatingWebhookConfiguration"
+      - "cluster.x-k8s.io/cluster-name"
+      - "headless service"
+    cause: "Workload resource synchronization depends on root cluster access, remote client/cache availability, watcher registration, and webhook/service correction."
+    resolution: "Check root Cluster state, deletionTimestamp, event-watcher logs, cluster cache connection errors, and workload webhook/service correction evidence."
+    decision_hints:
+      - "Remote client connection error means workload resource observation may be missing even if management-cluster CRDs look healthy."
+      - "Cluster deletion should terminate workload watcher context and remove soot manager finalizer."
+      - "Do not infer workload node or workload resource state from management-cluster node listing."
+    related_objects:
+      - Cluster
+      - ValidatingWebhookConfiguration
+      - MutatingWebhookConfiguration
+      - Service
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect event-watcher logs for workload observation"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-watcher | grep {{cluster_name}} | grep -E 'soot|workload|cache|remote|webhook'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect Cluster metadata related to workload observation"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: medium
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "soot-manager", "workload", "event-watcher", "webhook"]
+
+  - id: iksv2-renew-log-analysis
+    title: "IKS v2 Controller Log Analysis"
+    symptoms:
+      - "Kubernetes object state is ambiguous"
+      - "Controller-created child resource is missing"
+      - "Watcher or processor synchronization appears delayed"
+      - "Cleanup or lifecycle operation is stuck"
+    evidence_keywords:
+      - "event-watcher"
+      - "event-processor"
+      - "api-manager"
+      - "caaph-controller-manager"
+      - "capi-controller-manager"
+      - "capo-controller-manager"
+      - "capi-kamaji-controller-manager"
+      - "ERROR"
+      - "cluster key"
+      - "controller logs"
+    cause: "Controller logs are needed when Kubernetes resource state identifies the responsible controller but not the internal reason for reconciliation delay."
+    resolution: "Filter logs by cluster name or cluster key first, compare watcher and processor time windows, and inspect the controller responsible for the missing or stalled child resource."
+    decision_hints:
+      - "Do not search only for generic error strings without cluster key filtering."
+      - "Watcher logs may show observation only; processor logs are needed for actual lifecycle actions."
+      - "If a child resource is missing, inspect the controller responsible for creating that child resource."
+      - "If processor cleanup is delayed, inspect finalizers and external resource state alongside processor logs."
+    related_objects:
+      - Cluster
+      - MachineDeployment
+      - Machine
+      - HelmReleaseProxy
+      - TenantControlPlane
+      - ServiceGatewayClaim
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect event-watcher logs for the cluster"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-watcher | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect event-processor logs for the cluster"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-processor | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Inspect event-processor errors for the cluster"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-processor | grep {{cluster_name}} | grep ERROR"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-renew-state-guide"
+    tags: ["iksv2", "logs", "controller", "event-watcher", "event-processor"]

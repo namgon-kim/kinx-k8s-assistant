@@ -11,9 +11,41 @@ import (
 type reActResponse struct {
 	Thought             string               `json:"thought"`
 	Answer              string               `json:"answer,omitempty"`
+	RequirementAnalysis *requirementAnalysis `json:"requirement_analysis,omitempty"`
 	RequestContext      *requestContext      `json:"request_context,omitempty"`
 	Action              *action              `json:"action,omitempty"`
 	ResourceGuideLookup *resourceGuideLookup `json:"resource_guide_lookup,omitempty"`
+	FinalReport         *finalReport         `json:"final_report,omitempty"`
+	NextDirections      *nextDirections      `json:"next_directions,omitempty"`
+}
+
+type requirementAnalysis struct {
+	RequestType string                    `json:"request_type"`
+	Action      string                    `json:"action"`
+	Target      requirementAnalysisTarget `json:"target"`
+	Scope       requirementScope          `json:"scope,omitempty"`
+	Resources   []requirementResource     `json:"resource_candidates,omitempty"`
+	Evidence    []string                  `json:"evidence_needs,omitempty"`
+	Constraints []string                  `json:"constraints,omitempty"`
+	Ambiguities []string                  `json:"ambiguities,omitempty"`
+}
+
+type requirementAnalysisTarget struct {
+	Category    string `json:"category"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+type requirementScope struct {
+	Type      string `json:"type,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+}
+
+type requirementResource struct {
+	Kind      string `json:"kind"`
+	Name      string `json:"name,omitempty"`
+	Namespace string `json:"namespace,omitempty"`
+	Role      string `json:"role,omitempty"`
 }
 
 type requestContext struct {
@@ -32,13 +64,14 @@ type requestScope struct {
 }
 
 type action struct {
-	Name                string        `json:"name"`
-	Reason              string        `json:"reason"`
-	Goal                string        `json:"goal,omitempty"`
-	Target              *actionTarget `json:"target,omitempty"`
-	Command             string        `json:"command"`
-	ExpectedObservation string        `json:"expected_observation,omitempty"`
-	ModifiesResource    string        `json:"modifies_resource"`
+	Name                string         `json:"name"`
+	Reason              string         `json:"reason"`
+	Goal                string         `json:"goal,omitempty"`
+	Target              *actionTarget  `json:"target,omitempty"`
+	Command             string         `json:"command"`
+	ExpectedObservation string         `json:"expected_observation,omitempty"`
+	ModifiesResource    string         `json:"modifies_resource"`
+	GuideProgress       *guideProgress `json:"guide_progress,omitempty"`
 }
 
 type actionTarget struct {
@@ -47,11 +80,41 @@ type actionTarget struct {
 	Name      string `json:"name,omitempty"`
 }
 
+type guideProgress struct {
+	StepCompleted  int  `json:"step_completed,omitempty"`
+	EvidenceUseful bool `json:"evidence_useful,omitempty"`
+}
+
 type resourceGuideLookup struct {
 	ResourceFamily string `json:"resource_family"`
 	ProblemFocus   string `json:"problem_focus"`
 	Reason         string `json:"reason"`
 	Evidence       string `json:"evidence"`
+}
+
+type finalReport struct {
+	Conclusive             bool     `json:"conclusive"`
+	Conclusion             string   `json:"conclusion,omitempty"`
+	Attempted              []string `json:"attempted,omitempty"`
+	EvidenceKnown          []string `json:"evidence_known,omitempty"`
+	EvidenceMissing        []string `json:"evidence_missing,omitempty"`
+	MostLikelyCause        string   `json:"most_likely_cause,omitempty"`
+	RecommendedUserActions []string `json:"recommended_user_actions,omitempty"`
+	Blockers               []string `json:"blockers,omitempty"`
+}
+
+type nextDirections struct {
+	Note    string                `json:"note,omitempty"`
+	Options []nextDirectionOption `json:"options"`
+}
+
+type nextDirectionOption struct {
+	Kind           string `json:"kind"`
+	Summary        string `json:"summary"`
+	Why            string `json:"why,omitempty"`
+	ResourceFamily string `json:"resource_family,omitempty"`
+	ProblemFocus   string `json:"problem_focus,omitempty"`
+	Instruction    string `json:"instruction,omitempty"`
 }
 
 func candidateToShimCandidate(iterator gollm.ChatResponseIterator) (gollm.ChatResponseIterator, error) {
@@ -201,7 +264,7 @@ type shimCandidate struct {
 }
 
 func (c *shimCandidate) String() string {
-	return fmt.Sprintf("Thought: %s\nAnswer: %s\nRequestContext: %v\nAction: %v\nResourceGuideLookup: %v", c.candidate.Thought, c.candidate.Answer, c.candidate.RequestContext, c.candidate.Action, c.candidate.ResourceGuideLookup)
+	return fmt.Sprintf("Thought: %s\nAnswer: %s\nRequirementAnalysis: %v\nRequestContext: %v\nAction: %v\nResourceGuideLookup: %v\nFinalReport: %v\nNextDirections: %v", c.candidate.Thought, c.candidate.Answer, c.candidate.RequirementAnalysis, c.candidate.RequestContext, c.candidate.Action, c.candidate.ResourceGuideLookup, c.candidate.FinalReport, c.candidate.NextDirections)
 }
 
 func (c *shimCandidate) Parts() []gollm.Part {
@@ -216,6 +279,9 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	if c.candidate.Answer != "" {
 		parts = append(parts, &shimPart{text: c.candidate.Answer})
 	}
+	if c.candidate.RequirementAnalysis != nil {
+		parts = append(parts, &shimPart{requirementAnalysis: c.candidate.RequirementAnalysis})
+	}
 	if c.candidate.RequestContext != nil {
 		parts = append(parts, &shimPart{requestContext: c.candidate.RequestContext})
 	}
@@ -225,14 +291,23 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	if c.candidate.ResourceGuideLookup != nil {
 		parts = append(parts, &shimPart{resourceGuideLookup: c.candidate.ResourceGuideLookup})
 	}
+	if c.candidate.FinalReport != nil {
+		parts = append(parts, &shimPart{finalReport: c.candidate.FinalReport})
+	}
+	if c.candidate.NextDirections != nil {
+		parts = append(parts, &shimPart{nextDirections: c.candidate.NextDirections})
+	}
 	return parts
 }
 
 type shimPart struct {
 	text                string
+	requirementAnalysis *requirementAnalysis
 	requestContext      *requestContext
 	action              *action
 	resourceGuideLookup *resourceGuideLookup
+	finalReport         *finalReport
+	nextDirections      *nextDirections
 }
 
 func (p *shimPart) AsText() (string, bool) {
@@ -240,6 +315,16 @@ func (p *shimPart) AsText() (string, bool) {
 }
 
 func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
+	if p.requirementAnalysis != nil {
+		args, err := toMap(p.requirementAnalysis)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      internalRequirementAnalysisCall,
+			Arguments: args,
+		}}, true
+	}
 	if p.requestContext != nil {
 		args, err := toMap(p.requestContext)
 		if err != nil {
@@ -257,6 +342,26 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 		}
 		return []gollm.FunctionCall{{
 			Name:      internalResourceGuideLookupCall,
+			Arguments: args,
+		}}, true
+	}
+	if p.finalReport != nil {
+		args, err := toMap(p.finalReport)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      internalFinalReportCall,
+			Arguments: args,
+		}}, true
+	}
+	if p.nextDirections != nil {
+		args, err := toMap(p.nextDirections)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      internalNextDirectionsCall,
 			Arguments: args,
 		}}, true
 	}

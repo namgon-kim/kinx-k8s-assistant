@@ -49,7 +49,7 @@ func TestCommandStringAcceptsOnlyKubectlCommands(t *testing.T) {
 
 func TestResourceGuideQueryDeduplicatesExactRefinement(t *testing.T) {
 	loop := &Loop{}
-	query := "resource family: cluster-api\nproblem focus: worker scale"
+	query := "resource family: cluster-api\nproblem focus: nodegroup reconciliation"
 	if loop.resourceGuideQueryAlreadyUsed(query) {
 		t.Fatal("query must not be marked before use")
 	}
@@ -63,14 +63,14 @@ func TestResourceGuideRefinementQueryUsesProblemFocus(t *testing.T) {
 	loop := &Loop{originalQuery: "cluster status"}
 	got := loop.resourceGuideRefinementQuery(resourceGuideLookup{
 		ResourceFamily: "cluster-api",
-		ProblemFocus:   "worker scale / replica availability",
-		Reason:         "worker replicas are below desired count",
-		Evidence:       "spec.replicas=3, availableReplicas=1",
+		ProblemFocus:   "nodegroup reconciliation",
+		Reason:         "live evidence requires a more specific guide than the initial resource-family guide",
+		Evidence:       "controller reported nodegroup reconciliation is blocked",
 	})
 	for _, want := range []string{
 		"resource family: cluster-api",
-		"problem focus: worker scale / replica availability",
-		"observed evidence: spec.replicas=3, availableReplicas=1",
+		"problem focus: nodegroup reconciliation",
+		"observed evidence: controller reported nodegroup reconciliation is blocked",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected refinement query to contain %q, got %q", want, got)
@@ -91,6 +91,34 @@ func TestCommandMentionsResourceAllowsCRDPluralSingularMismatch(t *testing.T) {
 	}
 	if !commandMentionsResource("kubectl get machinedeployments -n tenant-a", "machinedeployment") {
 		t.Fatal("expected plural MachineDeployment resource in command to match singular action target")
+	}
+}
+
+func TestCommandMentionsResourceTreatsKubectlLogsAsPodTarget(t *testing.T) {
+	if !commandMentionsResource("kubectl logs clst-pz02-shs1006-04-85d5694687-5h2tz -n tenant-a -c konnectivity-server", "pod") {
+		t.Fatal("expected kubectl logs <pod> to satisfy pod action target")
+	}
+}
+
+func TestRejectUnrelatedFirstDiagnosticForExplicitClusterTarget(t *testing.T) {
+	loop := &Loop{
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-pz02-shs1006-04"},
+			Scope:         requestScope{Namespace: "tenant-a"},
+			ResourceClass: "custom_resource",
+		},
+	}
+	if !loop.rejectUnrelatedFirstDiagnostic([]gollm.FunctionCall{{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"target": map[string]any{
+				"resource":  "pods",
+				"namespace": "tenant-a",
+			},
+			"command": "kubectl get pods -n tenant-a",
+		},
+	}}) {
+		t.Fatal("expected unrelated pod listing to be rejected before first cluster diagnostic")
 	}
 }
 
@@ -215,7 +243,7 @@ func TestInconsistentActionTargetMessageRejectsNamespacedNamespaceTarget(t *test
 		Arguments: map[string]any{
 			"command": "kubectl get namespace tenant-a -n tenant-a -o yaml",
 			"target": map[string]any{
-				"resource":  "namespace",
+				"resource":  "Namespace",
 				"namespace": "tenant-a",
 				"name":      "tenant-a",
 			},
@@ -227,12 +255,44 @@ func TestInconsistentActionTargetMessageRejectsNamespacedNamespaceTarget(t *test
 	}
 }
 
+func TestInconsistentActionTargetMessageRejectsUnknownActionTargetResource(t *testing.T) {
+	call := gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl describe unknown clst-pz02-shs1006-04 -n tenant-a",
+			"target": map[string]any{
+				"resource":  "unknown",
+				"namespace": "tenant-a",
+				"name":      "clst-pz02-shs1006-04",
+			},
+		},
+	}
+	got, invalid := inconsistentActionTargetMessage(call)
+	if !invalid || !strings.Contains(got, "`unknown` is not a Kubernetes resource kind") {
+		t.Fatalf("expected unknown action target to be rejected, got invalid=%v message=%q", invalid, got)
+	}
+}
+
+func TestKubectlCommandUsesUnknownResourceRejectsGetDescribeOnly(t *testing.T) {
+	for _, command := range []string{
+		"kubectl describe unknown clst-pz02-shs1006-04 -n tenant-a",
+		"kubectl get cluster,unknown clst-pz02-shs1006-04 -n tenant-a",
+	} {
+		if !kubectlCommandUsesUnknownResource(command) {
+			t.Fatalf("expected unknown resource to be detected in %q", command)
+		}
+	}
+	if kubectlCommandUsesUnknownResource("kubectl logs unknown -n tenant-a") {
+		t.Fatal("kubectl logs unknown should be treated as a pod name, not an unknown resource kind")
+	}
+}
+
 func TestRequestContextRejectsNamespaceAsPrimaryTargetWithNamespaceScope(t *testing.T) {
 	_, ok := requestContextFromFunctionCall(gollm.FunctionCall{
 		Name: internalRequestContextCall,
 		Arguments: map[string]any{
 			"primary_target": map[string]any{
-				"resource": "namespace",
+				"resource": "Namespace",
 				"name":     "tenant-a",
 			},
 			"scope": map[string]any{
@@ -243,6 +303,155 @@ func TestRequestContextRejectsNamespaceAsPrimaryTargetWithNamespaceScope(t *test
 	})
 	if ok {
 		t.Fatal("expected namespace primary target with namespace scope to be rejected")
+	}
+}
+
+func TestRequestContextRejectsUnknownPrimaryTargetResource(t *testing.T) {
+	_, ok := requestContextFromFunctionCall(gollm.FunctionCall{
+		Name: internalRequestContextCall,
+		Arguments: map[string]any{
+			"primary_target": map[string]any{
+				"resource": "unknown",
+				"name":     "clst-pz02-shs1006-04",
+			},
+			"scope": map[string]any{
+				"namespace": "tenant-a",
+			},
+			"resource_class": "unknown",
+		},
+	})
+	if ok {
+		t.Fatal("expected unknown primary target resource to be rejected")
+	}
+}
+
+func TestRequestContextNormalizesPrimaryTargetResource(t *testing.T) {
+	got, ok := requestContextFromFunctionCall(gollm.FunctionCall{
+		Name: internalRequestContextCall,
+		Arguments: map[string]any{
+			"primary_target": map[string]any{
+				"resource": "Cluster",
+				"name":     "cluster-a",
+			},
+			"scope": map[string]any{
+				"namespace": "tenant-a",
+			},
+			"resource_class": "custom_resource",
+		},
+	})
+	if !ok {
+		t.Fatal("expected request context to be accepted")
+	}
+	if got.PrimaryTarget.Resource != "cluster" {
+		t.Fatalf("expected normalized primary target resource, got %q", got.PrimaryTarget.Resource)
+	}
+}
+
+func TestRequirementAnalysisDerivesRequestContextOnlyForResourceCandidates(t *testing.T) {
+	if _, ok := requestContextFromRequirementAnalysis(requirementAnalysis{
+		RequestType: "diagnosis",
+		Action:      "diagnose_problem",
+		Target:      requirementAnalysisTarget{Category: "cluster"},
+	}); ok {
+		t.Fatal("non-resource target analysis must not become a Kubernetes resource context")
+	}
+
+	got, ok := requestContextFromRequirementAnalysis(requirementAnalysis{
+		RequestType: "diagnosis",
+		Action:      "diagnose_problem",
+		Target:      requirementAnalysisTarget{Category: "resource"},
+		Resources: []requirementResource{{
+			Kind: "cluster",
+			Name: "cluster-a",
+			Role: "primary",
+		}},
+		Scope: requirementScope{Type: "namespaced", Namespace: "tenant-a"},
+	})
+	if !ok {
+		t.Fatal("primary resource candidate should derive request context")
+	}
+	if got.PrimaryTarget.Resource != "cluster" || got.PrimaryTarget.Name != "cluster-a" || got.Scope.Namespace != "tenant-a" {
+		t.Fatalf("unexpected derived request context: %#v", got)
+	}
+}
+
+func TestRequirementAnalysisRejectsLegacyTargetKind(t *testing.T) {
+	legacyCurrentCluster := "current" + "_cluster"
+	_, ok := requirementAnalysisFromFunctionCall(gollm.FunctionCall{
+		Name: internalRequirementAnalysisCall,
+		Arguments: map[string]any{
+			"request_type": "diagnosis",
+			"action":       "diagnose_problem",
+			"target": map[string]any{
+				"kind":        legacyCurrentCluster,
+				"description": "connected Kubernetes cluster",
+			},
+			"scope": map[string]any{
+				"type": "cluster_scoped",
+			},
+		},
+	})
+	if ok {
+		t.Fatal("legacy target field analysis must be rejected")
+	}
+}
+
+func TestRequirementAnalysisDoesNotDeriveUnknownResourceContext(t *testing.T) {
+	if _, ok := requestContextFromRequirementAnalysis(requirementAnalysis{
+		RequestType: "diagnosis",
+		Action:      "diagnose_problem",
+		Target:      requirementAnalysisTarget{Category: "resource"},
+		Resources: []requirementResource{{
+			Kind: "unknown",
+			Name: "cluster-a",
+			Role: "primary",
+		}},
+		Scope: requirementScope{Type: "namespaced", Namespace: "tenant-a"},
+	}); ok {
+		t.Fatal("unknown resource candidate must not become request context")
+	}
+}
+
+func TestRequirementAnalysisAllowsOpenTargetCategory(t *testing.T) {
+	got, ok := requirementAnalysisFromFunctionCall(gollm.FunctionCall{
+		Name: internalRequirementAnalysisCall,
+		Arguments: map[string]any{
+			"request_type": "inspection",
+			"action":       "inspect_certificate_rotation",
+			"target": map[string]any{
+				"category":    "certificate_lifecycle",
+				"description": "certificate rotation state",
+			},
+			"scope": map[string]any{
+				"type": "custom_scope",
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("open natural-language target categories should be accepted")
+	}
+	if got.Target.Category != "certificate_lifecycle" || got.Scope.Type != "custom_scope" {
+		t.Fatalf("unexpected open classification: %#v", got)
+	}
+}
+
+func TestRequirementAnalysisNormalizesResourceRoleSynonym(t *testing.T) {
+	got, ok := requestContextFromRequirementAnalysis(requirementAnalysis{
+		RequestType: "inspection",
+		Action:      "inspect_object",
+		Target:      requirementAnalysisTarget{Category: "kubernetes_resource"},
+		Resources: []requirementResource{{
+			Kind: "cluster",
+			Name: "cluster-a",
+			Role: normalizeRequirementResourceRole("target"),
+		}},
+		Scope: requirementScope{Type: "namespaced", Namespace: "tenant-a"},
+	})
+	if !ok {
+		t.Fatal("target role synonym should become primary request context")
+	}
+	if got.PrimaryTarget.Resource != "cluster" || got.PrimaryTarget.Name != "cluster-a" {
+		t.Fatalf("unexpected request context: %#v", got)
 	}
 }
 
@@ -259,6 +468,12 @@ func TestInitialResourceGuideLookupUsesRuntimeCRDDiscovery(t *testing.T) {
 	}, clusterClass) {
 		t.Fatal("CRDs should trigger initial guide lookup even when model class hint is wrong")
 	}
+	if !loop.shouldRunInitialResourceGuideLookup(requestContext{
+		PrimaryTarget: requestPrimaryTarget{Resource: "cluster"},
+		ResourceClass: "unknown",
+	}, clusterClass) {
+		t.Fatal("CRD resource candidates should trigger initial guide lookup even without an object name")
+	}
 
 	podClass := loop.classifyResourceByDiscovery(context.Background(), "pod")
 	if podClass.Kind != resourceClassificationBuiltin {
@@ -270,6 +485,51 @@ func TestInitialResourceGuideLookupUsesRuntimeCRDDiscovery(t *testing.T) {
 		ResourceClass: "custom_resource",
 	}, podClass) {
 		t.Fatal("built-in resources must not trigger initial guide lookup even when model class hint is wrong")
+	}
+}
+
+func TestFinalReportRequiresDocumentedFields(t *testing.T) {
+	if _, ok := finalReportFromFunctionCall(gollm.FunctionCall{
+		Name: internalFinalReportCall,
+		Arguments: map[string]any{
+			"conclusive": true,
+		},
+	}); ok {
+		t.Fatal("final_report without documented required fields must be rejected")
+	}
+
+	report, ok := finalReportFromFunctionCall(gollm.FunctionCall{
+		Name: internalFinalReportCall,
+		Arguments: map[string]any{
+			"conclusive":        true,
+			"conclusion":        "cluster is healthy",
+			"attempted":         []any{"checked cluster"},
+			"evidence_known":    []any{"status is healthy"},
+			"most_likely_cause": "none",
+		},
+	})
+	if !ok || !report.Conclusive {
+		t.Fatalf("expected valid conclusive final report, got ok=%v report=%#v", ok, report)
+	}
+}
+
+func TestNextDirectionsKeepsAtMostThreeValidOptions(t *testing.T) {
+	got, ok := nextDirectionsFromFunctionCall(gollm.FunctionCall{
+		Name: internalNextDirectionsCall,
+		Arguments: map[string]any{
+			"options": []any{
+				map[string]any{"kind": "different_approach", "summary": "A", "instruction": "try A"},
+				map[string]any{"kind": "different_approach", "summary": "B", "instruction": "try B"},
+				map[string]any{"kind": "another_guide", "summary": "C", "resource_family": "cluster", "problem_focus": "sync issue"},
+				map[string]any{"kind": "different_approach", "summary": "D", "instruction": "try D"},
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("expected next_directions to be valid")
+	}
+	if len(got.Options) != 3 {
+		t.Fatalf("expected only three options, got %#v", got.Options)
 	}
 }
 

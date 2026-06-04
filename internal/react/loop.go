@@ -16,7 +16,6 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	"github.com/google/uuid"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
-	"github.com/namgon-kim/kinx-k8s-assistant/internal/guidance"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/toolconnector"
 	"k8s.io/klog/v2"
 )
@@ -27,6 +26,8 @@ const (
 	StateIdle State = iota
 	StateRunning
 	StateWaitingApproval
+	StateWaitingDirectionChoice
+	StateWaitingDirectionText
 	StateDone
 	StateExited
 )
@@ -41,6 +42,9 @@ type PendingCall struct {
 
 const internalResourceGuideLookupCall = "__resource_guide_lookup__"
 const internalRequestContextCall = "__request_context__"
+const internalRequirementAnalysisCall = "__requirement_analysis__"
+const internalFinalReportCall = "__final_report__"
+const internalNextDirectionsCall = "__next_directions__"
 
 type Loop struct {
 	cfg      *config.Config
@@ -66,6 +70,7 @@ type Loop struct {
 	toolProfile            ToolProfile
 	requestIntent          RequestIntent
 	originalQuery          string
+	requirementAnalysis    *requirementAnalysis
 	requestContext         *requestContext
 	resourceClassification *resourceClassification
 	resourceDiscoveryCache map[string]resourceClassification
@@ -82,8 +87,57 @@ type Loop struct {
 	resourceGuideEvidence  []string
 	resourceGuideQueries   map[string]struct{}
 
+	guideStepState         *guideStepState
+	finalReportRequested   bool
+	pendingFinalReport     *finalReport
+	pendingNextDirections  *nextDirections
+	pendingDirectionPrompt *directionPromptState
+
 	cancel context.CancelFunc
 	once   sync.Once
+}
+
+type guideStepState struct {
+	GuideID          string
+	Title            string
+	TotalSteps       int
+	StepDescriptions []string
+	Completed        map[int]bool
+}
+
+func (g *guideStepState) allCompleted() bool {
+	if g == nil || g.TotalSteps == 0 {
+		return false
+	}
+	for i := 1; i <= g.TotalSteps; i++ {
+		if !g.Completed[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (g *guideStepState) remainingSteps() []int {
+	if g == nil {
+		return nil
+	}
+	var remaining []int
+	for i := 1; i <= g.TotalSteps; i++ {
+		if !g.Completed[i] {
+			remaining = append(remaining, i)
+		}
+	}
+	return remaining
+}
+
+// directionPromptState records the LLM-proposed next_directions options that
+// were rendered to the user, so the user's choice index can be mapped back to
+// a concrete continuation action.
+type directionPromptState struct {
+	Options       []nextDirectionOption
+	HasFreeInput  bool
+	FreeInputIdx  int
+	FinalizeIdx   int
 }
 
 func New(cfg *config.Config) (*Loop, error) {
@@ -231,6 +285,14 @@ func (l *Loop) run(ctx context.Context, initialQuery string) {
 			if !l.waitForApproval(ctx) {
 				return
 			}
+		case StateWaitingDirectionChoice:
+			if !l.waitForDirectionChoice(ctx) {
+				return
+			}
+		case StateWaitingDirectionText:
+			if !l.waitForDirectionText(ctx) {
+				return
+			}
 		case StateRunning:
 			if err := l.runIteration(ctx); err != nil {
 				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
@@ -312,10 +374,13 @@ func (l *Loop) startQuery(query string) error {
 	if priorState != "" {
 		l.currChatContent = append(l.currChatContent, priorState)
 	}
+	l.currChatContent = append(l.currChatContent, requirementAnalysisPrompt())
+	l.currChatContent = append(l.currChatContent, requirementAnalysisDefinitionPrompt())
 	l.currChatContent = append(l.currChatContent, query)
 	l.contextBlockHashes = nil
 	l.pendingCalls = nil
 	l.originalQuery = query
+	l.requirementAnalysis = nil
 	l.requestContext = nil
 	l.resourceClassification = nil
 	l.lastContextError = nil
@@ -329,6 +394,11 @@ func (l *Loop) startQuery(query string) error {
 	l.resourceGuideInjected = false
 	l.resourceGuideEvidence = nil
 	l.resourceGuideQueries = nil
+	l.guideStepState = nil
+	l.finalReportRequested = false
+	l.pendingFinalReport = nil
+	l.pendingNextDirections = nil
+	l.pendingDirectionPrompt = nil
 	l.state = StateRunning
 	return nil
 }
@@ -397,6 +467,7 @@ func (l *Loop) clearConversationState() {
 	l.contextBlockHashes = nil
 	l.pendingCalls = nil
 	l.originalQuery = ""
+	l.requirementAnalysis = nil
 	l.requestContext = nil
 	l.resourceClassification = nil
 	l.lastContextError = nil
@@ -411,6 +482,11 @@ func (l *Loop) clearConversationState() {
 	l.resourceGuideInjected = false
 	l.resourceGuideEvidence = nil
 	l.resourceGuideQueries = nil
+	l.guideStepState = nil
+	l.finalReportRequested = false
+	l.pendingFinalReport = nil
+	l.pendingNextDirections = nil
+	l.pendingDirectionPrompt = nil
 }
 
 func (l *Loop) noteContextContent(contents ...any) {
@@ -427,7 +503,10 @@ func (l *Loop) contextLimitTokens() int {
 			return parsed
 		}
 	}
-	model := strings.ToLower(strings.TrimSpace(l.cfg.Model))
+	model := ""
+	if l.cfg != nil {
+		model = strings.ToLower(strings.TrimSpace(l.cfg.Model))
+	}
 	switch {
 	case strings.Contains(model, "llama-3.3"):
 		return 32768
@@ -475,7 +554,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		l.compactBeforeNextIteration("Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it.")
 	}
 
-	sentContent := append([]any(nil), l.currChatContent...)
+	sentContent := l.buildIterationSendContent()
 	streamedText, functionCalls, err := l.sendAndCollectStreaming(ctx, sentContent)
 	if err != nil {
 		if !isContextLengthError(err) {
@@ -484,7 +563,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		if ok := l.compactAfterContextLengthError(err); !ok {
 			return err
 		}
-		sentContent = append([]any(nil), l.currChatContent...)
+		sentContent = l.buildIterationSendContent()
 		streamedText, functionCalls, err = l.sendAndCollectStreaming(ctx, sentContent)
 		if err != nil {
 			return err
@@ -492,6 +571,22 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 	l.noteContextContent(sentContent...)
 	l.currChatContent = nil
+
+	if len(functionCalls) == 0 {
+		if l.requirementAnalysis == nil && strings.TrimSpace(streamedText) != "" {
+			if parsed, err := parseReActResponse(streamedText); err == nil && parsed.RequirementAnalysis != nil {
+				functionCalls = []gollm.FunctionCall{{
+					Name:      internalRequirementAnalysisCall,
+					Arguments: requirementAnalysisToArguments(parsed.RequirementAnalysis),
+				}}
+			}
+		}
+		if len(functionCalls) == 0 && l.requirementAnalysis == nil {
+			if handled := l.requireRequirementAnalysisBeforeAction(nil); handled {
+				return nil
+			}
+		}
+	}
 
 	if len(functionCalls) == 0 {
 		if strings.TrimSpace(streamedText) != "" {
@@ -508,6 +603,10 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 	deferredProgressText := strings.TrimSpace(streamedText)
 
+	if handled := l.requireRequirementAnalysisBeforeAction(functionCalls); handled {
+		return nil
+	}
+
 	var requestContextHandled bool
 	functionCalls, requestContextHandled = l.consumeRequestContext(ctx, functionCalls)
 	if requestContextHandled {
@@ -518,7 +617,27 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		return nil
 	}
 
+	var finalReportHandled bool
+	functionCalls, finalReportHandled = l.consumeFinalReport(ctx, functionCalls)
+	if finalReportHandled {
+		return nil
+	}
+
+	var nextDirectionsHandled bool
+	functionCalls, nextDirectionsHandled = l.consumeNextDirections(ctx, functionCalls)
+	if nextDirectionsHandled {
+		return nil
+	}
+
 	if handled := l.rejectInconsistentActionTargets(functionCalls); handled {
+		return nil
+	}
+
+	if handled := l.rejectInvalidKubectlResources(functionCalls); handled {
+		return nil
+	}
+
+	if handled := l.rejectUnrelatedFirstDiagnostic(functionCalls); handled {
 		return nil
 	}
 
@@ -562,6 +681,27 @@ func (l *Loop) runIteration(ctx context.Context) error {
 
 	l.emitAcceptedProgressText(ctx, deferredProgressText)
 	return l.dispatchToolCalls(ctx)
+}
+
+// buildIterationSendContent assembles the message list that will be sent to
+// the LLM for the current iteration. It prepends two compact anchors so the
+// model keeps the originally determined request and the active guide step in
+// active attention across many iterations of tool observations:
+//   - requirement_analysis anchor (the user's classified request)
+//   - guide-step anchor (the resource guide's diagnostic-step progress)
+//
+// Order is: [requirement_analysis] → [guide_step] → currChatContent (latest
+// observations). The guide anchor is closer to the latest observation on
+// purpose; the model should consult it just before deciding the next action.
+func (l *Loop) buildIterationSendContent() []any {
+	sentContent := append([]any(nil), l.currChatContent...)
+	if anchor := l.guideStepAnchor(); anchor != "" {
+		sentContent = append([]any{anchor}, sentContent...)
+	}
+	if anchor := l.requirementAnalysisAnchor(); anchor != "" {
+		sentContent = append([]any{anchor}, sentContent...)
+	}
+	return sentContent
 }
 
 func (l *Loop) sendAndCollectStreaming(ctx context.Context, contents []any) (string, []gollm.FunctionCall, error) {
@@ -644,302 +784,6 @@ func isContextLengthError(err error) bool {
 		if strings.Contains(text, marker) {
 			return true
 		}
-	}
-	return false
-}
-
-func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
-	var remaining []gollm.FunctionCall
-	for _, call := range calls {
-		if call.Name != internalRequestContextCall {
-			remaining = append(remaining, call)
-			continue
-		}
-		if l.requestContext != nil {
-			continue
-		}
-		request, ok := requestContextFromFunctionCall(call)
-		if !ok {
-			l.appendCorrectionWithCompaction("invalid_request_context", "Request context was invalid. Return one corrected response with primary_target, scope, and resource_class before choosing the next action. Namespace is a scope field unless the user explicitly asks about a Namespace object; do not set primary_target.resource=namespace while also setting scope.namespace.")
-			l.currIteration++
-			l.state = StateRunning
-			return nil, true
-		}
-		l.requestContext = &request
-		classification := l.classifyResourceByDiscovery(ctx, request.PrimaryTarget.Resource)
-		l.resourceClassification = &classification
-		if l.shouldRunInitialResourceGuideLookup(request, classification) {
-			l.initialGuideAttempted = true
-			resource := normalizeKubectlResource(request.PrimaryTarget.Resource)
-			l.searchAndInjectResourceGuide(ctx, resource, l.initialResourceGuideQuery(request))
-			return nil, true
-		}
-	}
-	return remaining, false
-}
-
-func requestContextFromFunctionCall(call gollm.FunctionCall) (requestContext, bool) {
-	var request requestContext
-	primaryRaw, ok := call.Arguments["primary_target"].(map[string]any)
-	if !ok {
-		return request, false
-	}
-	resource, _ := primaryRaw["resource"].(string)
-	name, _ := primaryRaw["name"].(string)
-	resourceClass, _ := call.Arguments["resource_class"].(string)
-	request.PrimaryTarget = requestPrimaryTarget{
-		Resource: strings.TrimSpace(resource),
-		Name:     strings.TrimSpace(name),
-	}
-	if scopeRaw, ok := call.Arguments["scope"].(map[string]any); ok {
-		namespace, _ := scopeRaw["namespace"].(string)
-		request.Scope.Namespace = strings.TrimSpace(namespace)
-	}
-	switch strings.ToLower(strings.TrimSpace(resourceClass)) {
-	case "built_in", "custom_resource", "unknown":
-		request.ResourceClass = strings.ToLower(strings.TrimSpace(resourceClass))
-	default:
-		return requestContext{}, false
-	}
-	if request.PrimaryTarget.Resource == "" {
-		return requestContext{}, false
-	}
-	if request.PrimaryTarget.Resource == "namespace" && request.Scope.Namespace != "" {
-		return requestContext{}, false
-	}
-	return request, true
-}
-
-func (l *Loop) shouldRunInitialResourceGuideLookup(request requestContext, classification resourceClassification) bool {
-	if l.initialGuideAttempted {
-		return false
-	}
-	resource := normalizeKubectlResource(strings.ToLower(request.PrimaryTarget.Resource))
-	if resource == "" {
-		return false
-	}
-	return classification.Kind == resourceClassificationCRD
-}
-
-func (l *Loop) initialResourceGuideQuery(request requestContext) string {
-	lines := []string{
-		l.originalQuery,
-		"primary target resource: " + request.PrimaryTarget.Resource,
-	}
-	if l.resourceClassification != nil {
-		lines = append(lines,
-			"resource classification: "+l.resourceClassification.Kind,
-			"classification source: "+l.resourceClassification.Source,
-		)
-		if l.resourceClassification.APIGroup != "" {
-			lines = append(lines, "api group: "+l.resourceClassification.APIGroup)
-		}
-	}
-	if request.PrimaryTarget.Name != "" {
-		lines = append(lines, "primary target name: "+request.PrimaryTarget.Name)
-	}
-	if request.Scope.Namespace != "" {
-		lines = append(lines, "scope namespace: "+request.Scope.Namespace)
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (l *Loop) rejectInconsistentActionTargets(calls []gollm.FunctionCall) bool {
-	for _, call := range calls {
-		message, invalid := inconsistentActionTargetMessage(call)
-		if !invalid {
-			continue
-		}
-		if !l.appendCorrectionWithCompaction("inconsistent_action_target", message) {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 action target 불일치로 루프를 중단했습니다:\n"+message)
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.state = StateDone
-			return true
-		}
-		l.pendingCalls = nil
-		l.currIteration++
-		l.state = StateRunning
-		return true
-	}
-	return false
-}
-
-func inconsistentActionTargetMessage(call gollm.FunctionCall) (string, bool) {
-	command, ok := kubectlCommandFromFunctionCall(call)
-	if !ok {
-		return "", false
-	}
-	target, ok := actionTargetFromFunctionCall(call)
-	if !ok {
-		return "", false
-	}
-	if target.Resource == "namespace" && target.Namespace != "" {
-		return fmt.Sprintf("Action target declared resource %q with namespace scope %q, but Namespace objects are cluster-scoped. Use resource=namespace only when diagnosing a Namespace object itself; otherwise keep namespace as scope for the real target resource.", target.Resource, target.Namespace), true
-	}
-	if target.Resource != "" && !commandMentionsResource(command, target.Resource) {
-		return fmt.Sprintf("Action target declared resource %q, but command %q does not include that resource. Preserve the declared target and return one corrected next action.", target.Resource, command), true
-	}
-	if target.Name != "" && !commandMentionsToken(command, target.Name) && !commandUsesSelectorForName(command, target.Name) {
-		return fmt.Sprintf("Action target declared name %q, but command %q does not include that name. Preserve the declared target and return one corrected next action.", target.Name, command), true
-	}
-	if target.Namespace != "" && !commandUsesNamespace(command, target.Namespace) {
-		return fmt.Sprintf("Action target declared namespace %q, but command %q omits that namespace. Preserve the declared target and return one corrected next action with `-n %s` or `--namespace=%s`.", target.Namespace, command, target.Namespace, target.Namespace), true
-	}
-	return "", false
-}
-
-func actionTargetFromFunctionCall(call gollm.FunctionCall) (actionTarget, bool) {
-	raw, ok := call.Arguments["target"].(map[string]any)
-	if !ok {
-		return actionTarget{}, false
-	}
-	resource, _ := raw["resource"].(string)
-	namespace, _ := raw["namespace"].(string)
-	name, _ := raw["name"].(string)
-	target := actionTarget{
-		Resource:  strings.TrimSpace(resource),
-		Namespace: strings.TrimSpace(namespace),
-		Name:      strings.TrimSpace(name),
-	}
-	if target.Resource == "" && target.Namespace == "" && target.Name == "" {
-		return actionTarget{}, false
-	}
-	return target, true
-}
-
-func commandMentionsToken(command, token string) bool {
-	token = strings.ToLower(strings.TrimSpace(token))
-	if token == "" {
-		return true
-	}
-	for _, field := range strings.Fields(command) {
-		if strings.ToLower(strings.Trim(field, "'\"")) == token {
-			return true
-		}
-	}
-	return false
-}
-
-func commandMentionsResource(command, resource string) bool {
-	wants := normalizedResourceList(resource)
-	if len(wants) == 0 {
-		return true
-	}
-	var mentioned []string
-	for _, field := range strings.Fields(strings.ToLower(command)) {
-		for _, part := range strings.Split(strings.Trim(field, "'\","), ",") {
-			part = normalizeKubectlResource(strings.TrimSpace(part))
-			if part != "" {
-				mentioned = append(mentioned, part)
-			}
-		}
-	}
-	for _, want := range wants {
-		if !resourceListContains(mentioned, want) {
-			return false
-		}
-	}
-	return true
-}
-
-func normalizedResourceList(resource string) []string {
-	var resources []string
-	for _, part := range strings.Split(strings.ToLower(strings.TrimSpace(resource)), ",") {
-		part = normalizeKubectlResource(strings.TrimSpace(part))
-		if part != "" {
-			resources = append(resources, part)
-		}
-	}
-	return resources
-}
-
-func resourceListContains(resources []string, want string) bool {
-	for _, resource := range resources {
-		if resourceNamesEquivalent(resource, want) {
-			return true
-		}
-	}
-	return false
-}
-
-func resourceNamesEquivalent(a, b string) bool {
-	a = normalizeKubectlResource(strings.ToLower(strings.TrimSpace(a)))
-	b = normalizeKubectlResource(strings.ToLower(strings.TrimSpace(b)))
-	if a == "" || b == "" {
-		return false
-	}
-	a = strings.Split(a, ".")[0]
-	b = strings.Split(b, ".")[0]
-	if a == b {
-		return true
-	}
-	return singularizeResourceName(a) == b || singularizeResourceName(b) == a
-}
-
-func singularizeResourceName(resource string) string {
-	switch {
-	case strings.HasSuffix(resource, "ies") && len(resource) > 3:
-		return strings.TrimSuffix(resource, "ies") + "y"
-	case strings.HasSuffix(resource, "s") && len(resource) > 1:
-		return strings.TrimSuffix(resource, "s")
-	default:
-		return resource
-	}
-}
-
-func commandUsesSelectorForName(command, name string) bool {
-	name = strings.ToLower(strings.TrimSpace(name))
-	if name == "" {
-		return true
-	}
-	lower := strings.ToLower(command)
-	return strings.Contains(lower, "cluster-name="+name) ||
-		strings.Contains(lower, "cluster-name: "+name) ||
-		strings.Contains(lower, "cluster.x-k8s.io/cluster-name="+name)
-}
-
-func commandUsesNamespace(command, namespace string) bool {
-	fields := strings.Fields(command)
-	for i, field := range fields {
-		trimmed := strings.Trim(field, "'\"")
-		if (trimmed == "-n" || trimmed == "--namespace") && i+1 < len(fields) && strings.Trim(fields[i+1], "'\"") == namespace {
-			return true
-		}
-		if strings.HasPrefix(trimmed, "--namespace=") && strings.TrimPrefix(trimmed, "--namespace=") == namespace {
-			return true
-		}
-	}
-	return false
-}
-
-func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []gollm.FunctionCall) bool {
-	for _, call := range calls {
-		if call.Name != internalResourceGuideLookupCall {
-			continue
-		}
-		request, ok := resourceGuideLookupFromFunctionCall(call)
-		if !ok {
-			l.appendCorrectionWithCompaction("invalid_resource_guide_lookup", "Resource guide lookup request was invalid. Continue with the next safest kubectl diagnostic.")
-			l.currIteration++
-			l.state = StateRunning
-			return true
-		}
-		if l.resourceClassification == nil || l.resourceClassification.Kind != resourceClassificationCRD {
-			l.appendCorrectionWithCompaction("resource_guide_without_confirmed_crd", "Resource guide lookup is only available after runtime discovery confirms the primary target is a CRD. Continue with the next safest kubectl diagnostic and do not infer a CRD or Cluster API family from the name alone.")
-			l.currIteration++
-			l.state = StateRunning
-			return true
-		}
-		query := l.resourceGuideRefinementQuery(request)
-		if l.resourceGuideQueryAlreadyUsed(query) {
-			l.appendCorrectionWithCompaction("duplicate_resource_guide_lookup", "That refined resource-guide lookup was already performed for the same problem focus and evidence. Do not repeat it; choose the next kubectl diagnostic or answer from the evidence.")
-			l.currIteration++
-			l.state = StateRunning
-			return true
-		}
-		l.searchAndInjectResourceGuide(ctx, request.ResourceFamily, query)
-		return true
 	}
 	return false
 }
@@ -1425,502 +1269,14 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 
 	l.pendingCalls = nil
 	l.currIteration++
+	if l.guideStepState != nil && l.guideStepState.allCompleted() && !l.finalReportRequested {
+		l.requestFinalReportFromModel()
+	}
 	if l.shouldCompactBeforeNextSend() {
 		l.compactBeforeNextIteration("Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it.")
 	}
 	l.state = StateRunning
 	return nil
-}
-
-func (l *Loop) interceptCustomResourceFunctionCalls(ctx context.Context, calls []gollm.FunctionCall) bool {
-	if l.resourceGuideInjected || l.initialGuideAttempted {
-		return false
-	}
-	for _, call := range calls {
-		command, ok := kubectlCommandFromFunctionCall(call)
-		if !ok {
-			continue
-		}
-		resource, ok := customResourceCandidateFromKubectl(command)
-		if !ok {
-			continue
-		}
-		classification := l.classifyResourceByDiscovery(ctx, resource)
-		l.resourceClassification = &classification
-		if classification.Kind != resourceClassificationCRD {
-			continue
-		}
-		l.resourceGuideEvidence = append(l.resourceGuideEvidence, command)
-		l.initialGuideAttempted = true
-		l.searchAndInjectResourceGuide(ctx, resource, l.resourceGuideQuery(resource))
-		return true
-	}
-	return false
-}
-
-func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query string) {
-	l.markResourceGuideQuery(query)
-	client, err := guidance.NewResourceGuideClient(l.cfg)
-	if err != nil {
-		klog.Warningf("resource guidance client init failed: %v", err)
-		l.injectResourceGuideUnavailable(resource, "client_init_failed")
-		return
-	}
-	if client.KnowledgeProvider() != guidance.KnowledgeProviderQdrant {
-		l.injectResourceGuideUnavailable(resource, "provider="+string(client.KnowledgeProvider()))
-		return
-	}
-	searchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	found, err := client.SearchGuides(searchCtx, query)
-	cancel()
-	if err != nil {
-		klog.Warningf("resource guidance search failed: %v", err)
-		l.injectResourceGuideUnavailable(resource, "search_failed")
-		return
-	}
-	l.injectResourceGuideAttempt(resource, found)
-}
-
-func (l *Loop) resourceGuideQueryAlreadyUsed(query string) bool {
-	if l.resourceGuideQueries == nil {
-		return false
-	}
-	_, ok := l.resourceGuideQueries[query]
-	return ok
-}
-
-func (l *Loop) markResourceGuideQuery(query string) {
-	if l.resourceGuideQueries == nil {
-		l.resourceGuideQueries = make(map[string]struct{})
-	}
-	l.resourceGuideQueries[query] = struct{}{}
-}
-
-func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.GuideSearchResult) {
-	l.resourceGuideInjected = true
-	includeClusterAPI := guideResultImpliesClusterAPI(found)
-	l.promptOptions = l.newPromptOptions(l.requestIntent, true, includeClusterAPI)
-	if l.shouldCompactForStateRewrite() {
-		before := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
-		limit := l.contextLimitTokens()
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("↻ context compacting: injecting CRD guide context for %s; preserving question, procedure order, clues, and next action. estimated context %d/%d tokens.", resource, before, limit))
-		if err := l.resetChatSession(); err != nil {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
-			l.pendingCalls = nil
-			l.state = StateDone
-			return
-		}
-		l.currChatContent = []any{l.compactedStateMessage("Use the following guide context as decision support, then choose the next safest step.")}
-		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
-		after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("✓ context compacted: CRD guide context injected for %s. estimated context %d/%d tokens.", resource, after, limit))
-	} else {
-		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("ℹ resource guide injected for CRD %s without context compact.", resource))
-	}
-	l.pendingCalls = nil
-	l.currIteration++
-	l.state = StateRunning
-}
-
-func (l *Loop) injectResourceGuideUnavailable(resource, reason string) {
-	l.resourceGuideInjected = true
-	l.promptOptions = l.newPromptOptions(l.requestIntent, true, false)
-	content := formatResourceGuideUnavailableObservation(resource, reason)
-	if l.shouldCompactForStateRewrite() {
-		before := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
-		limit := l.contextLimitTokens()
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("↻ context compacting: recording unavailable CRD guide context for %s; preserving question, procedure order, clues, and next action. estimated context %d/%d tokens.", resource, before, limit))
-		if err := l.resetChatSession(); err != nil {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
-			l.pendingCalls = nil
-			l.state = StateDone
-			return
-		}
-		l.currChatContent = []any{l.compactedStateMessage("Resource guide lookup was unavailable; continue with custom-resource-aware diagnostics.")}
-		l.appendGuideObservation(guideRef{GuideID: "unavailable:" + resource + ":" + reason, Hash: contextHash(content)}, content)
-		after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("✓ context compacted: unavailable CRD guide context recorded for %s. estimated context %d/%d tokens.", resource, after, limit))
-	} else {
-		l.appendGuideObservation(guideRef{GuideID: "unavailable:" + resource + ":" + reason, Hash: contextHash(content)}, content)
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("ℹ resource guide unavailable for CRD %s (%s); continuing without context compact.", resource, reason))
-	}
-	l.pendingCalls = nil
-	l.currIteration++
-	l.state = StateRunning
-}
-
-func (l *Loop) resourceGuideQuery(resource string) string {
-	lines := []string{l.originalQuery, "observed custom resource: " + resource}
-	if l.resourceClassification != nil {
-		lines = append(lines,
-			"resource classification: "+l.resourceClassification.Kind,
-			"classification source: "+l.resourceClassification.Source,
-		)
-		if l.resourceClassification.APIGroup != "" {
-			lines = append(lines, "api group: "+l.resourceClassification.APIGroup)
-		}
-	}
-	return strings.Join(append(lines, l.resourceGuideEvidence...), "\n")
-}
-
-func (l *Loop) resourceGuideRefinementQuery(request resourceGuideLookup) string {
-	return strings.Join([]string{
-		l.originalQuery,
-		"resource family: " + request.ResourceFamily,
-		"problem focus: " + request.ProblemFocus,
-		"reason for refinement: " + request.Reason,
-		"observed evidence: " + request.Evidence,
-	}, "\n")
-}
-
-func resourceGuideLookupFromFunctionCall(call gollm.FunctionCall) (resourceGuideLookup, bool) {
-	var request resourceGuideLookup
-	resourceFamily, familyOK := call.Arguments["resource_family"].(string)
-	problemFocus, focusOK := call.Arguments["problem_focus"].(string)
-	reason, reasonOK := call.Arguments["reason"].(string)
-	evidence, evidenceOK := call.Arguments["evidence"].(string)
-	if !familyOK || !focusOK || !reasonOK || !evidenceOK {
-		return request, false
-	}
-	request = resourceGuideLookup{
-		ResourceFamily: strings.TrimSpace(resourceFamily),
-		ProblemFocus:   strings.TrimSpace(problemFocus),
-		Reason:         strings.TrimSpace(reason),
-		Evidence:       strings.TrimSpace(evidence),
-	}
-	if request.ResourceFamily == "" || request.ProblemFocus == "" || request.Reason == "" || request.Evidence == "" {
-		return resourceGuideLookup{}, false
-	}
-	return request, true
-}
-
-func kubectlCommandFromFunctionCall(call gollm.FunctionCall) (string, bool) {
-	return commandString(call.Arguments["command"])
-}
-
-func commandString(value any) (string, bool) {
-	command, ok := value.(string)
-	if !ok {
-		return "", false
-	}
-	command = strings.TrimSpace(command)
-	if !strings.HasPrefix(strings.ToLower(command), "kubectl ") {
-		return "", false
-	}
-	return command, true
-}
-
-func customResourceCandidateFromKubectl(command string) (string, bool) {
-	fields := strings.Fields(strings.ToLower(strings.TrimSpace(command)))
-	if len(fields) < 3 || fields[0] != "kubectl" {
-		return "", false
-	}
-	verb, verbIndex, ok := kubectlVerbAndIndexFromFields(fields, 0)
-	if !ok {
-		return "", false
-	}
-	switch verb {
-	case "get", "describe":
-	default:
-		return "", false
-	}
-	resource, ok := firstKubectlResourceArg(fields, verbIndex+1)
-	if !ok {
-		return "", false
-	}
-	resource = normalizeKubectlResource(resource)
-	if resource == "" || isBuiltinKubernetesResource(resource) {
-		return "", false
-	}
-	return resource, true
-}
-
-func firstKubectlResourceArg(fields []string, start int) (string, bool) {
-	for i := start; i < len(fields); i++ {
-		field := strings.Trim(fields[i], "'\"")
-		if field == "" {
-			continue
-		}
-		if strings.HasPrefix(field, "--") {
-			if strings.Contains(field, "=") {
-				continue
-			}
-			if kubectlFlagRequiresValue(field) && i+1 < len(fields) {
-				i++
-			}
-			continue
-		}
-		if strings.HasPrefix(field, "-") {
-			if kubectlShortFlagRequiresValue(field) && len(field) == 2 && i+1 < len(fields) {
-				i++
-			}
-			continue
-		}
-		resource := strings.Trim(field, ",")
-		if strings.Contains(resource, ",") {
-			resource = strings.Split(resource, ",")[0]
-		}
-		return resource, resource != ""
-	}
-	return "", false
-}
-
-func kubectlFlagRequiresValue(flag string) bool {
-	return kubectlGlobalFlagRequiresValue(flag) || kubectlCommandFlagRequiresValue(flag)
-}
-
-func kubectlShortFlagRequiresValue(flag string) bool {
-	return kubectlShortGlobalFlagRequiresValue(flag) || kubectlShortCommandFlagRequiresValue(flag)
-}
-
-func kubectlCommandFlagRequiresValue(flag string) bool {
-	switch flag {
-	case "--filename", "--field-selector", "--label-columns", "--output", "--output-watch-events",
-		"--raw", "--selector", "--server-print", "--sort-by", "--template", "--watch-only":
-		return true
-	default:
-		return false
-	}
-}
-
-func kubectlShortCommandFlagRequiresValue(flag string) bool {
-	switch flag {
-	case "-f", "-l", "-o", "-R", "-w":
-		return true
-	default:
-		return false
-	}
-}
-
-var builtinKubernetesResources = map[string]string{
-	"bindings": "binding", "componentstatuses": "componentstatus", "pods": "pod", "nodes": "node",
-	"services": "service", "endpoints": "endpoint", "limitranges": "limitrange", "deployments": "deployment",
-	"replicasets": "replicaset", "statefulsets": "statefulset", "daemonsets": "daemonset", "jobs": "job",
-	"cronjobs": "cronjob", "configmaps": "configmap", "secrets": "secret", "namespaces": "namespace",
-	"events": "event", "podtemplates": "podtemplate", "replicationcontrollers": "replicationcontroller",
-	"resourcequotas": "resourcequota", "ingresses": "ingress", "persistentvolumes": "persistentvolume",
-	"persistentvolumeclaims": "persistentvolumeclaim", "serviceaccounts": "serviceaccount", "roles": "role",
-	"rolebindings": "rolebinding", "clusterroles": "clusterrole", "clusterrolebindings": "clusterrolebinding",
-	"mutatingwebhookconfigurations": "mutatingwebhookconfiguration", "validatingwebhookconfigurations": "validatingwebhookconfiguration",
-	"customresourcedefinitions": "customresourcedefinition", "apiservices": "apiservice",
-	"controllerrevisions": "controllerrevision", "tokenreviews": "tokenreview",
-	"localsubjectaccessreviews": "localsubjectaccessreview", "selfsubjectaccessreviews": "selfsubjectaccessreview",
-	"selfsubjectrulesreviews": "selfsubjectrulesreview", "subjectaccessreviews": "subjectaccessreview",
-	"horizontalpodautoscalers": "horizontalpodautoscaler", "certificatesigningrequests": "certificatesigningrequest",
-	"leases": "lease", "flowschemas": "flowschema", "prioritylevelconfigurations": "prioritylevelconfiguration",
-	"ingressclasses": "ingressclass", "networkpolicies": "networkpolicy", "runtimeclasses": "runtimeclass",
-	"poddisruptionbudgets": "poddisruptionbudget", "podsecuritypolicies": "podsecuritypolicy",
-	"priorityclasses": "priorityclass", "csidrivers": "csidriver", "csinodes": "csinode",
-	"csistoragecapacities": "csistoragecapacity", "storageclasses": "storageclass",
-	"endpointslices": "endpointslice", "volumeattachments": "volumeattachment",
-	"cs": "componentstatus", "cm": "configmap", "ep": "endpoint", "ev": "event", "limits": "limitrange",
-	"ns": "namespace", "no": "node", "pvc": "persistentvolumeclaim", "pv": "persistentvolume",
-	"po": "pod", "rc": "replicationcontroller", "quota": "resourcequota", "sa": "serviceaccount",
-	"svc": "service", "crd": "customresourcedefinition", "crds": "customresourcedefinition",
-	"ds": "daemonset", "deploy": "deployment", "rs": "replicaset", "sts": "statefulset",
-	"hpa": "horizontalpodautoscaler", "cj": "cronjob", "csr": "certificatesigningrequest",
-	"ing": "ingress", "netpol": "networkpolicy", "pdb": "poddisruptionbudget", "psp": "podsecuritypolicy",
-	"pc": "priorityclass", "sc": "storageclass",
-}
-
-func normalizeKubectlResource(resource string) string {
-	if normalized, ok := builtinKubernetesResources[resource]; ok {
-		return normalized
-	}
-	return resource
-}
-
-func isBuiltinKubernetesResource(resource string) bool {
-	_, ok := builtinKubernetesResources[resource]
-	if ok {
-		return true
-	}
-	for _, normalized := range builtinKubernetesResources {
-		if resource == normalized {
-			return true
-		}
-	}
-	return false
-}
-
-func formatResourceGuideObservation(resource string, found *guidance.GuideSearchResult) string {
-	var b strings.Builder
-	b.WriteString("Resource guide lookup was triggered after runtime discovery confirmed this resource as a CRD: ")
-	b.WriteString(resource)
-	if found == nil || len(found.Cases) == 0 {
-		b.WriteString(".\nNo matching resource guide was found. Continue only with custom-resource-aware diagnostics; do not treat this resource as a built-in Kubernetes workload object.")
-		return b.String()
-	}
-	b.WriteString(".\nUse this top guide before continuing diagnosis:\n")
-	for i, c := range found.Cases {
-		if i >= 1 {
-			break
-		}
-		fmt.Fprintf(&b, "- %s", c.Title)
-		if c.ID != "" {
-			fmt.Fprintf(&b, " (guide_id: %s)", c.ID)
-		}
-		b.WriteString("\n")
-		if len(c.EvidenceKeywords) > 0 {
-			fmt.Fprintf(&b, "  evidence keywords: %s\n", strings.Join(c.EvidenceKeywords, ", "))
-		}
-		if len(c.DecisionHints) > 0 {
-			fmt.Fprintf(&b, "  decision hints: %s\n", strings.Join(c.DecisionHints, " | "))
-		}
-		if len(c.RelatedObjects) > 0 {
-			fmt.Fprintf(&b, "  related objects: %s\n", strings.Join(c.RelatedObjects, ", "))
-		}
-		if len(c.Tags) > 0 {
-			fmt.Fprintf(&b, "  tags: %s\n", strings.Join(c.Tags, ", "))
-		}
-		if cues := guideMetadataCues(c); len(cues) > 0 {
-			fmt.Fprintf(&b, "  metadata cues to inspect: %s\n", strings.Join(cues, ", "))
-		}
-		if len(c.DiagnosticSteps) > 0 {
-			b.WriteString("  diagnostic steps; preserve label selectors, annotations, and command templates exactly when applicable:\n")
-			for j, step := range c.DiagnosticSteps {
-				if j >= 5 {
-					break
-				}
-				fmt.Fprintf(&b, "    %d. %s", j+1, step.Description)
-				if step.CommandTemplate != "" {
-					fmt.Fprintf(&b, " -> %s", step.CommandTemplate)
-				}
-				if step.ExpectedOutcome != "" {
-					fmt.Fprintf(&b, " ; expected: %s", step.ExpectedOutcome)
-				}
-				if len(step.Preconditions) > 0 {
-					fmt.Fprintf(&b, " ; preconditions: %s", strings.Join(step.Preconditions, " | "))
-				}
-				b.WriteString("\n")
-			}
-		}
-		if summary := firstNonEmptyGuideText(c.Resolution, c.Cause); summary != "" {
-			fmt.Fprintf(&b, "  summary: %s\n", summary)
-		}
-	}
-	if guideResultImpliesClusterAPI(found) {
-		b.WriteString("Cluster API guardrails are enabled because the injected guide context indicates a Cluster API CRD family:\n")
-		b.WriteString("- Treat an operator-managed `Cluster` custom resource as a management-cluster control-plane object that describes a workload cluster, not as the workload cluster itself.\n")
-		b.WriteString("- A management-cluster `kubectl get node` result is not workload-cluster evidence; do not use it to conclude workload-cluster node registration, node health, or providerID presence.\n")
-		b.WriteString("- Do not run `kubectl get node` for workload-cluster diagnosis until the current kubeconfig/context is confirmed to be that workload cluster's kubeconfig. If it is not confirmed, continue with guide-supported CRDs, labels, annotations, infrastructure/bootstrap resources, and providerID evidence instead.\n")
-		b.WriteString("- Inspect workload-cluster nodes only after obtaining that workload cluster's kubeconfig by the project-approved method, unless the user explicitly asks about management-cluster nodes.\n")
-	}
-	b.WriteString("Choose the next action by comparing live evidence against the guide keywords and decision hints. If the current evidence does not match a guide, collect the missing evidence instead of assuming the guide is correct.")
-	return b.String()
-}
-
-func guideMetadataCues(c guidance.GuideCase) []string {
-	seen := map[string]struct{}{}
-	var cues []string
-	addCue := func(value string) {
-		value = strings.Trim(value, " ,.;:()[]{}\"'`")
-		if value == "" {
-			return
-		}
-		if _, ok := seen[value]; ok {
-			return
-		}
-		seen[value] = struct{}{}
-		cues = append(cues, value)
-	}
-	fields := []string{
-		c.Cause,
-		c.Resolution,
-		strings.Join(c.Symptoms, " "),
-		strings.Join(c.EvidenceKeywords, " "),
-		strings.Join(c.DecisionHints, " "),
-		strings.Join(c.Tags, " "),
-	}
-	for _, step := range c.DiagnosticSteps {
-		fields = append(fields, step.Description, step.CommandTemplate, step.ExpectedOutcome, strings.Join(step.Preconditions, " "))
-	}
-	for _, text := range fields {
-		for _, token := range strings.FieldsFunc(text, func(r rune) bool {
-			return r == ' ' || r == '\n' || r == '\t' || r == ',' || r == ';'
-		}) {
-			lower := strings.ToLower(token)
-			if strings.Contains(lower, "annotation") ||
-				strings.Contains(lower, "label") ||
-				strings.Contains(lower, "/") ||
-				strings.Contains(lower, "=") {
-				addCue(token)
-			}
-		}
-	}
-	if len(cues) > 12 {
-		return cues[:12]
-	}
-	return cues
-}
-
-func guideResultImpliesClusterAPI(found *guidance.GuideSearchResult) bool {
-	if found == nil || len(found.Cases) == 0 {
-		return false
-	}
-	return guideCaseImpliesClusterAPI(found.Cases[0])
-}
-
-func guideRefFromResult(resource string, found *guidance.GuideSearchResult) guideRef {
-	if found == nil || len(found.Cases) == 0 {
-		id := "none:" + resource
-		return guideRef{GuideID: id, Hash: contextHash(id)}
-	}
-	c := found.Cases[0]
-	id := c.ID
-	if id == "" {
-		id = c.Title
-	}
-	content := strings.Join([]string{
-		c.ID,
-		c.Title,
-		strings.Join(c.EvidenceKeywords, ","),
-		strings.Join(c.DecisionHints, "|"),
-		firstNonEmptyGuideText(c.Resolution, c.Cause),
-	}, "\n")
-	return guideRef{GuideID: id, Hash: contextHash(content)}
-}
-
-func guideCaseImpliesClusterAPI(c guidance.GuideCase) bool {
-	var parts []string
-	parts = append(parts, c.ID, c.Title, c.Cause, c.Resolution, c.Source)
-	parts = append(parts, c.Symptoms...)
-	parts = append(parts, c.EvidenceKeywords...)
-	parts = append(parts, c.DecisionHints...)
-	parts = append(parts, c.RelatedObjects...)
-	parts = append(parts, c.Tags...)
-	for _, step := range c.DiagnosticSteps {
-		parts = append(parts, step.Description, step.CommandTemplate, step.RenderedCommand)
-	}
-	text := strings.ToLower(strings.Join(parts, "\n"))
-	for _, marker := range []string{
-		"cluster-api",
-		"cluster api",
-		"cluster.x-k8s.io",
-	} {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func formatResourceGuideUnavailableObservation(resource, reason string) string {
-	return fmt.Sprintf(
-		"Resource guide lookup is required before diagnosing CRD resource %s, but lookup was not executed (%s). Do not claim that no guide matched. Continue only with custom-resource-aware diagnostics and state that resource guidance was unavailable.",
-		resource,
-		reason,
-	)
-}
-
-func firstNonEmptyGuideText(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 func (l *Loop) appendToolObservation(call PendingCall, result map[string]any) {
@@ -1954,6 +1310,34 @@ func (l *Loop) recordAction(call PendingCall, result map[string]any) {
 	l.completedActions = append(l.completedActions, record)
 	if len(l.completedActions) > 12 {
 		l.completedActions = l.completedActions[len(l.completedActions)-12:]
+	}
+	if step, ok := guideStepCompletedFromFunctionCall(call.FunctionCall); ok {
+		l.markGuideStepCompleted(step)
+	}
+}
+
+func guideStepCompletedFromFunctionCall(call gollm.FunctionCall) (int, bool) {
+	raw, ok := call.Arguments["guide_progress"].(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	value, ok := raw["step_completed"]
+	if !ok {
+		return 0, false
+	}
+	switch v := value.(type) {
+	case float64:
+		if v <= 0 {
+			return 0, false
+		}
+		return int(v), true
+	case int:
+		if v <= 0 {
+			return 0, false
+		}
+		return v, true
+	default:
+		return 0, false
 	}
 }
 
