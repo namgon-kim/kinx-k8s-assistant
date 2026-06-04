@@ -131,6 +131,8 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
 
 **주의:** `/readonly` 변경 후 `/save` 명령으로 저장해야 다음 실행에도 유지됩니다.
 
+read-only 모드는 Kubernetes 리소스 변경 명령을 차단하지만 `kubectl get`, `describe`, `logs`, `top`, `api-resources` 같은 진단 명령은 허용합니다. `kubectl -n <namespace> get ...`처럼 namespace flag가 verb 앞에 있는 명령도 read-only 진단 명령으로 인식합니다. `bash -c`/`bash -lc` 안의 명령이 read-only `kubectl`과 안전한 텍스트 처리 파이프라인으로만 구성된 경우도 진단 명령으로 허용합니다.
+
 ### 출력 언어
 ```bash
 >>> /lang status   # 현재 출력 언어 표시
@@ -189,6 +191,58 @@ servers:
 
 guidance는 별도 서버를 실행하지 않습니다. k8s-assistant가 custom resource 작업/진단 요청에는 resource guide를 먼저 조회하고, 장애 흐름에는 사용자 확인 후 incident guide 검색과 조치 계획 생성을 수행합니다. Kubernetes 명령 실행은 k8s-assistant ReAct 루프와 승인 흐름이 담당합니다.
 
+### CRD-first resource guide 조회
+
+k8s-assistant는 LLM이 리소스 이름만 보고 custom resource 여부를 맞히는 것에 의존하지 않습니다. 사용자 요청은 먼저 별도 requirement-analysis 단계에서 자연어 대상과 Kubernetes 리소스 후보를 분리합니다. 대상은 리소스가 아닐 수도 있으므로, "이 클러스터의 문제를 해결해줘" 같은 요청은 구체적인 Kubernetes `Cluster` 오브젝트가 명시되지 않은 한 현재 접속한 클러스터 환경으로 분류합니다.
+
+1. 첫 LLM 응답은 `requirement_analysis`만 반환합니다.
+2. `target.category`, `scope.type`, `resource_candidates`, `request_type`, `action`으로 요청을 분류합니다.
+3. requirement-analysis 값 정의표는 `docs/requirement_analysis.md`를 기준으로 합니다.
+4. 예전 target 값 대신 새 `target.category`와 `resource_candidates` 계약만 사용합니다.
+5. `target.category`와 `scope.type`은 권장값을 우선 쓰되, 자연어 표현을 막지 않도록 런타임 enum으로 강제하지 않습니다.
+6. `resource_candidates`가 비어 있으면 Kubernetes 리소스 컨텍스트와 CRD resource guide/RAG 조회를 만들지 않습니다.
+7. primary Kubernetes 리소스 후보가 있을 때만 런타임이 discovery로 built-in/CRD 여부를 확인합니다.
+8. CRD로 확인된 경우에만 resource guide/RAG를 조회합니다.
+9. guide 결과에 근거가 있을 때만 해당 CRD family 전용 주의사항을 조건부로 주입합니다.
+10. resource guide/RAG 조회가 불가능하거나 결과가 없으면 guide를 가정하지 않고 일반 kubectl 증거 수집과 LLM 판단으로 진행합니다.
+
+guide가 제공한 label selector, annotation, command template은 진단 컨텍스트에서 보존됩니다. Cluster API 계열 guide가 주입된 경우, 관리 클러스터의 `kubectl get node` 결과를 workload cluster node 등록/건강/providerID 판단 근거로 사용하지 않습니다. workload cluster node를 확인하려면 먼저 해당 workload cluster kubeconfig/context임을 확인해야 합니다.
+
+ReAct action target 검증은 comma-separated resource와 CRD plural/singular 차이를 허용합니다. 예를 들어 `machinedeployment,tenantcontrolplane` 또는 `machine`/`machines` 형태가 같은 명령 안에서 일관되게 쓰이면 불필요하게 correction loop를 만들지 않습니다. `kubectl logs <pod>`처럼 resource token을 생략하는 kubectl 관용형도 Pod target으로 인식합니다. 동일한 target correction이 반복되면 같은 LLM 재시도를 계속하지 않고 루프를 중단해 오류를 노출합니다.
+
+명시적인 `resource kind + name + namespace` 요청의 첫 진단은 primary `resource_candidates` 항목을 직접 조회하거나 해당 target selector를 사용해야 합니다. 예를 들어 `namespace X의 Y cluster` 요청에서 첫 명령이 단순 `kubectl get pods -n X`로 빠지면 runtime이 correction합니다.
+
+`Namespace`/`namespace` 대소문자와 무관하게, namespace는 scope로 취급합니다. 사용자가 Namespace object 자체를 묻지 않았는데 Namespace 리소스 후보와 namespace scope를 동시에 내보내면 Kubernetes 리소스 컨텍스트로 승격하지 않습니다.
+
+`unknown`은 분류 값일 뿐 Kubernetes resource kind가 아닙니다. runtime은 `resource_candidates.kind=unknown`, `action.target.resource=unknown`, `kubectl get/describe unknown ...` 형태를 Kubernetes 리소스 대상으로 사용하지 않으며, 구체적인 리소스 종류가 없으면 명확화를 요구하도록 correction합니다.
+
+### 가이드 진행 추적과 종결 선택
+
+resource guide가 주입되면 가이드의 진단 step들이 체크리스트로 추적되며, 매 iteration 시작 시 모델에 다음 두 가지를 다시 안내합니다.
+
+- 사용자 요청 분류 (`requirement_analysis`): 진단 대상이 도중에 다른 리소스로 흘러가지 않도록 고정합니다.
+- 가이드 진행도: 어떤 step이 완료됐고 어떤 step이 남았는지, 다음에 무엇을 수행해야 하는지를 짧게 다시 제공합니다.
+
+가이드의 모든 step이 완료되면 모델은 일반 `kubectl` 명령을 또 실행하지 않고 진단 결과 보고서(`final_report`)를 생성합니다.
+
+- 결론이 충분히 도출된 경우: 보고서를 사용자에게 출력하고 진단을 종료합니다.
+- 결론이 충분하지 않은 경우: 보고서를 출력한 뒤 1~3개의 다음 진단 방향 옵션을 사용자에게 묻습니다.
+
+다음과 같이 선택지가 표시됩니다.
+
+```text
+진단을 어떻게 계속할지 선택해 주세요.
+
+  1. [가이드 재검색] 다른 운영 문제 초점으로 RAG 재조회
+  2. [다른 접근] 관련 controller 로그 확인
+  3. 직접 다른 방향 입력
+  4. 여기서 진단 종료
+```
+
+`[가이드 재검색]`을 고르면 모델이 제안한 운영 문제 초점으로 새 RAG 검색이 실행되고, `[다른 접근]`을 고르면 모델이 제시한 방향으로 ReAct 루프가 계속됩니다. `직접 다른 방향 입력`을 고르면 사용자가 자유 텍스트로 진단 방향을 알려줄 수 있고, `여기서 진단 종료`를 고르면 보고서까지만 보여주고 마칩니다.
+
+내부 schema와 상태 전이는 `docs/guide_progress_and_continuation.md`에 정리되어 있습니다.
+
 기본 설정 경로:
 
 ```text
@@ -238,6 +292,41 @@ runbook을 Qdrant에 업로드:
 ```
 
 업로드 helper는 runbook text를 embedding endpoint로 vector화한 뒤 Qdrant에 저장합니다. 이는 런타임 필수 기능이 아니라 초기 적재/검증용 도구입니다.
+
+## Context compact
+
+긴 진단 흐름에서는 tool 결과와 correction이 누적되어 LLM context limit에 도달할 수 있습니다. k8s-assistant는 context가 커지면 raw history를 계속 누적하지 않고 compact state로 전환합니다.
+
+compact state에는 다음이 포함됩니다.
+
+- 원 질문
+- primary target과 namespace scope
+- CRD discovery 결과와 guide ref/hash
+- 수행한 절차와 순서
+- 각 절차에서 얻은 단서
+- result hash
+- 다음 동작
+
+추정 context 사용량이 모델 context limit의 80% 이상이면 compact가 실행됩니다. correction이나 guide injection만으로 낮은 token 사용량에서 compact하지 않습니다. provider가 context length 오류를 반환한 경우에도 compact 후 1회 재시도합니다. compact가 발생하면 터미널에 다음 형태의 안내가 출력됩니다.
+
+```text
+↻ context compacting: ...
+✓ context compacted: ...
+```
+
+context limit은 모델명으로 추정합니다. 운영 환경에서 정확한 값을 지정하려면 다음 환경변수를 사용합니다.
+
+```bash
+export K8S_ASSISTANT_CONTEXT_LIMIT_TOKENS=32768
+```
+
+JSON ReAct shim 사용 시 모델이 최종 답변을 JSON code block 없이 plain text로 반환해도, k8s-assistant는 이를 shim parse error가 아니라 최종 답변으로 처리합니다.
+
+## Prompt / tool context 관리
+
+k8s-assistant는 runtime prompt를 section 단위로 조립합니다. core ReAct, output contract, language policy, target/scope 보존, command guideline은 항상 포함하고, read-only, guidance protocol, manifest generation, Cluster API guardrail은 현재 요청과 RAG 결과에 따라 조건부로 포함합니다.
+
+tool schema는 안전성을 위해 pruning하지 않고 등록된 전체 tool set을 유지합니다. 대신 ToolProfile hash를 사용해 동일한 tool schema 조합을 캐싱/참조 가능한 단위로 관리합니다.
 
 ## guidance revise 논의
 

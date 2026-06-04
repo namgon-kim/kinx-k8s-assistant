@@ -1,6 +1,8 @@
 package react
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestParseReActResponseWithAction(t *testing.T) {
 	parsed, err := parseReActResponse(`prefix
@@ -142,12 +144,22 @@ func TestShimPartConvertsActionToFunctionCall(t *testing.T) {
 	}
 }
 
+func TestParseReActResponseRejectsPlainText(t *testing.T) {
+	parsed, err := parseReActResponse("plain final answer")
+	if err == nil {
+		t.Fatal("expected plain text shim response to be rejected")
+	}
+	if parsed != nil {
+		t.Fatalf("expected nil parsed response, got %#v", parsed)
+	}
+}
+
 func TestShimPartConvertsResourceGuideLookupToInternalCall(t *testing.T) {
 	part := &shimPart{resourceGuideLookup: &resourceGuideLookup{
 		ResourceFamily: "cluster-api",
-		ProblemFocus:   "worker scale / replica availability",
-		Reason:         "desired replicas exceed available replicas",
-		Evidence:       "spec.replicas=3, availableReplicas=1",
+		ProblemFocus:   "nodegroup reconciliation",
+		Reason:         "live evidence requires a more specific guide than the initial resource-family guide",
+		Evidence:       "controller reported nodegroup reconciliation is blocked",
 	}}
 
 	calls, ok := part.AsFunctionCalls()
@@ -157,8 +169,31 @@ func TestShimPartConvertsResourceGuideLookupToInternalCall(t *testing.T) {
 	if calls[0].Name != internalResourceGuideLookupCall {
 		t.Fatalf("unexpected call name: %q", calls[0].Name)
 	}
-	if calls[0].Arguments["problem_focus"] != "worker scale / replica availability" {
+	if calls[0].Arguments["problem_focus"] != "nodegroup reconciliation" {
 		t.Fatalf("unexpected problem focus: %#v", calls[0].Arguments["problem_focus"])
+	}
+}
+
+func TestShimPartConvertsRequirementAnalysisToInternalCall(t *testing.T) {
+	part := &shimPart{requirementAnalysis: &requirementAnalysis{
+		RequestType: "diagnosis",
+		Action:      "diagnose_problem",
+		Target: requirementAnalysisTarget{
+			Category:    "cluster",
+			Description: "connected Kubernetes cluster",
+		},
+		Evidence: []string{"current cluster health evidence"},
+	}}
+
+	calls, ok := part.AsFunctionCalls()
+	if !ok || len(calls) != 1 {
+		t.Fatalf("expected one internal requirement-analysis call, got %#v", calls)
+	}
+	if calls[0].Name != internalRequirementAnalysisCall {
+		t.Fatalf("unexpected call name: %q", calls[0].Name)
+	}
+	if calls[0].Arguments["request_type"] != "diagnosis" {
+		t.Fatalf("unexpected request type: %#v", calls[0].Arguments["request_type"])
 	}
 }
 
