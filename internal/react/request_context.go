@@ -354,7 +354,7 @@ func normalizeRequirementResourceSource(source string) string {
 	case "user_request", "previous_context", "live_evidence", "guide_context", "model_inference":
 		return strings.ToLower(strings.TrimSpace(source))
 	default:
-		return strings.ToLower(strings.TrimSpace(source))
+		return ""
 	}
 }
 
@@ -387,7 +387,7 @@ func operationalFocusFromArgument(raw map[string]any) *requirementOperationalFoc
 			Name:      cleanUnknownPlaceholder(name),
 			Namespace: cleanUnknownPlaceholder(namespace),
 			Role:      strings.ToLower(strings.TrimSpace(role)),
-			Source:    strings.ToLower(strings.TrimSpace(source)),
+			Source:    normalizeRequirementResourceSource(source),
 			Evidence:  strings.TrimSpace(evidence),
 		}
 		if hint.Kind != "" || hint.Name != "" || hint.Evidence != "" {
@@ -410,7 +410,7 @@ func normalizeOperationalFocusRelationship(value string) string {
 	case "same_primary", "related_to_primary", "new_primary", "unclear":
 		return strings.ToLower(strings.TrimSpace(value))
 	default:
-		return strings.ToLower(strings.TrimSpace(value))
+		return ""
 	}
 }
 

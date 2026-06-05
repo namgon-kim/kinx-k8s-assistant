@@ -142,6 +142,14 @@ The runtime instructs the model to emit this when all diagnostic_steps are compl
     "evidence_known": ["facts directly observed from tool output; required when conclusive=true"],
     "evidence_missing": ["facts that would have helped but were not obtainable; use with blockers when conclusive=false and evidence_known is empty"],
     "most_likely_cause": "best-guess cause given partial evidence, or the literal string \"inconclusive\"",
+    "problematic_resources": [
+      {
+        "kind": "Kubernetes resource kind for the suspected blocker/root-cause investigation target",
+        "name": "resource name",
+        "namespace": "resource namespace when namespaced",
+        "reason": "observed evidence showing why this resource is the next suspected blocker/root-cause target to investigate"
+      }
+    ],
     "recommended_user_actions": ["concrete next steps the user can run outside this session (optional)"],
     "blockers": ["hard constraints that prevented full diagnosis (optional)"]
   }
@@ -150,8 +158,11 @@ The runtime instructs the model to emit this when all diagnostic_steps are compl
 
 | `conclusive` | Loop behavior |
 |---|---|
-| `true` | Render the conclusion, transition to `StateDone`. |
+| `true` without `problematic_resources` | Render the conclusion, transition to `StateDone`. |
+| `true` with `problematic_resources` | Render the conclusion, show a user choice asking whether to investigate the named suspected blocker/root-cause resource(s). If the user chooses yes/resource option, start a new query from requirement_analysis with that resource kind/name/namespace as the target. |
 | `false` | Render the report, call `requestNextDirectionsFromModel(report)`, continue the loop so the next model response is a `next_directions` object. |
+
+`problematic_resources` is not a list of resources that merely report symptoms. If the original primary resource reports a condition caused by another resource family, do not list the primary resource unless evidence shows the primary object's own spec, metadata, or configuration is malformed. If the likely related blocker kind is known but its object name is not, leave `problematic_resources` empty and put the missing related-resource lookup in `evidence_missing` or `recommended_user_actions`.
 
 ### `next_directions`
 
@@ -185,6 +196,7 @@ Emitted only after an inconclusive `final_report`. The model proposes 1–3 dist
 |---|---|---|
 | `another_guide` | `resource_family`, `problem_focus` | Reset guide step state, run `searchAndInjectResourceGuide(family, query)` and resume. |
 | `different_approach` | `instruction` | Inject the directive as a user message and resume the ReAct loop. |
+| `investigate_resource` | `resource_kind`, `resource_name`, optional `namespace` | Runtime-created option after a conclusive report with `problematic_resources`; starts a new query from requirement_analysis for that resource. |
 
 Invalid options (missing required fields, unknown `kind`) are filtered before the user is prompted. If no valid option remains, the runtime emits one correction and asks the model to re-emit. If the correction also fails, the runtime does not show an internal schema error to the user; it falls back to a user choice prompt containing "직접 다른 방향 입력" and "여기서 진단 종료", plus one generic `different_approach` option when `blockers` or `evidence_missing` from the inconclusive `final_report` can be turned into a safe continuation directive.
 

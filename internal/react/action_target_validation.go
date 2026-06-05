@@ -379,27 +379,6 @@ func commandUsesNamespace(command, namespace string) bool {
 	return false
 }
 
-func commandNamespace(command string) (string, bool) {
-	fields := strings.Fields(command)
-	for i, field := range fields {
-		trimmed := strings.Trim(field, "'\"")
-		switch {
-		case trimmed == "-n" || trimmed == "--namespace":
-			if i+1 < len(fields) {
-				namespace := strings.TrimSpace(strings.Trim(fields[i+1], "'\""))
-				return namespace, namespace != "" && !isAllNamespacesValue(namespace)
-			}
-		case strings.HasPrefix(trimmed, "--namespace="):
-			namespace := strings.TrimSpace(strings.TrimPrefix(trimmed, "--namespace="))
-			return namespace, namespace != "" && !isAllNamespacesValue(namespace)
-		case strings.HasPrefix(trimmed, "-n") && len(trimmed) > 2:
-			namespace := strings.TrimSpace(strings.TrimPrefix(trimmed, "-n"))
-			return namespace, namespace != "" && !isAllNamespacesValue(namespace)
-		}
-	}
-	return "", false
-}
-
 func commandUsesAllNamespaces(command string) bool {
 	for _, field := range strings.Fields(command) {
 		trimmed := strings.Trim(field, "'\"")

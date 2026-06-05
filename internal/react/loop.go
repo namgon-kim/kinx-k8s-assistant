@@ -47,6 +47,8 @@ const internalPhasePlanCall = "__phase_plan__"
 const internalPhaseProgressCall = "__phase_progress__"
 const internalFinalReportCall = "__final_report__"
 const internalNextDirectionsCall = "__next_directions__"
+const internalInvalidActionCall = "__invalid_action__"
+const internalInvalidStructuredOutputCall = "__invalid_structured_output__"
 
 type Loop struct {
 	cfg      *config.Config
@@ -93,12 +95,13 @@ type Loop struct {
 	resourceGuideEvidence   []string
 	resourceGuideQueries    map[string]struct{}
 
-	guideStepState           *guideStepState
-	finalReportRequested     bool
-	pendingResponseDirective string
-	pendingFinalReport       *finalReport
-	pendingNextDirections    *nextDirections
-	pendingDirectionPrompt   *directionPromptState
+	guideStepState               *guideStepState
+	finalReportRequested         bool
+	guidedPhaseProgressRequested bool
+	pendingResponseDirective     string
+	pendingFinalReport           *finalReport
+	pendingNextDirections        *nextDirections
+	pendingDirectionPrompt       *directionPromptState
 
 	cancel context.CancelFunc
 	once   sync.Once
@@ -415,6 +418,7 @@ func (l *Loop) startQuery(query string) error {
 	l.resourceGuideQueries = nil
 	l.guideStepState = nil
 	l.finalReportRequested = false
+	l.guidedPhaseProgressRequested = false
 	l.pendingResponseDirective = ""
 	l.pendingFinalReport = nil
 	l.pendingNextDirections = nil
@@ -518,6 +522,7 @@ func (l *Loop) clearConversationState() {
 	l.resourceGuideQueries = nil
 	l.guideStepState = nil
 	l.finalReportRequested = false
+	l.guidedPhaseProgressRequested = false
 	l.pendingResponseDirective = ""
 	l.pendingFinalReport = nil
 	l.pendingNextDirections = nil
@@ -689,7 +694,15 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		return nil
 	}
 
+	if handled := l.rejectInvalidShimStructuredCalls(functionCalls); handled {
+		return nil
+	}
+
 	if handled := l.handleRequestedResourceGuideLookup(ctx, functionCalls); handled {
+		return nil
+	}
+
+	if handled := l.rejectActionDuringGuidanceLookupWithoutGuide(functionCalls); handled {
 		return nil
 	}
 

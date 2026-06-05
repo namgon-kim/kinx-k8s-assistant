@@ -76,6 +76,40 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 	return false
 }
 
+func (l *Loop) rejectActionDuringGuidanceLookupWithoutGuide(calls []gollm.FunctionCall) bool {
+	if l.phaseStepState == nil || l.resourceGuideInjected {
+		return false
+	}
+	if l.resourceClassification == nil || l.resourceClassification.Kind != resourceClassificationCRD {
+		return false
+	}
+	current := l.phaseStepState.currentStep()
+	if !strings.EqualFold(strings.TrimSpace(current.Name), "guidance_lookup") {
+		return false
+	}
+	for _, call := range calls {
+		if call.Name == internalResourceGuideLookupCall || call.Name == internalPhaseProgressCall {
+			continue
+		}
+		if _, ok := kubectlCommandFromFunctionCall(call); !ok {
+			continue
+		}
+		message := "Active phase is guidance_lookup for a CRD-backed primary target. This phase must request a top-level `resource_guide_lookup` before any kubectl action. Return one `resource_guide_lookup` object for the accepted primary resource and operational problem focus."
+		if !l.appendCorrectionWithCompaction("guidance_lookup_action_before_lookup", message) {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "resource_guide_lookup 전 kubectl action이 반복되어 진단을 중단합니다:\n"+message)
+			l.pendingCalls = nil
+			l.currIteration = 0
+			l.state = StateDone
+			return true
+		}
+		l.pendingCalls = nil
+		l.currIteration++
+		l.state = StateRunning
+		return true
+	}
+	return false
+}
+
 func (l *Loop) phaseAllowsResourceGuideLookup() bool {
 	if l.phaseStepState == nil {
 		return false
@@ -109,7 +143,15 @@ func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query
 		l.injectResourceGuideUnavailable(resource, "search_failed")
 		return
 	}
+	originalCaseCount := 0
+	if found != nil {
+		originalCaseCount = len(found.Cases)
+	}
 	found = l.filterResourceGuidesForRequest(found, query)
+	if originalCaseCount > 0 && (found == nil || len(found.Cases) == 0) {
+		l.injectResourceGuideUnavailable(resource, "filtered_no_applicable_guides")
+		return
+	}
 	l.injectResourceGuideAttempt(resource, found)
 }
 
@@ -132,7 +174,11 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 	l.resourceGuideInjected = true
 	l.guideStepState = l.buildGuideStepState(found)
 	l.finalReportRequested = false
+	l.guidedPhaseProgressRequested = false
 	l.pendingResponseDirective = ""
+	if l.guideStepState != nil {
+		l.enterGuidedDiagnosisPhase()
+	}
 	includeClusterAPI := guideResultImpliesClusterAPI(found)
 	l.promptOptions = l.newPromptOptions(l.requestIntent, true, includeClusterAPI)
 	if l.shouldCompactForStateRewrite() {
@@ -168,6 +214,7 @@ func (l *Loop) injectResourceGuideUnavailable(resource, reason string) {
 	l.resourceGuideInjected = true
 	l.guideStepState = nil
 	l.finalReportRequested = false
+	l.guidedPhaseProgressRequested = false
 	l.pendingResponseDirective = ""
 	l.promptOptions = l.newPromptOptions(l.requestIntent, true, false)
 	content := formatResourceGuideUnavailableObservation(resource, reason)

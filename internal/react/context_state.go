@@ -127,18 +127,18 @@ func (l *Loop) hasPriorConversationMemory() bool {
 func (l *Loop) writePriorConversationMemory(b *strings.Builder) {
 	if l.lastOriginalQuery != "" {
 		b.WriteString("previous_original_query: ")
-		b.WriteString(l.lastOriginalQuery)
+		b.WriteString(compactPriorString(l.lastOriginalQuery, 1000))
 		b.WriteString("\n")
 	}
 	if l.lastRequirementAnalysis != nil {
-		if raw, err := json.Marshal(l.lastRequirementAnalysis); err == nil {
+		if raw, err := json.Marshal(compactPriorRequirementAnalysis(l.lastRequirementAnalysis)); err == nil {
 			b.WriteString("previous_requirement_analysis: ")
 			b.Write(raw)
 			b.WriteString("\n")
 		}
 	}
 	if l.lastRequestContext != nil {
-		if raw, err := json.Marshal(l.lastRequestContext); err == nil {
+		if raw, err := json.Marshal(compactPriorRequestContext(l.lastRequestContext)); err == nil {
 			b.WriteString("previous_request_context: ")
 			b.Write(raw)
 			b.WriteString("\n")
@@ -151,6 +151,89 @@ func (l *Loop) writePriorConversationMemory(b *strings.Builder) {
 			b.WriteString("\n")
 		}
 	}
+}
+
+func compactPriorRequirementAnalysis(analysis *requirementAnalysis) map[string]any {
+	if analysis == nil {
+		return nil
+	}
+	out := map[string]any{
+		"request_type": analysis.RequestType,
+		"action":       analysis.Action,
+		"target": map[string]any{
+			"category":    analysis.Target.Category,
+			"name":        analysis.Target.Name,
+			"description": compactPriorString(analysis.Target.Description, 500),
+		},
+		"scope": analysis.Scope,
+	}
+	if len(analysis.Resources) > 0 {
+		limit := len(analysis.Resources)
+		if limit > 3 {
+			limit = 3
+		}
+		out["resource_candidates"] = append([]requirementResource(nil), analysis.Resources[:limit]...)
+	}
+	if analysis.OperationalFocus != nil {
+		focus := map[string]any{
+			"summary":                 compactPriorString(analysis.OperationalFocus.Summary, 500),
+			"relationship_to_primary": analysis.OperationalFocus.RelationshipToPrimary,
+			"changed_from_previous":   analysis.OperationalFocus.ChangedFromPrevious,
+			"reason":                  compactPriorString(analysis.OperationalFocus.Reason, 500),
+			"evidence_needs":          compactPriorStringSlice(analysis.OperationalFocus.EvidenceNeeds, 3, 300),
+		}
+		if len(analysis.OperationalFocus.RelatedResourceHints) > 0 {
+			limit := len(analysis.OperationalFocus.RelatedResourceHints)
+			if limit > 3 {
+				limit = 3
+			}
+			hints := append([]requirementRelatedResource(nil), analysis.OperationalFocus.RelatedResourceHints[:limit]...)
+			for i := range hints {
+				hints[i].Evidence = compactPriorString(hints[i].Evidence, 300)
+			}
+			focus["related_resource_hints"] = hints
+		}
+		out["operational_focus"] = focus
+	}
+	if len(analysis.Evidence) > 0 {
+		out["evidence_needs"] = compactPriorStringSlice(analysis.Evidence, 3, 300)
+	}
+	return out
+}
+
+func compactPriorRequestContext(ctx *requestContext) map[string]any {
+	if ctx == nil {
+		return nil
+	}
+	return map[string]any{
+		"primary_target": ctx.PrimaryTarget,
+		"scope":          ctx.Scope,
+		"resource_class": ctx.ResourceClass,
+	}
+}
+
+func compactPriorStringSlice(values []string, limit int, maxBytes int) []string {
+	if limit <= 0 || len(values) == 0 {
+		return nil
+	}
+	if len(values) < limit {
+		limit = len(values)
+	}
+	out := make([]string, 0, limit)
+	for _, value := range values[:limit] {
+		if text := compactPriorString(value, maxBytes); text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func compactPriorString(value string, maxBytes int) string {
+	value = strings.TrimSpace(value)
+	if value == "" || maxBytes <= 0 || len(value) <= maxBytes {
+		return value
+	}
+	return safeStringHead(value, maxBytes) + " ...[truncated " + contextHash(value) + "]"
 }
 
 func (l *Loop) hasConversationState() bool {

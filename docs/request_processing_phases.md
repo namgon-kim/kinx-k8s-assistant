@@ -34,6 +34,8 @@ In particular:
 - Do not run resource-guide/RAG lookup only because discovery says the primary resource is a CRD.
 - Do not treat the first `kubectl` action as automatically sufficient evidence.
 - Do not block useful multi-resource observation just because it is not a single `kubectl -n <namespace> get <kind> <name> -o yaml` command.
+- Do not treat logs as ordinary Kubernetes resource observation. Resource observation is API-object evidence: status, conditions, spec, metadata, events, owner/dependent references, and related Kubernetes objects.
+- Use logs only for explicit log/log-analysis requests, or after user input, live evidence, or guide context identifies a concrete log-bearing Pod, container, or controller.
 - Use RAG only when the accepted phase plan reaches a guidance phase, observed evidence exists, and runtime discovery confirms the relevant guide-supported resource family.
 
 ## Resolution Strategy
@@ -200,7 +202,7 @@ Guidance-related work must be classified under the top-level phase workflow.
 | `observation_execution` | Execute live observation. | No | Raw observation is stored as phase evidence. |
 | `observation_completion` | Model reports whether observation goals are complete. | No | Runtime may run CRD discovery after this phase if relevant. |
 | `guidance_decision` | Model decides whether guide lookup is useful. Runtime only confirms eligibility. | No | The output may be direct response, further observation, or `guidance_lookup`. |
-| `guidance_lookup` | Perform resource/incident/remediation guide search and inject context. | No | This phase produces guide context, but has no diagnostic guide steps yet. |
+| `guidance_lookup` | Perform resource/incident/remediation guide search and inject context. | No | For CRD-backed primary targets, this phase must emit `resource_guide_lookup` before kubectl actions or `phase_progress`. It produces guide context or records lookup unavailability, but has no diagnostic guide steps yet. |
 | `guided_diagnosis` | Execute injected guide diagnostic procedure. | Yes | Each guide diagnostic instruction is a nested `guidance_step`; progress is tracked with `guide_progress`. |
 | `response_synthesis` | Answer directly from gathered evidence. | No | Used when guide is unnecessary or skipped. |
 | `final_report` | Close the request. | No | May summarize completed phase steps and nested guide steps. |
@@ -217,7 +219,7 @@ phase_step 6: guidance_lookup
 phase_step 7: guided_diagnosis
   guidance_step 1: inspect top-level Cluster/CAPI resources
   guidance_step 2: inspect worker group resources
-  guidance_step 3: inspect events/logs tied to the blocker
+  guidance_step 3: inspect events or related API objects tied to the blocker
 phase_step 8: final_report
 ```
 
@@ -280,7 +282,8 @@ Observation is a first-class phase before RAG. The model declares the intended o
 | `target_resolution` | Finds namespace/name/kind candidates when the user omitted them or used a follow-up phrase. | `kubectl get cluster -A`, `kubectl get machinedeployment -A` | No, unless the user only asked to find the object. |
 | `primary_status` | Reads current state of the accepted primary target. | `kubectl -n ns get cluster name -o yaml`, `kubectl describe pod pod-a -n ns` | Usually yes. |
 | `related_resource_status` | Reads related resources needed to understand the primary target or operational focus. | `kubectl -n ns get cluster/name openstackcluster/name kamajicontrolplane/name -o yaml`, `kubectl -n ns get machinedeployment,machineset,machine -l cluster.x-k8s.io/cluster-name=name -o yaml` | Yes when related to the active target/focus. |
-| `event_log_observation` | Reads events or logs as supporting evidence. | `kubectl -n ns get events --field-selector=...`, `kubectl logs ...` | Yes when it adds concrete failure evidence. |
+| `event_observation` | Reads Kubernetes events as supporting resource evidence. | `kubectl -n ns get events --field-selector=...` | Yes when it adds concrete failure evidence. |
+| `log_observation` | Reads logs only when logs are the explicit user target or a concrete log-bearing Pod/container/controller has already been identified. | `kubectl logs <pod> -n ns -c <container>` | No for ordinary resource observation; yes only for explicit log analysis or identified log-bearing targets. |
 | `broad_scan` | Scans a wide scope for clues or inventory. | `kubectl get pods -A`, `kubectl get events -A` | Usually no by itself; can become useful evidence if concrete signals are extracted. |
 | `verification_observation` | Checks whether a suspected condition still holds after prior evidence or remediation. | `kubectl -n ns get machine md-... -o yaml`, `kubectl rollout status ...` | Yes for verification-focused requests. |
 
@@ -302,7 +305,8 @@ The phase completion report should distinguish at least these booleans:
 Important cases:
 
 - `kubectl get cluster -A` for a named cluster without namespace is usually `target_resolution`, not completed diagnosis.
-- `kubectl -n <namespace> get cluster <name> -o yaml` is usually `primary_status` and can complete the minimum observation.
+- `kubectl -n <namespace> get cluster <name> -o yaml` is usually `primary_status` and can complete the minimum observation because it captures the primary object's metadata, spec, status, and conditions.
+- For an explicitly named resource diagnosis, do not inspect nodes, related resources, events, or logs before `primary_status` has observed the primary object. Complete the observation phase after primary status when it is sufficient so runtime can expose CRD discovery/classification before guidance or related-resource diagnosis.
 - A multi-resource command can complete observation when the resources are related to the accepted target or operational focus.
 - An observation with runtime/internal errors, approval decline, blocked execution, or malformed schema is not diagnostic evidence.
 - A Kubernetes `NotFound` or `Forbidden` result can be diagnostic evidence only when it directly answers or advances the user's request.
@@ -317,6 +321,13 @@ Guide lookup is allowed when all of these are true:
 - Runtime discovery, performed after observation when needed, confirms the relevant resource family is CRD-backed or otherwise guide-supported.
 - Observed evidence exists and is relevant to the active target/focus.
 - The query can include the original request, accepted request context, operational focus, and compact observed evidence.
+
+When the active phase is `guidance_lookup` for a CRD-backed primary target:
+
+- The next model output must be top-level `resource_guide_lookup`.
+- Runtime rejects `phase_progress` from `guidance_lookup` until a guide lookup result has been injected or lookup unavailability has been recorded.
+- Runtime rejects kubectl actions from `guidance_lookup` before `resource_guide_lookup`.
+- `guided_diagnosis` is valid only after guide context exists; otherwise the model should continue to `response_synthesis` or earlier observation phases instead of pretending guided diagnosis started.
 
 Guide lookup should be skipped when:
 

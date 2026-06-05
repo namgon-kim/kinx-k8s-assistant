@@ -393,14 +393,18 @@ func isInternalRuntimeErrorText(text string) bool {
 		"next_directions 형식 오류",
 		"final_report 형식 오류",
 		"resource_guide_lookup 형식 오류",
-		"requirement analysis",
-		"request context",
-		"action target",
-		"shim json",
+		"requirement analysis 오류",
+		"request context 오류",
+		"action target 불일치",
 		"parsing shim json",
 		"context compact failed",
 		"openai streaming error",
 		"llm 응답 후보가 없습니다",
+		"반복된 requirement analysis 오류",
+		"반복된 request context 오류",
+		"반복된 action target 불일치",
+		"반복된 phase plan 오류",
+		"반복된 phase progress 오류",
 	}
 	for _, marker := range markers {
 		if strings.Contains(lower, marker) {

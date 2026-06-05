@@ -179,7 +179,11 @@ The field is not a RAG execution request. Guide lookup is selected by the model'
 - `resource_candidates.primary.source=user_request` means the current request explicitly changed or named the primary target.
 - `resource_candidates.primary.source=previous_context` means runtime may fill missing target name or namespace from the previous request context.
 - `resource_candidates.primary.source=model_inference` with `operational_focus.relationship_to_primary=related_to_primary` is not accepted as a target switch; runtime keeps the previous primary and moves the inferred resource into `operational_focus.related_resource_hints`.
-- Broad phrases such as "this cluster" classify as `target.category=cluster_environment` and leave `resource_candidates` empty unless the user names a concrete Kubernetes resource kind/object.
+- Phrases such as "this cluster" / "이 클러스터" are anaphoric references. If prior accepted context contains a named Kubernetes `Cluster` object and the new request is a follow-up, keep that previous object as `resource_candidates.primary` with `source=previous_context`. If no prior named object exists and the wording refers to the active kubeconfig/context or overall environment health, classify as `target.category=cluster_environment` with empty `resource_candidates`. If both meanings are plausible, record the ambiguity instead of inventing a target.
+- For an explicitly named Kubernetes resource diagnosis, initial `evidence_needs` should be limited to the primary object's API state: metadata, spec, status, and conditions.
+- Do not add node status, related resources, events, or logs as initial evidence needs before the primary object has been observed. After the primary object observation, runtime discovery can classify CRD eligibility and the later phase can decide whether related resources, events, or guide lookup are needed.
+- Kubernetes resource observation does not include logs by default.
+- Use logs only when the user explicitly asks for logs/log analysis, or when prior live evidence or guide context identifies a concrete log-bearing Pod, container, or controller as the diagnostic target.
 - `resource_candidates` is the only source for Kubernetes resource context derivation.
 - If `resource_candidates` is empty, runtime does not create Kubernetes resource context and does not trigger CRD resource-guide/RAG lookup.
 - Runtime uses Kubernetes discovery, not model wording, to confirm whether a relevant resource candidate is built-in or CRD-backed.
@@ -197,6 +201,8 @@ Some user terms are operational concepts rather than Kubernetes resource kinds.
 | Term | Handling |
 |---|---|
 | `node group`, `노드 그룹`, `worker group` | Treat as a worker-group concept. In Cluster API context it can involve MachineDeployment, MachineSet, Machine, or worker lifecycle evidence. Do not hard-map it to one runtime kind. Use `operational_focus` to express it as a related problem focus unless the user explicitly names a concrete primary resource. Inferred MachineDeployment/MachineSet/Machine candidates should use `operational_focus.related_resource_hints.source=model_inference`, not `resource_candidates.primary.source=model_inference`. |
+| `this cluster`, `이 클러스터` | Resolve as a follow-up reference first. If the previous accepted primary target was a named Kubernetes `Cluster` object, preserve that object with `source=previous_context`. If there is no prior named object and the request refers to active kubeconfig/context or global environment health, classify as `cluster_environment`. If both are plausible, ask for clarification. |
+| `current cluster`, `현재 클러스터`, `connected cluster` | Usually means the connected Kubernetes environment when it refers to the active kubeconfig/context. In a clear follow-up to a named `Cluster` object, previous context still wins unless the user explicitly switches to the connected environment. |
 | follow-up references such as "그럼", "왜", "그건" | Use prior accepted context only when the new request omits explicit target/scope, and express the new diagnostic angle in `operational_focus`. |
 | "왜 정상동작 하지 않는 걸까", "노드 그룹은?", "그럼 이건?" | Treat as follow-up wording when previous context exists. Do not invent a new resource kind from these phrases; default to the previous target/scope through `operational_focus.relationship_to_primary`. |
 

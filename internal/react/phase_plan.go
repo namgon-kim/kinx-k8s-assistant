@@ -17,6 +17,8 @@ type phaseStepState struct {
 	Completed         map[int]bool
 }
 
+const lightweightLookupPhase = "lightweight_lookup"
+
 func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
 	var remaining []gollm.FunctionCall
 	for _, call := range calls {
@@ -43,21 +45,34 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 			return nil, true
 		}
 		l.phaseStepState = newPhaseStepState(plan)
-		l.currIteration++
-		l.state = StateRunning
-		return nil, true
+		continue
 	}
 	return remaining, false
 }
 
 func (l *Loop) consumePhaseProgress(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
 	var remaining []gollm.FunctionCall
+	handled := false
 	for _, call := range calls {
 		if call.Name != internalPhaseProgressCall {
 			remaining = append(remaining, call)
 			continue
 		}
 		progress, ok := phaseProgressFromFunctionCall(call)
+		if ok && l.phaseProgressBlockedByGuidanceLookup(progress) {
+			message := "Active phase is guidance_lookup for a CRD-backed primary target, but no resource-guide lookup result has been injected or recorded as unavailable. Return one top-level `resource_guide_lookup` object for the accepted primary resource and operational problem focus. Do not complete guidance_lookup with phase_progress, do not enter guided_diagnosis, and do not choose a kubectl action until the guide lookup result is observed."
+			if !l.appendCorrectionWithCompaction("guidance_lookup_missing_resource_guide_lookup", message) {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "resource_guide_lookup 없이 guidance_lookup 완료가 반복되어 진단을 중단합니다:\n"+message)
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return nil, true
+			}
+			l.pendingCalls = nil
+			l.currIteration++
+			l.state = StateRunning
+			return nil, true
+		}
 		if !ok || l.phaseStepState == nil || !l.phaseStepState.acceptProgress(progress) {
 			message := "Phase progress was invalid. Return one corrected phase_progress object for the active phase, or continue the active phase with one valid action. Do not use guide_progress for top-level phase completion."
 			if !l.appendCorrectionWithCompaction("invalid_phase_progress", message) {
@@ -75,11 +90,35 @@ func (l *Loop) consumePhaseProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 		if l.guideStepState != nil && strings.EqualFold(l.phaseStepState.phaseName(progress.PhaseCompleted), "guided_diagnosis") {
 			l.guideStepState = nil
 		}
+		l.guidedPhaseProgressRequested = false
+		handled = true
+	}
+	if handled && len(remaining) == 0 {
 		l.currIteration++
 		l.state = StateRunning
 		return nil, true
 	}
 	return remaining, false
+}
+
+func (l *Loop) phaseProgressBlockedByGuidanceLookup(progress phaseProgress) bool {
+	if l.phaseStepState == nil {
+		return false
+	}
+	current := l.phaseStepState.currentStep()
+	if !strings.EqualFold(strings.TrimSpace(current.Name), "guidance_lookup") {
+		return false
+	}
+	if progress.PhaseCompleted != current.Index {
+		return false
+	}
+	if l.resourceGuideInjected {
+		return false
+	}
+	if l.resourceClassification == nil || l.resourceClassification.Kind != resourceClassificationCRD {
+		return false
+	}
+	return true
 }
 
 func (l *Loop) requirePhasePlanBeforeAction(calls []gollm.FunctionCall) bool {
@@ -104,6 +143,34 @@ func (l *Loop) requirePhasePlanBeforeAction(calls []gollm.FunctionCall) bool {
 	l.currIteration++
 	l.state = StateRunning
 	return true
+}
+
+func (l *Loop) rejectInvalidShimStructuredCalls(calls []gollm.FunctionCall) bool {
+	for _, call := range calls {
+		var code, message string
+		switch call.Name {
+		case internalInvalidActionCall:
+			code = "invalid_action"
+			message = "Action payload was invalid. Re-emit one corrected response with `action` as an object containing name, reason, target, command, and modifies_resource. Do not encode action as a string."
+		case internalInvalidStructuredOutputCall:
+			code = "mixed_answer_structured_output"
+			message = "The previous response included `answer` together with another structured output. Return exactly one structured output. If a tool, phase_plan, phase_progress, resource_guide_lookup, final_report, or next_directions is needed, omit `answer`; if you are answering the user, omit all other structured fields."
+		default:
+			continue
+		}
+		if !l.appendCorrectionWithCompaction(code, message) {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 shim structured output 오류로 루프를 중단했습니다:\n"+message)
+			l.pendingCalls = nil
+			l.currIteration = 0
+			l.state = StateDone
+			return true
+		}
+		l.pendingCalls = nil
+		l.currIteration++
+		l.state = StateRunning
+		return true
+	}
+	return false
 }
 
 func phasePlanFromFunctionCall(call gollm.FunctionCall) (phasePlan, bool) {
@@ -138,7 +205,6 @@ func phaseStepsFromValue(value any) ([]phaseStep, bool) {
 		return nil, false
 	}
 	steps := make([]phaseStep, 0, len(raw))
-	seen := make(map[int]struct{})
 	for _, item := range raw {
 		m, ok := item.(map[string]any)
 		if !ok {
@@ -154,10 +220,6 @@ func phaseStepsFromValue(value any) ([]phaseStep, bool) {
 		if step.Index == 0 || step.Name == "" || step.Goal == "" || step.CompletionCondition == "" {
 			return nil, false
 		}
-		if _, ok := seen[step.Index]; ok {
-			return nil, false
-		}
-		seen[step.Index] = struct{}{}
 		steps = append(steps, step)
 	}
 	return steps, true
@@ -168,9 +230,34 @@ func phasePlanValid(plan phasePlan) bool {
 		return false
 	}
 	foundCurrent := false
+	seenIndex := make(map[int]struct{}, len(plan.PhaseSteps))
+	seenName := make(map[string]struct{}, len(plan.PhaseSteps))
 	for _, step := range plan.PhaseSteps {
+		if step.Index == 0 || strings.TrimSpace(step.Name) == "" {
+			return false
+		}
+		if _, ok := seenIndex[step.Index]; ok {
+			return false
+		}
+		seenIndex[step.Index] = struct{}{}
+		name := strings.ToLower(strings.TrimSpace(step.Name))
+		if _, ok := seenName[name]; ok {
+			return false
+		}
+		seenName[name] = struct{}{}
 		if step.Index == plan.CurrentPhaseIndex {
 			foundCurrent = true
+		}
+	}
+	for _, step := range plan.PhaseSteps {
+		for _, next := range step.AllowedNext {
+			nextName := strings.ToLower(strings.TrimSpace(next))
+			if nextName == "" {
+				continue
+			}
+			if _, ok := seenName[nextName]; !ok {
+				return false
+			}
 		}
 	}
 	return foundCurrent
@@ -207,8 +294,13 @@ func (s *phaseStepState) acceptProgress(progress phaseProgress) bool {
 		return false
 	}
 	s.Completed[progress.PhaseCompleted] = true
-	if next := s.nextIndex(progress.NextPhase); next != 0 {
-		s.CurrentPhaseIndex = next
+	if strings.TrimSpace(progress.NextPhase) != "" {
+		if next := s.allowedNextIndex(current, progress.NextPhase); next != 0 {
+			s.CurrentPhaseIndex = next
+		} else {
+			delete(s.Completed, progress.PhaseCompleted)
+			return false
+		}
 	} else if next := s.firstIncompleteAfter(progress.PhaseCompleted); next != 0 {
 		s.CurrentPhaseIndex = next
 	}
@@ -239,9 +331,22 @@ func (s *phaseStepState) phaseName(index int) string {
 	return ""
 }
 
-func (s *phaseStepState) nextIndex(name string) int {
+func (s *phaseStepState) allowedNextIndex(current phaseStep, name string) int {
 	name = strings.TrimSpace(strings.ToLower(name))
 	if s == nil || name == "" {
+		return 0
+	}
+	if len(current.AllowedNext) == 0 {
+		return 0
+	}
+	allowed := false
+	for _, candidate := range current.AllowedNext {
+		if strings.EqualFold(strings.TrimSpace(candidate), name) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
 		return 0
 	}
 	for _, step := range s.PhaseSteps {
@@ -301,16 +406,50 @@ func (l *Loop) phaseStepAnchor() string {
 	b.WriteString("Rules:\n")
 	b.WriteString("- Use `phase_progress` to complete the active top-level phase_step when its completion condition is satisfied.\n")
 	b.WriteString("- Do not use `guide_progress` for top-level phase completion; `guide_progress` is only for nested guidance_step entries while current_phase_name=guided_diagnosis.\n")
-	b.WriteString("- If guidance is useful, enter it through guidance_decision/guidance_lookup; do not assume runtime will automatically inject RAG.\n")
+	if strings.EqualFold(strings.TrimSpace(current.Name), "guidance_lookup") {
+		b.WriteString("- current_phase_name=guidance_lookup: return one top-level `resource_guide_lookup` object. Do not emit kubectl action, `phase_progress`, or `guide_progress` until the resource-guide lookup result is observed or recorded unavailable.\n")
+	} else {
+		b.WriteString("- If guidance is useful, enter it through guidance_decision/guidance_lookup; do not assume runtime will automatically inject RAG.\n")
+	}
 	return b.String()
 }
 
 func (l *Loop) requestGuidedDiagnosisPhaseProgress() {
+	if l.guidedPhaseProgressRequested {
+		return
+	}
+	l.guidedPhaseProgressRequested = true
 	var b strings.Builder
 	b.WriteString("All nested resource-guide guidance_step entries have been completed for the active guided_diagnosis phase.\n")
 	b.WriteString("Your next response MUST be a `phase_progress` object completing the active guided_diagnosis phase; do not emit another action or final_report yet.\n")
 	b.WriteString("Set next_phase to final_report unless live evidence requires a different allowed next phase from the accepted phase_plan.")
 	l.queueResponseDirective(b.String())
+}
+
+func (l *Loop) enterGuidedDiagnosisPhase() {
+	if l.phaseStepState == nil {
+		return
+	}
+	if index := l.phaseStepState.indexByName("guided_diagnosis"); index != 0 {
+		l.phaseStepState.CurrentPhaseIndex = index
+		delete(l.phaseStepState.Completed, index)
+	}
+}
+
+func (l *Loop) rewindPhaseBeforeGuidance() {
+	if l.phaseStepState == nil {
+		return
+	}
+	index := l.phaseStepState.preferredPreGuidanceIndex()
+	if index == 0 {
+		return
+	}
+	l.phaseStepState.CurrentPhaseIndex = index
+	for _, step := range l.phaseStepState.PhaseSteps {
+		if step.Index >= index {
+			delete(l.phaseStepState.Completed, step.Index)
+		}
+	}
 }
 
 func (l *Loop) phaseAllowsPlainAnswer() bool {
@@ -319,7 +458,7 @@ func (l *Loop) phaseAllowsPlainAnswer() bool {
 	}
 	name := strings.ToLower(strings.TrimSpace(l.phaseStepState.currentStep().Name))
 	switch name {
-	case "response_synthesis", "clarification", "explanation", "final_report":
+	case lightweightLookupPhase, "response_synthesis", "clarification", "explanation", "final_report":
 		return true
 	default:
 		return false
@@ -363,6 +502,39 @@ func (s *phaseStepState) compactPlan() map[string]any {
 		"current_phase_index": s.CurrentPhaseIndex,
 		"completed_phases":    completed,
 	}
+}
+
+func (s *phaseStepState) indexByName(name string) int {
+	name = strings.TrimSpace(strings.ToLower(name))
+	if s == nil || name == "" {
+		return 0
+	}
+	for _, step := range s.PhaseSteps {
+		if strings.ToLower(strings.TrimSpace(step.Name)) == name {
+			return step.Index
+		}
+	}
+	return 0
+}
+
+func (s *phaseStepState) preferredPreGuidanceIndex() int {
+	if s == nil {
+		return 0
+	}
+	for _, preferred := range []string{"observation_execution", "observation_planning", "observation_completion", "context_resolution"} {
+		if index := s.indexByName(preferred); index != 0 {
+			return index
+		}
+	}
+	for i := len(s.PhaseSteps) - 1; i >= 0; i-- {
+		step := s.PhaseSteps[i]
+		name := strings.ToLower(strings.TrimSpace(step.Name))
+		if name == "" || strings.Contains(name, "guidance") || name == "final_report" {
+			continue
+		}
+		return step.Index
+	}
+	return 0
 }
 
 func stringFromAny(value any) string {
