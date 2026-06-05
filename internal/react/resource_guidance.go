@@ -20,6 +20,18 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 		if call.Name != internalResourceGuideLookupCall {
 			continue
 		}
+		if !l.phaseAllowsResourceGuideLookup() {
+			if !l.appendCorrectionWithCompaction("resource_guide_wrong_phase", "Resource guide lookup is only allowed from the guidance_lookup phase after observation evidence is available. Complete or advance the current phase with phase_progress, or continue the active phase with the next safest diagnostic.") {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "잘못된 phase의 resource_guide_lookup 요청이 반복되어 진단을 중단합니다.")
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return true
+			}
+			l.currIteration++
+			l.state = StateRunning
+			return true
+		}
 		request, ok := resourceGuideLookupFromFunctionCall(call)
 		if !ok {
 			if !l.appendCorrectionWithCompaction("invalid_resource_guide_lookup", "Resource guide lookup request was invalid. Continue with the next safest kubectl diagnostic.") {
@@ -64,33 +76,17 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 	return false
 }
 
-func (l *Loop) interceptCustomResourceFunctionCalls(ctx context.Context, calls []gollm.FunctionCall) bool {
-	if l.resourceGuideInjected || l.initialGuideAttempted {
+func (l *Loop) phaseAllowsResourceGuideLookup() bool {
+	if l.phaseStepState == nil {
 		return false
 	}
-	if l.requestContext == nil {
-		return false
-	}
-	for _, call := range calls {
-		command, ok := kubectlCommandFromFunctionCall(call)
-		if !ok {
-			continue
-		}
-		resource, ok := customResourceCandidateFromKubectl(command)
-		if !ok {
-			continue
-		}
-		classification := l.classifyResourceByDiscovery(ctx, resource)
-		if classification.Kind != resourceClassificationCRD {
-			continue
-		}
-		l.resourceClassification = &classification
-		l.resourceGuideEvidence = append(l.resourceGuideEvidence, command)
-		l.initialGuideAttempted = true
-		l.searchAndInjectResourceGuide(ctx, resource, l.resourceGuideQuery(resource))
+	name := strings.ToLower(strings.TrimSpace(l.phaseStepState.currentStep().Name))
+	switch name {
+	case "guidance_lookup":
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query string) {
@@ -113,6 +109,7 @@ func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query
 		l.injectResourceGuideUnavailable(resource, "search_failed")
 		return
 	}
+	found = l.filterResourceGuidesForRequest(found, query)
 	l.injectResourceGuideAttempt(resource, found)
 }
 
@@ -236,6 +233,54 @@ func (l *Loop) resourceGuideRefinementQuery(request resourceGuideLookup) string 
 		"reason for refinement: " + request.Reason,
 		"observed evidence: " + request.Evidence,
 	}, "\n")
+}
+
+func (l *Loop) filterResourceGuidesForRequest(found *guidance.GuideSearchResult, query string) *guidance.GuideSearchResult {
+	if found == nil || len(found.Cases) == 0 {
+		return found
+	}
+	if requestOrQuerySuggestsDeletion(l.originalQuery, query) {
+		return found
+	}
+	filtered := *found
+	filtered.Cases = nil
+	for _, c := range found.Cases {
+		if guideCaseIsDeletionOrCleanup(c) {
+			continue
+		}
+		filtered.Cases = append(filtered.Cases, c)
+	}
+	return &filtered
+}
+
+func requestOrQuerySuggestsDeletion(values ...string) bool {
+	for _, value := range values {
+		lower := strings.ToLower(value)
+		for _, marker := range []string{
+			"delete", "deletion", "deleting", "cleanup", "clean up", "deletiontimestamp",
+			"cluster-delete", "nodegroup-delete", "resource-delete",
+			"삭제", "삭제중", "삭제 중", "정리",
+		} {
+			if strings.Contains(lower, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func guideCaseIsDeletionOrCleanup(c guidance.GuideCase) bool {
+	fields := []string{
+		c.ID,
+		c.Title,
+		c.Cause,
+		c.Resolution,
+		strings.Join(c.Symptoms, " "),
+		strings.Join(c.EvidenceKeywords, " "),
+		strings.Join(c.DecisionHints, " "),
+		strings.Join(c.Tags, " "),
+	}
+	return requestOrQuerySuggestsDeletion(fields...)
 }
 
 func resourceGuideLookupFromFunctionCall(call gollm.FunctionCall) (resourceGuideLookup, bool) {

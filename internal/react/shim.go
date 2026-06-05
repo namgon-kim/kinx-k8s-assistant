@@ -13,6 +13,8 @@ type reActResponse struct {
 	Answer              string               `json:"answer,omitempty"`
 	RequirementAnalysis *requirementAnalysis `json:"requirement_analysis,omitempty"`
 	RequestContext      *requestContext      `json:"request_context,omitempty"`
+	PhasePlan           *phasePlan           `json:"phase_plan,omitempty"`
+	PhaseProgress       *phaseProgress       `json:"phase_progress,omitempty"`
 	Action              *action              `json:"action,omitempty"`
 	GuideProgress       *guideProgress       `json:"guide_progress,omitempty"`
 	ResourceGuideLookup *resourceGuideLookup `json:"resource_guide_lookup,omitempty"`
@@ -106,6 +108,27 @@ type actionTarget struct {
 type guideProgress struct {
 	StepCompleted  int  `json:"step_completed,omitempty"`
 	EvidenceUseful bool `json:"evidence_useful,omitempty"`
+}
+
+type phasePlan struct {
+	RequestGoal       string      `json:"request_goal"`
+	CurrentPhaseIndex int         `json:"current_phase_index,omitempty"`
+	PhaseSteps        []phaseStep `json:"phase_steps,omitempty"`
+}
+
+type phaseStep struct {
+	Index               int      `json:"index"`
+	Name                string   `json:"name"`
+	Goal                string   `json:"goal"`
+	CompletionCondition string   `json:"completion_condition"`
+	AllowedNext         []string `json:"allowed_next,omitempty"`
+}
+
+type phaseProgress struct {
+	PhaseCompleted   int    `json:"phase_completed"`
+	EvidenceUseful   bool   `json:"evidence_useful,omitempty"`
+	CompletionReason string `json:"completion_reason,omitempty"`
+	NextPhase        string `json:"next_phase,omitempty"`
 }
 
 type resourceGuideLookup struct {
@@ -214,6 +237,12 @@ func unmarshalReActResponse(data []byte) (*reActResponse, error) {
 	if err := unmarshalOptionalPointer(raw, "request_context", &parsed.RequestContext); err != nil {
 		return nil, err
 	}
+	if err := unmarshalOptionalPhasePlan(raw, &parsed.PhasePlan); err != nil {
+		return nil, err
+	}
+	if err := unmarshalOptionalPointer(raw, "phase_progress", &parsed.PhaseProgress); err != nil {
+		return nil, err
+	}
 	if err := unmarshalOptionalPointer(raw, "action", &parsed.Action); err != nil {
 		return nil, err
 	}
@@ -261,6 +290,35 @@ func unmarshalOptionalPointer[T any](raw map[string]json.RawMessage, key string,
 	var parsed T
 	if err := json.Unmarshal(value, &parsed); err != nil {
 		return err
+	}
+	*target = &parsed
+	return nil
+}
+
+func unmarshalOptionalPhasePlan(raw map[string]json.RawMessage, target **phasePlan) error {
+	value, ok := raw["phase_plan"]
+	if !ok || string(value) == "null" {
+		return nil
+	}
+	var parsed phasePlan
+	if err := json.Unmarshal(value, &parsed); err == nil {
+		if len(parsed.PhaseSteps) > 0 {
+			*target = &parsed
+			return nil
+		}
+	}
+	var compat struct {
+		RequestGoal       string      `json:"request_goal"`
+		CurrentPhaseIndex int         `json:"current_phase_index,omitempty"`
+		Phases            []phaseStep `json:"phases,omitempty"`
+	}
+	if err := json.Unmarshal(value, &compat); err != nil {
+		return err
+	}
+	parsed = phasePlan{
+		RequestGoal:       compat.RequestGoal,
+		CurrentPhaseIndex: compat.CurrentPhaseIndex,
+		PhaseSteps:        compat.Phases,
 	}
 	*target = &parsed
 	return nil
@@ -356,7 +414,7 @@ type shimCandidate struct {
 }
 
 func (c *shimCandidate) String() string {
-	return fmt.Sprintf("Thought: %s\nAnswer: %s\nRequirementAnalysis: %v\nRequestContext: %v\nAction: %v\nGuideProgress: %v\nResourceGuideLookup: %v\nFinalReport: %v\nInvalidFinalReport: %v\nNextDirections: %v\nInvalidDirections: %v", c.candidate.Thought, c.candidate.Answer, c.candidate.RequirementAnalysis, c.candidate.RequestContext, c.candidate.Action, c.candidate.GuideProgress, c.candidate.ResourceGuideLookup, c.candidate.FinalReport, c.candidate.InvalidFinalReport, c.candidate.NextDirections, c.candidate.InvalidDirections)
+	return fmt.Sprintf("Thought: %s\nAnswer: %s\nRequirementAnalysis: %v\nRequestContext: %v\nPhasePlan: %v\nPhaseProgress: %v\nAction: %v\nGuideProgress: %v\nResourceGuideLookup: %v\nFinalReport: %v\nInvalidFinalReport: %v\nNextDirections: %v\nInvalidDirections: %v", c.candidate.Thought, c.candidate.Answer, c.candidate.RequirementAnalysis, c.candidate.RequestContext, c.candidate.PhasePlan, c.candidate.PhaseProgress, c.candidate.Action, c.candidate.GuideProgress, c.candidate.ResourceGuideLookup, c.candidate.FinalReport, c.candidate.InvalidFinalReport, c.candidate.NextDirections, c.candidate.InvalidDirections)
 }
 
 func (c *shimCandidate) Parts() []gollm.Part {
@@ -373,6 +431,12 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	}
 	if c.candidate.RequestContext != nil {
 		parts = append(parts, &shimPart{requestContext: c.candidate.RequestContext})
+	}
+	if c.candidate.PhasePlan != nil {
+		parts = append(parts, &shimPart{phasePlan: c.candidate.PhasePlan})
+	}
+	if c.candidate.PhaseProgress != nil {
+		parts = append(parts, &shimPart{phaseProgress: c.candidate.PhaseProgress})
 	}
 	if c.candidate.Action != nil {
 		parts = append(parts, &shimPart{action: c.candidate.Action})
@@ -396,6 +460,8 @@ func (c *shimCandidate) Parts() []gollm.Part {
 func (c *shimCandidate) hasStructuredOutput() bool {
 	return c.candidate.RequirementAnalysis != nil ||
 		c.candidate.RequestContext != nil ||
+		c.candidate.PhasePlan != nil ||
+		c.candidate.PhaseProgress != nil ||
 		c.candidate.Action != nil ||
 		c.candidate.ResourceGuideLookup != nil ||
 		c.candidate.FinalReport != nil ||
@@ -408,6 +474,8 @@ type shimPart struct {
 	text                string
 	requirementAnalysis *requirementAnalysis
 	requestContext      *requestContext
+	phasePlan           *phasePlan
+	phaseProgress       *phaseProgress
 	action              *action
 	resourceGuideLookup *resourceGuideLookup
 	finalReport         *finalReport
@@ -438,6 +506,26 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 		}
 		return []gollm.FunctionCall{{
 			Name:      internalRequestContextCall,
+			Arguments: args,
+		}}, true
+	}
+	if p.phasePlan != nil {
+		args, err := toMap(p.phasePlan)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      internalPhasePlanCall,
+			Arguments: args,
+		}}, true
+	}
+	if p.phaseProgress != nil {
+		args, err := toMap(p.phaseProgress)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      internalPhaseProgressCall,
 			Arguments: args,
 		}}, true
 	}

@@ -2,7 +2,7 @@
 
 `requirement_analysis` is the first response contract for each user request. It classifies the natural-language request before the ReAct loop chooses a tool, asks for resource guidance, or returns a final answer.
 
-After acceptance, the analysis is re-emitted on every subsequent iteration as the `requirement_analysis` anchor so the model keeps serving the originally determined request. See [`guide_progress_and_continuation.md`](./guide_progress_and_continuation.md) for the iteration anchor, guide-step tracking, and `final_report` / `next_directions` continuation flow.
+After acceptance, the analysis is re-emitted on every subsequent iteration as the `requirement_analysis` anchor so the model keeps serving the originally determined request. See [`request_processing_phases.md`](./request_processing_phases.md) for the default natural-language request pipeline before guide lookup, and [`guide_progress_and_continuation.md`](./guide_progress_and_continuation.md) for the iteration anchor, guide-step tracking, and `final_report` / `next_directions` continuation flow.
 
 The value tables below define preferred stable values. Natural-language requests can be broader than the table, so `target.category` and `scope.type` are not hard-blocked by runtime enum validation. When no preferred value fits, use `other` and explain the nuance in `target.description`, `evidence_needs`, or `ambiguities`.
 
@@ -138,7 +138,7 @@ The value tables below define preferred stable values. Natural-language requests
 
 `operational_focus` captures the current operational problem angle without replacing `resource_candidates.primary`. It is optional and can appear on any request, including the first request and follow-up requests.
 
-The field is not a RAG execution request. Initial resource-guide lookup remains runtime-controlled from `resource_candidates.primary` after CRD discovery. Refined guide lookup remains a later ReAct decision through top-level `resource_guide_lookup`.
+The field is not a RAG execution request. Guide lookup is selected by the model's later processing phase, not directly by `operational_focus`. Runtime may confirm CRD/resource-family eligibility after observation before allowing that guide phase to execute.
 
 | Field | Model Guidance | Runtime Behavior |
 |---|---|---|
@@ -182,10 +182,10 @@ The field is not a RAG execution request. Initial resource-guide lookup remains 
 - Broad phrases such as "this cluster" classify as `target.category=cluster_environment` and leave `resource_candidates` empty unless the user names a concrete Kubernetes resource kind/object.
 - `resource_candidates` is the only source for Kubernetes resource context derivation.
 - If `resource_candidates` is empty, runtime does not create Kubernetes resource context and does not trigger CRD resource-guide/RAG lookup.
-- Runtime uses Kubernetes discovery, not model wording, to decide whether a primary resource candidate is built-in or CRD-backed.
+- Runtime uses Kubernetes discovery, not model wording, to confirm whether a relevant resource candidate is built-in or CRD-backed.
 - Built-in resources skip CRD resource-guide/RAG lookup.
-- CRD resource-guide/RAG lookup runs only after discovery confirms the primary resource candidate is a CRD.
-- `operational_focus` does not trigger CRD resource-guide/RAG lookup by itself. It is passed to the next ReAct step as context for deciding between top-level `resource_guide_lookup`, kubectl/tool action, or final answer.
+- CRD resource-guide/RAG lookup runs only when the model-declared phase plan reaches guidance consideration, discovery confirms the relevant resource candidate is a CRD, and the observation phase has collected useful evidence. See [`request_processing_phases.md`](./request_processing_phases.md).
+- `operational_focus` does not trigger CRD resource-guide/RAG lookup by itself. It is passed to the next ReAct step as context for the model-declared phase plan and later guidance decision.
 - If resource-guide/RAG is unavailable or empty, the assistant continues with ordinary kubectl evidence gathering and model reasoning.
 - `unknown` is not a Kubernetes resource kind. Do not use it in `resource_candidates.kind`, `action.target.resource`, or a kubectl resource position.
 - `scope.type=all_namespaces` represents all namespaces. Do not store this as `scope.namespace="all"`; `all` is not a real namespace in this contract.

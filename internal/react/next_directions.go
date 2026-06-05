@@ -262,7 +262,6 @@ func (l *Loop) applyDirectionOption(ctx context.Context, opt nextDirectionOption
 		// Reset guide step state and trigger a refined resource-guide lookup.
 		l.guideStepState = nil
 		l.resourceGuideInjected = false
-		l.initialGuideAttempted = false
 		family := strings.TrimSpace(opt.ResourceFamily)
 		if family == "" && l.requestContext != nil {
 			family = l.requestContext.PrimaryTarget.Resource

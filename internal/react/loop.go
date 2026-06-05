@@ -43,6 +43,8 @@ type PendingCall struct {
 const internalResourceGuideLookupCall = "__resource_guide_lookup__"
 const internalRequestContextCall = "__request_context__"
 const internalRequirementAnalysisCall = "__requirement_analysis__"
+const internalPhasePlanCall = "__phase_plan__"
+const internalPhaseProgressCall = "__phase_progress__"
 const internalFinalReportCall = "__final_report__"
 const internalNextDirectionsCall = "__next_directions__"
 
@@ -72,6 +74,7 @@ type Loop struct {
 	originalQuery           string
 	requirementAnalysis     *requirementAnalysis
 	requestContext          *requestContext
+	phaseStepState          *phaseStepState
 	resourceClassification  *resourceClassification
 	lastOriginalQuery       string
 	lastRequirementAnalysis *requirementAnalysis
@@ -86,7 +89,6 @@ type Loop struct {
 	contextApproxTokens     int
 	lastAssistantText       string
 	lastProgressText        string
-	initialGuideAttempted   bool
 	resourceGuideInjected   bool
 	resourceGuideEvidence   []string
 	resourceGuideQueries    map[string]struct{}
@@ -399,6 +401,7 @@ func (l *Loop) startQuery(query string) error {
 	l.originalQuery = query
 	l.requirementAnalysis = nil
 	l.requestContext = nil
+	l.phaseStepState = nil
 	l.resourceClassification = nil
 	l.lastContextError = nil
 	l.injectedGuides = nil
@@ -407,7 +410,6 @@ func (l *Loop) startQuery(query string) error {
 	l.lastCompactedActionSeq = 0
 	l.lastAssistantText = ""
 	l.lastProgressText = ""
-	l.initialGuideAttempted = false
 	l.resourceGuideInjected = false
 	l.resourceGuideEvidence = nil
 	l.resourceGuideQueries = nil
@@ -497,6 +499,7 @@ func (l *Loop) clearConversationState() {
 	l.originalQuery = ""
 	l.requirementAnalysis = nil
 	l.requestContext = nil
+	l.phaseStepState = nil
 	l.resourceClassification = nil
 	l.lastOriginalQuery = ""
 	l.lastRequirementAnalysis = nil
@@ -510,7 +513,6 @@ func (l *Loop) clearConversationState() {
 	l.contextApproxTokens = estimateContextTokens(l.systemPrompt)
 	l.lastAssistantText = ""
 	l.lastProgressText = ""
-	l.initialGuideAttempted = false
 	l.resourceGuideInjected = false
 	l.resourceGuideEvidence = nil
 	l.resourceGuideQueries = nil
@@ -607,12 +609,26 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	l.pendingResponseDirective = ""
 
 	if len(functionCalls) == 0 {
-		if l.requirementAnalysis == nil && strings.TrimSpace(streamedText) != "" {
-			if parsed, err := parseReActResponse(streamedText); err == nil && parsed.RequirementAnalysis != nil {
+		if strings.TrimSpace(streamedText) != "" {
+			if parsed, err := parseReActResponse(streamedText); err == nil && l.requirementAnalysis == nil && parsed.RequirementAnalysis != nil {
 				functionCalls = []gollm.FunctionCall{{
 					Name:      internalRequirementAnalysisCall,
 					Arguments: requirementAnalysisToArguments(parsed.RequirementAnalysis),
 				}}
+			} else if err == nil && l.requirementAnalysis != nil && l.phaseStepState == nil && parsed.PhasePlan != nil {
+				if args, mapErr := toMap(parsed.PhasePlan); mapErr == nil {
+					functionCalls = []gollm.FunctionCall{{
+						Name:      internalPhasePlanCall,
+						Arguments: args,
+					}}
+				}
+			} else if err == nil && l.phaseStepState != nil && parsed.PhaseProgress != nil {
+				if args, mapErr := toMap(parsed.PhaseProgress); mapErr == nil {
+					functionCalls = []gollm.FunctionCall{{
+						Name:      internalPhaseProgressCall,
+						Arguments: args,
+					}}
+				}
 			}
 		}
 		if len(functionCalls) == 0 && l.requirementAnalysis == nil {
@@ -620,9 +636,19 @@ func (l *Loop) runIteration(ctx context.Context) error {
 				return nil
 			}
 		}
+		if len(functionCalls) == 0 && l.requirementAnalysis != nil && l.phaseStepState == nil {
+			if handled := l.requirePhasePlanBeforeAction(nil); handled {
+				return nil
+			}
+		}
 	}
 
 	if len(functionCalls) == 0 {
+		if l.phaseStepState != nil && strings.TrimSpace(streamedText) != "" && !l.phaseAllowsPlainAnswer() {
+			if handled := l.rejectPlainAnswerOutsideResponsePhase(); handled {
+				return nil
+			}
+		}
 		if strings.TrimSpace(streamedText) != "" {
 			rawModelText := streamedText
 			l.contextApproxTokens += estimateContextTokens(rawModelText)
@@ -644,6 +670,22 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	var requestContextHandled bool
 	functionCalls, requestContextHandled = l.consumeRequestContext(ctx, functionCalls)
 	if requestContextHandled {
+		return nil
+	}
+
+	if handled := l.requirePhasePlanBeforeAction(functionCalls); handled {
+		return nil
+	}
+
+	var phasePlanHandled bool
+	functionCalls, phasePlanHandled = l.consumePhasePlan(functionCalls)
+	if phasePlanHandled {
+		return nil
+	}
+
+	var phaseProgressHandled bool
+	functionCalls, phaseProgressHandled = l.consumePhaseProgress(functionCalls)
+	if phaseProgressHandled {
 		return nil
 	}
 
@@ -672,10 +714,6 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	if handled := l.rejectUnrelatedFirstDiagnostic(functionCalls); handled {
-		return nil
-	}
-
-	if handled := l.interceptCustomResourceFunctionCalls(ctx, functionCalls); handled {
 		return nil
 	}
 
@@ -730,6 +768,9 @@ func (l *Loop) runIteration(ctx context.Context) error {
 func (l *Loop) buildIterationSendContent() []any {
 	sentContent := append([]any(nil), l.currChatContent...)
 	if anchor := l.guideStepAnchor(); anchor != "" {
+		sentContent = append([]any{anchor}, sentContent...)
+	}
+	if anchor := l.phaseStepAnchor(); anchor != "" {
 		sentContent = append([]any{anchor}, sentContent...)
 	}
 	if anchor := l.requirementAnalysisAnchor(); anchor != "" {
@@ -1347,7 +1388,11 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 	l.pendingCalls = nil
 	l.currIteration++
 	if l.guideStepState != nil && l.guideStepState.allCompleted() && !l.finalReportRequested {
-		l.requestFinalReportFromModel()
+		if l.phaseStepState != nil && strings.EqualFold(l.phaseStepState.currentStep().Name, "guided_diagnosis") {
+			l.requestGuidedDiagnosisPhaseProgress()
+		} else {
+			l.requestFinalReportFromModel()
+		}
 	}
 	if l.shouldCompactBeforeNextSend() {
 		l.compactBeforeNextIteration("Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it.")
@@ -1388,13 +1433,23 @@ func (l *Loop) recordAction(call PendingCall, result map[string]any) {
 	if len(l.completedActions) > 12 {
 		l.completedActions = l.completedActions[len(l.completedActions)-12:]
 	}
-	if guideProgressObservationUseful(result) {
+	if guideProgressObservationUseful(result) && l.guideProgressAllowedForCurrentPhase() {
 		if step, ok := guideStepCompletedFromFunctionCall(call.FunctionCall); ok {
 			l.markGuideStepCompleted(step)
 		} else if step, ok := l.inferGuideStepCompletedFromFunctionCall(call.FunctionCall); ok {
 			l.markGuideStepCompleted(step)
 		}
 	}
+}
+
+func (l *Loop) guideProgressAllowedForCurrentPhase() bool {
+	if l.guideStepState == nil {
+		return false
+	}
+	if l.phaseStepState == nil {
+		return true
+	}
+	return strings.EqualFold(l.phaseStepState.currentStep().Name, "guided_diagnosis")
 }
 
 func guideProgressObservationUseful(result map[string]any) bool {
@@ -1418,27 +1473,15 @@ func guideStepCompletedFromFunctionCall(call gollm.FunctionCall) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	if useful, ok := raw["evidence_useful"].(bool); ok && !useful {
+	if useful, ok := raw["evidence_useful"]; ok && !boolFromAny(useful) {
 		return 0, false
 	}
 	value, ok := raw["step_completed"]
 	if !ok {
 		return 0, false
 	}
-	switch v := value.(type) {
-	case float64:
-		if v <= 0 {
-			return 0, false
-		}
-		return int(v), true
-	case int:
-		if v <= 0 {
-			return 0, false
-		}
-		return v, true
-	default:
-		return 0, false
-	}
+	step := intFromAny(value)
+	return step, step > 0
 }
 
 func (l *Loop) inferGuideStepCompletedFromFunctionCall(call gollm.FunctionCall) (int, bool) {

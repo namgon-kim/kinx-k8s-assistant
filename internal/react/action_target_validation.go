@@ -134,10 +134,19 @@ func actionTargetFromFunctionCall(call gollm.FunctionCall) (actionTarget, bool) 
 }
 
 func commandMentionsToken(command, token string) bool {
-	token = strings.ToLower(strings.TrimSpace(token))
-	if token == "" {
+	tokens := normalizedTokenList(token)
+	if len(tokens) == 0 {
 		return true
 	}
+	for _, token := range tokens {
+		if !commandMentionsSingleToken(command, token) {
+			return false
+		}
+	}
+	return true
+}
+
+func commandMentionsSingleToken(command, token string) bool {
 	for _, field := range strings.Fields(command) {
 		field = strings.ToLower(strings.Trim(field, "'\""))
 		for _, part := range strings.FieldsFunc(field, func(r rune) bool {
@@ -149,6 +158,17 @@ func commandMentionsToken(command, token string) bool {
 		}
 	}
 	return false
+}
+
+func normalizedTokenList(token string) []string {
+	var tokens []string
+	for _, part := range strings.Split(strings.ToLower(strings.TrimSpace(token)), ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			tokens = append(tokens, part)
+		}
+	}
+	return tokens
 }
 
 func commandMentionsResource(command, resource string) bool {
@@ -226,13 +246,54 @@ func kubectlMentionedResources(command string) []string {
 			resources = append(resources, "pod")
 			continue
 		}
-		if resource, ok := firstKubectlResourceArg(fields, verbIndex+1); ok {
+		for _, resource := range kubectlResourceArgs(fields, verbIndex+1) {
 			for _, part := range strings.Split(resource, ",") {
 				part = kubectlResourceKindFromArg(part)
 				part = normalizeKubectlResource(strings.TrimSpace(part))
 				if part != "" {
 					resources = append(resources, part)
 				}
+			}
+		}
+	}
+	return resources
+}
+
+func kubectlResourceArgs(fields []string, start int) []string {
+	var resources []string
+	firstSeen := false
+	for i := start; i < len(fields); i++ {
+		field := strings.Trim(fields[i], "'\"")
+		if field == "" {
+			continue
+		}
+		if strings.HasPrefix(field, "--") {
+			if strings.Contains(field, "=") {
+				continue
+			}
+			if kubectlFlagRequiresValue(field) && i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(field, "-") {
+			if kubectlShortFlagRequiresValue(field) && len(field) == 2 && i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		if !firstSeen {
+			resource := kubectlResourceKindFromArg(strings.Trim(field, ","))
+			if resource != "" {
+				resources = append(resources, resource)
+				firstSeen = true
+			}
+			continue
+		}
+		if strings.Contains(field, "/") || strings.Contains(field, ",") {
+			resource := kubectlResourceKindFromArg(strings.Trim(field, ","))
+			if resource != "" {
+				resources = append(resources, resource)
 			}
 		}
 	}
@@ -316,6 +377,27 @@ func commandUsesNamespace(command, namespace string) bool {
 		}
 	}
 	return false
+}
+
+func commandNamespace(command string) (string, bool) {
+	fields := strings.Fields(command)
+	for i, field := range fields {
+		trimmed := strings.Trim(field, "'\"")
+		switch {
+		case trimmed == "-n" || trimmed == "--namespace":
+			if i+1 < len(fields) {
+				namespace := strings.TrimSpace(strings.Trim(fields[i+1], "'\""))
+				return namespace, namespace != "" && !isAllNamespacesValue(namespace)
+			}
+		case strings.HasPrefix(trimmed, "--namespace="):
+			namespace := strings.TrimSpace(strings.TrimPrefix(trimmed, "--namespace="))
+			return namespace, namespace != "" && !isAllNamespacesValue(namespace)
+		case strings.HasPrefix(trimmed, "-n") && len(trimmed) > 2:
+			namespace := strings.TrimSpace(strings.TrimPrefix(trimmed, "-n"))
+			return namespace, namespace != "" && !isAllNamespacesValue(namespace)
+		}
+	}
+	return "", false
 }
 
 func commandUsesAllNamespaces(command string) bool {

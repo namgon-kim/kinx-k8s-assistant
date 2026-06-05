@@ -224,6 +224,51 @@ func TestShimPartConvertsResourceGuideLookupToInternalCall(t *testing.T) {
 	}
 }
 
+func TestShimPartConvertsPhasePlanToInternalCall(t *testing.T) {
+	part := &shimPart{phasePlan: &phasePlan{
+		RequestGoal:       "diagnose cluster health",
+		CurrentPhaseIndex: 1,
+		PhaseSteps: []phaseStep{{
+			Index:               1,
+			Name:                "observation_planning",
+			Goal:                "choose first observation",
+			CompletionCondition: "next observation action is selected",
+			AllowedNext:         []string{"observation_execution"},
+		}},
+	}}
+
+	calls, ok := part.AsFunctionCalls()
+	if !ok || len(calls) != 1 {
+		t.Fatalf("expected one internal phase-plan call, got %#v", calls)
+	}
+	if calls[0].Name != internalPhasePlanCall {
+		t.Fatalf("unexpected call name: %q", calls[0].Name)
+	}
+	if calls[0].Arguments["request_goal"] != "diagnose cluster health" {
+		t.Fatalf("unexpected request goal: %#v", calls[0].Arguments["request_goal"])
+	}
+}
+
+func TestShimPartConvertsPhaseProgressToInternalCall(t *testing.T) {
+	part := &shimPart{phaseProgress: &phaseProgress{
+		PhaseCompleted:   2,
+		EvidenceUseful:   true,
+		CompletionReason: "cluster status was observed",
+		NextPhase:        "observation_completion",
+	}}
+
+	calls, ok := part.AsFunctionCalls()
+	if !ok || len(calls) != 1 {
+		t.Fatalf("expected one internal phase-progress call, got %#v", calls)
+	}
+	if calls[0].Name != internalPhaseProgressCall {
+		t.Fatalf("unexpected call name: %q", calls[0].Name)
+	}
+	if calls[0].Arguments["phase_completed"] != float64(2) {
+		t.Fatalf("unexpected completed phase: %#v", calls[0].Arguments["phase_completed"])
+	}
+}
+
 func TestShimPartConvertsRequirementAnalysisToInternalCall(t *testing.T) {
 	part := &shimPart{requirementAnalysis: &requirementAnalysis{
 		RequestType: "diagnosis",

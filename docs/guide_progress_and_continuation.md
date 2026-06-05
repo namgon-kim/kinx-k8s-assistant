@@ -2,7 +2,7 @@
 
 This document describes how the ReAct loop keeps the model aligned with the original request and the active resource guide across many iterations, and how it transitions to a `final_report` and a user-chosen next direction when the guide is exhausted.
 
-Related contracts: [`requirement_analysis`](./requirement_analysis.md) (initial request classification).
+Related contracts: [`requirement_analysis`](./requirement_analysis.md) (initial request classification), [`request_processing_phases`](./request_processing_phases.md) (default observation and guidance-decision phases before any guide is injected).
 
 ## Motivation
 
@@ -15,7 +15,7 @@ The runtime addresses both without forcibly blocking output. Two anchors are re-
 
 ## Iteration anchors
 
-`Loop.buildIterationSendContent` prepends two short anchor messages before whatever the current iteration is sending. Order matters: `requirement_analysis` first (the user-level goal), then `guide_step` (the current procedural step), then the latest observations.
+`Loop.buildIterationSendContent` prepends compact anchor messages before whatever the current iteration is sending. Order matters: `requirement_analysis` first (the user-level goal), then `phase_step` when a phase plan is active, then `guide_step` only while the active phase is `guided_diagnosis`, then the latest observations.
 
 ### requirement_analysis anchor
 
@@ -27,9 +27,25 @@ The anchor explicitly tells the model:
 - If live evidence implies a different operational focus on the same target family, use `resource_guide_lookup` instead of pivoting the diagnosis target.
 - Before emitting `action`, verify it advances this analysis.
 
-### guide_step anchor (L2)
+### phase_step anchor (L1)
 
-Re-emits a compact progress representation of the active resource guide. The full guide body is still injected only once via `appendGuideObservation`. The complete diagnostic step list is persisted in a workspace-local temporary step store; each iteration carries only the progress counters and the next step detail needed for the current action.
+Re-emits the active top-level request-processing step from the model-declared `phase_plan`. This is the parent workflow step that owns ordinary observation, response synthesis, guidance decision, and final report transitions.
+
+The `phase_step` anchor should include:
+
+- request goal;
+- current phase index/name;
+- current phase goal;
+- current phase completion condition;
+- completed phase indices;
+- allowed next phase names;
+- compact CRD/resource-family eligibility context when runtime discovery has confirmed it after observation.
+
+The model completes a phase with `phase_progress`. Runtime must not use `guide_progress` to complete a top-level phase.
+
+### guide_step anchor (L2, nested)
+
+Re-emits a compact progress representation of the active resource guide. This anchor exists only when the active `phase_step` is `guided_diagnosis`. The full guide body is still injected only once via `appendGuideObservation`. The complete diagnostic step list is persisted in a workspace-local temporary step store; each iteration carries only the progress counters and the next step detail needed for the current action.
 
 Format (rendered each iteration):
 
@@ -54,13 +70,39 @@ Rules:
 
 `guideStepState` is built from `GuideCase.DiagnosticSteps` at the moment the guide is injected. Only the top case is tracked because the runtime injects one case at a time. The runtime stores the full diagnostic step payload in `step_store` for bookkeeping, but the model does not need the full list in every iteration.
 
+`guideStepState` is scoped to the current `guided_diagnosis` `phase_step`. When every nested guide step is completed, the model should complete the parent `guided_diagnosis` phase with `phase_progress` and move to `final_report`.
+
 ## Output schema additions
 
 The JSON ReAct shim accepts these additional top-level objects in the model response (each in its own iteration, never combined):
 
+### `phase_progress`
+
+Self-reported progress for the active top-level `phase_step`. This is separate from guide progress and is valid before, during, and after guided diagnosis.
+
+```json
+{
+  "phase_progress": {
+    "phase_completed": 4,
+    "evidence_useful": true,
+    "completion_reason": "The primary Cluster status and related control-plane resources were observed.",
+    "next_phase": "guidance_decision"
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `phase_completed` | 1-based index of the top-level `phase_step` completed by the latest response/observation. |
+| `evidence_useful` | True when the latest observation or response advanced the request goal. |
+| `completion_reason` | Short grounding for why the phase completion condition is satisfied. |
+| `next_phase` | Name of the next top-level phase from the accepted phase plan, or a model-proposed amendment when the observation changed the route. |
+
+`phase_progress` owns the parent workflow. `guide_progress` owns nested guide diagnostic steps only.
+
 ### `action.guide_progress`
 
-Self-reported guide progress for the action that the model is emitting.
+Self-reported nested guide progress for the action that the model is emitting. This field is valid only while the active top-level phase is `guided_diagnosis`.
 
 ```json
 {
@@ -82,7 +124,9 @@ Self-reported guide progress for the action that the model is emitting.
 | `step_completed` | 1-based index of the guide step this action advances. Omit when no guide is active. |
 | `evidence_useful` | True when the previous observation moved diagnosis forward. Omit when no guide is active. |
 
-When this field is present and the tool observation is useful, `recordAction` calls `markGuideStepCompleted(step)`. If the model omits `action.guide_progress`, the runtime may infer completion only for the current next step when the executed command matches that step's command template. Observations with explicit errors or statuses such as `blocked`, `declined`, `failed`, or `error` do not complete guide steps. When `guideStepState.allCompleted()` becomes true, `dispatchToolCalls` calls `requestFinalReportFromModel()` exactly once.
+When this field is present and the tool observation is useful, `recordAction` calls `markGuideStepCompleted(step)`. If the model omits `action.guide_progress`, the runtime may infer completion only for the current next guide step when the executed command matches that step's command template. Observations with explicit errors or statuses such as `blocked`, `declined`, `failed`, or `error` do not complete guide steps.
+
+When `guideStepState.allCompleted()` becomes true, the model should emit `phase_progress` for the parent `guided_diagnosis` phase and then proceed to `final_report`. Runtime may request a final report as a safety fallback, but the conceptual transition is phase-level, not guide-step-level.
 
 ### `final_report`
 
@@ -146,6 +190,8 @@ Invalid options (missing required fields, unknown `kind`) are filtered before th
 
 ## State machine
 
+This is the outer runtime state machine. The model-declared `phase_step` workflow is nested inside `StateRunning`; it should not require a new user-visible runtime state for every phase.
+
 ```
                   ┌──────────────────────────┐
                   │ StateIdle / StateDone    │
@@ -206,25 +252,28 @@ New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirec
 
 | File | Role |
 |---|---|
-| `internal/react/loop.go` | State enum, `guideStepState`, anchor wiring (`buildIterationSendContent`), guide step completion bookkeeping. |
-| `internal/react/request_context.go` | `requirementAnalysisAnchor()`, `guideStepAnchor()`. |
-| `internal/react/resource_guidance.go` | `buildGuideStepState` builds the guide progress state from `GuideCase.DiagnosticSteps` and persists the full step details to `step_store` when the guide is injected. |
+| `internal/react/loop.go` | State enum, `phaseStepState`, `guideStepState`, anchor wiring (`buildIterationSendContent`), phase and guide step completion bookkeeping. |
+| `internal/react/request_context.go`, `internal/react/phase_plan.go` | `requirementAnalysisAnchor()`, `phaseStepAnchor()`, `guideStepAnchor()`. |
+| `internal/react/resource_guidance.go` | `buildGuideStepState` builds nested guide progress from `GuideCase.DiagnosticSteps` and persists the full step details to `step_store` when the guide is injected under `guided_diagnosis`. |
 | `internal/react/final_report.go` | `requestFinalReportFromModel`, `consumeFinalReport`, `renderFinalReport`, `requestNextDirectionsFromModel`. |
 | `internal/react/next_directions.go` | `consumeNextDirections`, `promptDirectionChoice`, `waitForDirectionChoice`, `waitForDirectionText`, `applyDirectionOption`. |
-| `internal/react/shim.go` | New top-level shim fields: `action.guide_progress`, `final_report`, `next_directions`. |
-| `prompts/default.tmpl`, `prompts/system_ko.tmpl` | Output schemas and rules for the model. |
+| `internal/react/shim.go` | Target top-level shim fields: `phase_plan`, `phase_progress`, `action.guide_progress`, `final_report`, `next_directions`. |
+| `prompts/default.tmpl`, `prompts/system_ko.tmpl` | Output schemas and model rules for phase planning, phase progress, nested guide progress, and final reporting. |
 
 ## Design constraints honored
 
 - **No forced output filtering.** The model can ignore the final_report instruction and emit `action` again; the anchor will re-emit on the next iteration. Drift is mitigated by per-iteration anchors and clear positive rules, not by post-hoc string filtering.
 - **Single-case tracking.** Only the top guide case's `DiagnosticSteps` populates `guideStepState`. Multi-case progress is not tracked because the runtime only injects one case at a time.
 - **No MaxIteration coupling.** `MaxIterations` still ends the loop with the existing "Maximum number of iterations reached" message. Guide-exhaustion via `final_report` is independent and can fire well before `MaxIterations`.
+- **Phase owns guide.** `guideStepState` is subordinate to the active `guided_diagnosis` `phase_step`; guide completion should lead to parent `phase_progress`, not directly replace the phase workflow.
 
 ## Invariants
 
-- `guideStepState` is non-nil only between `injectResourceGuideAttempt` (or `applyDirectionOption(another_guide)`) and a successful `final_report` or `startQuery`/`clearConversationState`.
+- `phaseStepState` is non-nil after the model-declared `phase_plan` is accepted and remains active until `final_report`, `startQuery`, or `clearConversationState`.
+- `guideStepState` is non-nil only while the active `phase_step` is `guided_diagnosis`; it is cleared when that parent phase completes, when a different guide is selected, or on `startQuery`/`clearConversationState`.
 - `finalReportRequested` is set when `requestFinalReportFromModel` queues its instruction. It prevents duplicate instruction text from being re-appended on every dispatch. It is cleared on `applyDirectionOption`, `startQuery`, `clearConversationState`, and at every `injectResourceGuide*` entry.
 - `pendingDirectionPrompt` is non-nil only while in `StateWaitingDirectionChoice`. The user's `Choice` index is mapped back to a concrete `nextDirectionOption` (or the synthetic finalize / free-input rows) using `FreeInputIdx` and `FinalizeIdx`.
+- `phase_progress.phase_completed` is the model's self-report for the top-level phase. It is ignored when the corresponding observation is blocked, declined, failed, errored, or structurally unrelated to the active phase goal.
 - `action.guide_progress.step_completed` is the model's self-report, not enforced by command matching. It is ignored when the corresponding observation is blocked, declined, failed, or errored. Misreported indices on successful observations are accepted (the worst case is premature `final_report` instruction or a step staying open).
 - Internal schema/correction errors, including invalid `next_directions`, are runtime errors rather than Kubernetes incident evidence. They must not trigger incident guidance offers.
 

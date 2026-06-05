@@ -51,12 +51,6 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 				l.requestContext = &request
 				classification := l.classifyResourceByDiscovery(ctx, request.PrimaryTarget.Resource)
 				l.resourceClassification = &classification
-				if l.shouldRunInitialResourceGuideLookup(request, classification) {
-					l.initialGuideAttempted = true
-					resource := normalizeKubectlResource(request.PrimaryTarget.Resource)
-					l.searchAndInjectResourceGuide(ctx, resource, l.initialResourceGuideQuery(request))
-					return nil, true
-				}
 			}
 			l.currIteration++
 			l.state = StateRunning
@@ -86,12 +80,6 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 		l.requestContext = &request
 		classification := l.classifyResourceByDiscovery(ctx, request.PrimaryTarget.Resource)
 		l.resourceClassification = &classification
-		if l.shouldRunInitialResourceGuideLookup(request, classification) {
-			l.initialGuideAttempted = true
-			resource := normalizeKubectlResource(request.PrimaryTarget.Resource)
-			l.searchAndInjectResourceGuide(ctx, resource, l.initialResourceGuideQuery(request))
-			return nil, true
-		}
 	}
 	return remaining, false
 }
@@ -555,17 +543,6 @@ func requestContextFromFunctionCall(call gollm.FunctionCall) (requestContext, bo
 	return request, true
 }
 
-func (l *Loop) shouldRunInitialResourceGuideLookup(request requestContext, classification resourceClassification) bool {
-	if l.initialGuideAttempted {
-		return false
-	}
-	resource := normalizeKubectlResource(strings.ToLower(request.PrimaryTarget.Resource))
-	if resource == "" || isBuiltinKubernetesResource(resource) {
-		return false
-	}
-	return classification.Kind == resourceClassificationCRD
-}
-
 func (l *Loop) resetChatSessionAfterRequirementAnalysis() error {
 	if err := l.resetChatSession(); err != nil {
 		return err
@@ -583,7 +560,7 @@ func (l *Loop) requirementAnalysisContextMessage() string {
 	if l.requirementAnalysis != nil {
 		raw, _ = json.Marshal(l.requirementAnalysis)
 	}
-	return fmt.Sprintf("Accepted requirement_analysis:\n%s\nUse this analysis as the request classification. If resource_candidates is empty, do not invent a Kubernetes resource target. If operational_focus is present, treat it as the current diagnostic angle, not as an automatic RAG request. Continue by choosing exactly one next step: top-level resource_guide_lookup when a refined lookup is needed, a kubectl/tool diagnostic, or a final answer.", string(raw))
+	return fmt.Sprintf("Accepted requirement_analysis:\n%s\nUse this analysis as the request classification. If resource_candidates is empty, do not invent a Kubernetes resource target. If operational_focus is present, treat it as the current diagnostic angle, not as an automatic RAG request. Your next response must be only a `phase_plan` object that defines ordered `phase_steps`, each with goal, completion_condition, and allowed_next. Do not choose an action, resource_guide_lookup, final_report, or answer until the phase_plan is accepted.", string(raw))
 }
 
 // guideStepAnchor returns a compact reaffirmation of the active resource
@@ -592,6 +569,9 @@ func (l *Loop) requirementAnalysisContextMessage() string {
 // appendGuideObservation; this anchor re-emits just enough state for the
 // model to know which step it is on and what is left to do.
 func (l *Loop) guideStepAnchor() string {
+	if l.phaseStepState != nil && !strings.EqualFold(l.phaseStepState.currentStep().Name, "guided_diagnosis") {
+		return ""
+	}
 	state := l.guideStepState
 	if state == nil || state.TotalSteps == 0 {
 		return ""

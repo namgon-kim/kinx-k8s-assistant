@@ -78,6 +78,31 @@ func TestResourceGuideRefinementQueryUsesProblemFocus(t *testing.T) {
 	}
 }
 
+func TestFilterResourceGuidesDropsDeletionGuideForGeneralDiagnosis(t *testing.T) {
+	loop := &Loop{originalQuery: "namespace tenant-a에서 clst-a cluster가 왜 문제야?"}
+	got := loop.filterResourceGuidesForRequest(&guidance.GuideSearchResult{
+		Cases: []guidance.GuideCase{
+			{ID: "iksv2-renew-cluster-deletion", Title: "IKS v2 Cluster Deletion and Cleanup", Tags: []string{"delete"}},
+			{ID: "iksv2-renew-cluster-creation-top-level", Title: "IKS v2 Cluster Creation Top-Level Resources"},
+		},
+	}, "primary target resource: cluster")
+	if len(got.Cases) != 1 || got.Cases[0].ID != "iksv2-renew-cluster-creation-top-level" {
+		t.Fatalf("expected deletion guide to be filtered, got %#v", got.Cases)
+	}
+}
+
+func TestFilterResourceGuidesKeepsDeletionGuideForDeletionDiagnosis(t *testing.T) {
+	loop := &Loop{originalQuery: "cluster deletion이 왜 안 끝나?"}
+	got := loop.filterResourceGuidesForRequest(&guidance.GuideSearchResult{
+		Cases: []guidance.GuideCase{
+			{ID: "iksv2-renew-cluster-deletion", Title: "IKS v2 Cluster Deletion and Cleanup", Tags: []string{"delete"}},
+		},
+	}, "primary target resource: cluster")
+	if len(got.Cases) != 1 {
+		t.Fatalf("expected deletion guide to be kept, got %#v", got.Cases)
+	}
+}
+
 func TestCommandMentionsResourceAllowsCommaSeparatedTargetResource(t *testing.T) {
 	command := "kubectl -n 43e3c8fe-8674-4ccf-88e9-7084805034bb get machinedeployment,tenantcontrolplane -l cluster.x-k8s.io/cluster-name=clst-pz02-shs1006-04 -o yaml"
 	if !commandMentionsResource(command, "machinedeployment,tenantcontrolplane") {
@@ -101,6 +126,16 @@ func TestCommandMentionsResourceAllowsKubectlResourceNameShorthand(t *testing.T)
 	}
 	if !commandMentionsToken(command, "clst-a") {
 		t.Fatalf("expected resource/name shorthand to mention object name: %s", command)
+	}
+}
+
+func TestCommandMentionsResourceAllowsMultipleResourceNameShorthandArgs(t *testing.T) {
+	command := "kubectl -n tenant-a get ingress/clst-a secret/clst-a-cloud-conf secret/clst-a-admin-kubeconfig -o yaml"
+	if !commandMentionsResource(command, "ingress, secret") {
+		t.Fatalf("expected multiple resource/name shorthand args to mention ingress and secret: %s", command)
+	}
+	if !commandMentionsToken(command, "clst-a, clst-a-cloud-conf, clst-a-admin-kubeconfig") {
+		t.Fatalf("expected comma-separated target names to match command: %s", command)
 	}
 }
 
@@ -521,39 +556,6 @@ func TestRequirementAnalysisNormalizesResourceRoleSynonym(t *testing.T) {
 	}
 	if got.PrimaryTarget.Resource != "cluster" || got.PrimaryTarget.Name != "cluster-a" {
 		t.Fatalf("unexpected request context: %#v", got)
-	}
-}
-
-func TestInitialResourceGuideLookupUsesRuntimeCRDDiscovery(t *testing.T) {
-	loop := &Loop{executor: fakeDiscoveryExecutor{}}
-	clusterClass := loop.classifyResourceByDiscovery(context.Background(), "cluster")
-	if clusterClass.Kind != resourceClassificationCRD {
-		t.Fatalf("expected cluster to be classified as CRD, got %#v", clusterClass)
-	}
-	if !loop.shouldRunInitialResourceGuideLookup(requestContext{
-		PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "cluster-a"},
-		Scope:         requestScope{Namespace: "tenant-a"},
-		ResourceClass: "built_in",
-	}, clusterClass) {
-		t.Fatal("CRDs should trigger initial guide lookup even when model class hint is wrong")
-	}
-	if !loop.shouldRunInitialResourceGuideLookup(requestContext{
-		PrimaryTarget: requestPrimaryTarget{Resource: "cluster"},
-		ResourceClass: "unknown",
-	}, clusterClass) {
-		t.Fatal("CRD resource candidates should trigger initial guide lookup even without an object name")
-	}
-
-	podClass := loop.classifyResourceByDiscovery(context.Background(), "pod")
-	if podClass.Kind != resourceClassificationBuiltin {
-		t.Fatalf("expected pod to be classified as built-in, got %#v", podClass)
-	}
-	if loop.shouldRunInitialResourceGuideLookup(requestContext{
-		PrimaryTarget: requestPrimaryTarget{Resource: "pod", Name: "pod-a"},
-		Scope:         requestScope{Namespace: "tenant-a"},
-		ResourceClass: "custom_resource",
-	}, podClass) {
-		t.Fatal("built-in resources must not trigger initial guide lookup even when model class hint is wrong")
 	}
 }
 
