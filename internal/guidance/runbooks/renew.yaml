@@ -1,0 +1,808 @@
+schema:
+  placeholder_policy:
+    - "{{namespace}}: management cluster에서 tenant/cluster 리소스가 생성되는 namespace (tenant-id)"
+    - "{{cluster_name}}: IKS v2 Cluster 리소스 이름"
+    - "{{machine_deployment_name}}: 특정 MachineDeployment(node group) 이름"
+    - "{{machine_name}}: 특정 Machine 이름"
+    - "{{openstack_machine_name}}: 특정 OpenStackMachine 이름. 보통 Machine 이름과 같지만 리소스에서 확인해야 한다."
+    - "{{workload_context}}: workload cluster kubeconfig/context. {{cluster_name}}-admin-kubeconfig Secret의 admin.conf에서 추출한 뒤에만 사용한다."
+  diagnostic_policy:
+    - "판정 근거는 Kubernetes status/conditions/annotations/labels/finalizers다. 서비스 내부 DB 값과 내부 상태 코드는 사용하지 않는다."
+    - "먼저 annotation/label로 시스템이 마킹한 단계를 확정하고, 그다음 conditions/status로 실제 상태와의 간극을 찾는다."
+    - "OpenStack을 직접 조회하는 도구가 없다. OpenStack 자원 상태는 OpenStackCluster.status(ready/하위 객체/failureMessage)와 OpenStackMachine의 InstanceReady reason으로 추론한다. 오류가 없으면 정상 생성으로 간주한다."
+    - "condition/reason 이름은 컴포넌트 버전에 따라 다를 수 있다. 이름이 안 보이면 같은 의미의 status 신호를 직접 읽는다."
+    - "로그 수집 도구가 없다. 로그가 필요하면 직접 실행하지 말고 사용자에게 명령을 안내한다."
+    - "automatic_candidate=true 명령은 read-only kubectl 조회 또는 로그 조회만 포함한다. 노드 OS 내부(cloud-init/kubelet) 로그는 사용자가 직접 확인하도록 안내한다."
+
+cases:
+  - id: iksv2-cluster-creation-top-level
+    title: "Cluster 생성 상위 리소스와 생성 annotation"
+    symptoms:
+      - "클러스터 생성이 오래 걸리거나 끝나지 않는다"
+      - "Cluster status에 InfrastructureReady 또는 ControlPlaneReady가 없다"
+      - "생성 요청 후 상위 Cluster API 리소스가 없다"
+    evidence_keywords:
+      - "Cluster"
+      - "OpenStackCluster"
+      - "KamajiControlPlane"
+      - "InfrastructureReady"
+      - "ControlPlaneReady"
+      - "WaitingForInfrastructure"
+      - "WaitingForControlPlane"
+      - "cluster-create-started"
+      - "cluster-create-completed"
+      - "cluster-create-failed"
+      - "cluster.x-k8s.io.ew/cluster-id"
+    match_types: ["Timeout"]
+    cause: "클러스터 생성은 api-manager가 만든 상위 리소스에서 시작한다. 하위 리소스 부재는 상위 리소스와 생성 annotation을 확인한 뒤에만 해석한다."
+    resolution: "Cluster/OpenStackCluster/KamajiControlPlane 존재와 InfrastructureReady/ControlPlaneReady condition, cluster-create-* annotation을 먼저 본다."
+    decision_hints:
+      - "Cluster/OpenStackCluster/KamajiControlPlane 중 일부가 없으면 상위 생성 단계 문제로 본다."
+      - "InfrastructureReady=False reason WaitingForInfrastructure면 인프라(OpenStackCluster) 단계로 간다."
+      - "InfrastructureReady=True, ControlPlaneReady=False면 control plane(Kamaji) 단계로 간다."
+      - "cluster-create-started만 있고 완료/실패 마킹이 없으면 진행 중 또는 멈춤이다."
+    related_objects:
+      - Cluster
+      - OpenStackCluster
+      - KamajiControlPlane
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Cluster metadata, finalizers, 생성 annotation 확인"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o jsonpath='{.metadata.labels}{\"\\n\"}{.metadata.annotations}{\"\\n\"}{.metadata.finalizers}{\"\\n\"}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "상위 리소스 존재와 condition 확인"
+        command_template: "kubectl -n {{namespace}} get cluster/{{cluster_name}} openstackcluster/{{cluster_name}} kamajicontrolplane/{{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Cluster condition 요약"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o jsonpath='{range .status.conditions[*]}{.type}={.status} reason={.reason} message={.message}{\"\\n\"}{end}'"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "cluster", "creation", "annotations"]
+
+  - id: iksv2-infrastructure-openstackcluster
+    title: "OpenStack 인프라(OpenStackCluster) 단계 추론"
+    symptoms:
+      - "클러스터가 생성 중에서 안 넘어간다"
+      - "InfrastructureReady가 오래 False다"
+      - "네트워크/라우터/보안그룹/엔드포인트가 준비되지 않는다"
+    evidence_keywords:
+      - "OpenStackCluster"
+      - "status.ready"
+      - "status.network"
+      - "status.router"
+      - "controlPlaneSecurityGroup"
+      - "workerSecurityGroup"
+      - "apiServerLoadBalancer"
+      - "failureMessage"
+      - "failureReason"
+      - "cluster.x-k8s.io.ew/cluster-sg-id"
+      - "OpenStackError"
+    match_types: ["Timeout", "ConfigError"]
+    cause: "OpenStackCluster는 인프라 준비를 status.ready와 status 하위 객체로 노출한다. 세분 condition이 없을 수 있어 어떤 status 객체가 채워졌는지와 failureMessage로 막힌 단계를 추론한다."
+    resolution: "status.ready=false에서 비어 있는 status 객체(network/router/securityGroup/apiServerLoadBalancer)로 단계를 좁히고 failureMessage/Events/capo 로그를 본다. 오류가 없으면 정상 생성으로 간주한다."
+    decision_hints:
+      - "status.network/externalNetwork 비어 있음 → network/subnet 단계(외부 네트워크 미존재/CIDR 충돌/quota)."
+      - "status.network 있고 status.router 비어 있음 → router/게이트웨이 단계."
+      - "controlPlaneSecurityGroup/workerSecurityGroup 비어 있고 cluster-sg-id 미기록 → security group 단계."
+      - "status.apiServerLoadBalancer 비어 있음 → API endpoint(LB/FIP) 단계, control plane 접근 경로 미구성으로 이어진다."
+      - "failureMessage에 401/403이면 cluster 전용 application credential/endpoint 문제(OpenStackError)."
+    related_objects:
+      - OpenStackCluster
+      - Cluster
+    diagnostic_steps:
+      - type: diagnostic
+        description: "OpenStackCluster status와 failureMessage 확인"
+        command_template: "kubectl -n {{namespace}} get openstackcluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "OpenStackCluster Events 확인"
+        command_template: "kubectl -n {{namespace}} describe openstackcluster {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "CAPO 컨트롤러 로그를 클러스터 기준으로 확인하도록 안내"
+        command_template: "kubectl logs -n capo-system deploy/capo-controller-manager --since=30m | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "openstack", "infrastructure", "network", "quota"]
+
+  - id: iksv2-vm-creation-openstackmachine
+    title: "VM(OpenStackMachine) 생성 실패 추론"
+    symptoms:
+      - "노드그룹을 만들었는데 VM이 안 생긴다"
+      - "Machine이 Provisioning에서 멈췄다"
+      - "VM 생성이 quota/이미지/flavor/port/volume 때문에 실패한다"
+    evidence_keywords:
+      - "OpenStackMachine"
+      - "InstanceReady"
+      - "InstanceCreateFailed"
+      - "InstanceStateError"
+      - "InvalidMachineSpec"
+      - "InstanceNotFound"
+      - "OpenStackError"
+      - "WaitingForBootstrapData"
+      - "failureMessage"
+      - "Quota exceeded"
+      - "No valid host was found"
+      - "providerID"
+    match_types: ["FailedScheduling", "ConfigError", "Pending"]
+    cause: "Machine InfrastructureReady=False이고 providerID가 비어 있으면 VM 생성 단계에서 막힌 것이다. OpenStackMachine의 InstanceReady reason과 failureMessage로 좁힌다."
+    resolution: "OpenStackMachine InstanceReady reason과 failureMessage를 읽어 quota/flavor/image/port/volume/credential 중 어느 것인지 좁힌다. 같은 노드그룹에서 일부 Machine만 실패하면 quota/용량을 우선한다."
+    decision_hints:
+      - "WaitingForClusterInfrastructure는 인프라 대기(정상 진행). 오래 막히면 iksv2-infrastructure-openstackcluster로 간다."
+      - "WaitingForBootstrapData는 bootstrap data 미생성(capi-kubeadm-bootstrap)."
+      - "InstanceCreateFailed면 failureMessage로 quota/flavor/image/port/volume을 좁힌다."
+      - "InstanceStateError(No valid host)는 컴퓨트 용량 부족 또는 flavor/AZ 불일치."
+      - "OpenStackError는 API 통신/인증(application credential/endpoint)."
+    related_objects:
+      - OpenStackMachine
+      - Machine
+      - OpenStackMachineTemplate
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Machine phase/providerID/condition 요약"
+        command_template: "kubectl -n {{namespace}} get machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o jsonpath='{range .items[*]}{.metadata.name}{\"\\t\"}phase={.status.phase}{\"\\t\"}providerID={.spec.providerID}{\"\\n\"}{end}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "OpenStackMachine status/conditions/failureMessage 확인"
+        command_template: "kubectl -n {{namespace}} get openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "OpenStackMachine Events 확인"
+        command_template: "kubectl -n {{namespace}} describe openstackmachine {{openstack_machine_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "openstack", "vm", "instance", "quota", "capo"]
+
+  - id: iksv2-hosted-control-plane
+    title: "Hosted Control Plane(Kamaji) 준비 상태"
+    symptoms:
+      - "API 서버 접속이 안 되거나 kubeconfig가 안 먹는다"
+      - "컨트롤 플레인 Pod가 안 뜨거나 계속 재시작한다"
+      - "ControlPlaneReady가 False다"
+    evidence_keywords:
+      - "KamajiControlPlane"
+      - "TenantControlPlane"
+      - "version.status"
+      - "Provisioning"
+      - "NotReady"
+      - "WriteLimited"
+      - "Upgrading"
+      - "CertificateAuthorityRotating"
+      - "Migrating"
+      - "controlPlaneEndpoint"
+      - "dataStoreName"
+      - "capi-kamaji-controller-manager"
+    match_types: ["CrashLoopBackOff", "Pending", "NetworkFailure"]
+    cause: "control plane 준비는 KamajiControlPlane/TenantControlPlane status로 판정한다. 판정값은 TenantControlPlane.status.kubernetesResources.version.status, control plane Deployment replica, controlPlaneEndpoint다. workload-cluster node 상태는 근거로 쓰지 않는다."
+    resolution: "version.status, controlPlaneEndpoint, deployment readyReplicas, datastore를 확인한다. KamajiControlPlane은 있는데 TenantControlPlane이 없으면 Kamaji provider 로그를 본다."
+    decision_hints:
+      - "KamajiControlPlane 있음, TenantControlPlane 없음 → Kamaji provider 미생성/실패."
+      - "version.status=Provisioning 지속 → control plane Pod 기동 중/멈춤(스케줄/이미지/datastore 대기)."
+      - "version.status=NotReady → control plane component 비정상(인증서/datastore/설정)."
+      - "version.status=WriteLimited → datastore write 제한(용량/quorum)."
+      - "controlPlaneEndpoint 비어 있음 → API 노출 경로 미구성, worker join에도 영향(iksv2-machine-join-failure)."
+      - "version.status=Upgrading/CertificateAuthorityRotating/Migrating 장기 지속 → rollout/CA교체/마이그레이션 멈춤."
+    related_objects:
+      - KamajiControlPlane
+      - TenantControlPlane
+      - Cluster
+    diagnostic_steps:
+      - type: diagnostic
+        description: "KamajiControlPlane/TenantControlPlane status 확인"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane/{{cluster_name}} tenantcontrolplane/{{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "TenantControlPlane version.status와 endpoint 요약"
+        command_template: "kubectl -n {{namespace}} get tenantcontrolplane {{cluster_name}} -o jsonpath='version={.status.kubernetesResources.version.status}{\"\\t\"}endpoint={.status.controlPlaneEndpoint}{\"\\t\"}datastore={.status.storage.dataStoreName}{\"\\n\"}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "Kamaji controller 로그를 클러스터 기준으로 확인"
+        command_template: "kubectl logs -n kamaji-system deploy/capi-kamaji-controller-manager --since=30m | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "control-plane", "kamaji", "tenantcontrolplane", "endpoint", "datastore"]
+
+  - id: iksv2-initial-deployment-state
+    title: "초기 배포 단계 판정과 실패 후 pause"
+    symptoms:
+      - "초기 배포가 실패했다"
+      - "클러스터가 paused 됐다"
+      - "생성은 됐는데 사용 가능 상태로 안 넘어간다"
+    evidence_keywords:
+      - "initial-deployment-completed"
+      - "initial-deployment-paused"
+      - "cluster.x-k8s.io/paused"
+      - "cluster.x-k8s.io.ew/initial-deployment"
+      - "cluster-create-completed"
+      - "cluster-create-failed"
+      - "HelmRelease"
+      - "spec.suspend"
+    match_types: ["Timeout"]
+    cause: "초기 배포 성공은 control plane Ready + 초기 노드그룹(initial-deployment=true label) Available + addon Ready의 종합이다. 실패하면 watcher가 실패를 마킹하고 processor가 control plane cleanup으로 진입한다."
+    resolution: "initial-deployment-completed/initial-deployment-paused/paused annotation을 먼저 보고, 미완료 구성요소(control plane/초기 노드그룹/addon)를 해당 케이스로 추적한다."
+    decision_hints:
+      - "initial-deployment-completed=false + initial-deployment-paused=true + paused + HelmRelease suspend면 실패 확정 후 cleanup 단계다."
+      - "control plane 미완료면 iksv2-hosted-control-plane로 간다."
+      - "초기 노드그룹 미완료면 iksv2-nodegroup-creation-rollout/iksv2-machine-join-failure로 간다."
+      - "addon 미완료면 iksv2-addon-rollout로 간다."
+    related_objects:
+      - Cluster
+      - MachineDeployment
+      - HelmReleaseProxy
+      - HelmRelease
+    diagnostic_steps:
+      - type: diagnostic
+        description: "초기 배포 annotation 확인"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o jsonpath='{.metadata.annotations}{\"\\n\"}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "초기 노드그룹과 addon 준비 상태 확인"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,helmreleaseproxy,helmrelease -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "초기 배포 watcher/processor 로그 확인"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-watcher --since=30m | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "initial-deployment", "paused"]
+
+  - id: iksv2-nodegroup-creation-rollout
+    title: "NodeGroup 전개 계층 판정"
+    symptoms:
+      - "노드그룹을 만들었는데 노드가 안 생긴다"
+      - "MachineDeployment 하위 리소스가 전개되지 않는다"
+    evidence_keywords:
+      - "MachineDeployment"
+      - "MachineSet"
+      - "Machine"
+      - "OpenStackMachine"
+      - "status.phase"
+      - "ScalingUp"
+      - "OpenStackMachineTemplate"
+      - "KubeadmConfigTemplate"
+    match_types: ["Pending"]
+    cause: "node group은 MachineDeployment→MachineSet→Machine→OpenStackMachine로 전개된다. 어느 계층에서 멈췄는지로 담당 controller를 좁힌다."
+    resolution: "전개 계층에서 가장 바깥에 없는 하위 리소스가 멈춘 지점이다. 상위가 있고 5분 이상 하위가 없으면 담당 controller를 의심한다."
+    decision_hints:
+      - "MachineDeployment 있음, MachineSet 없음 → CAPI 전개 전/실패(capi-controller-manager)."
+      - "MachineSet 있음, Machine 없음 → replica 전개 전 또는 template 문제."
+      - "Machine 있음, OpenStackMachine 없음 → CAPO 전개 전/실패(capo-controller-manager)."
+      - "Machine InfrastructureReady=False, providerID 비어 있음 → VM 생성 단계(iksv2-vm-creation-openstackmachine)."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - Machine
+      - OpenStackMachine
+    diagnostic_steps:
+      - type: diagnostic
+        description: "node group 전개 계층 확인"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,machineset,machine,openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "MachineDeployment status 확인"
+        command_template: "kubectl -n {{namespace}} get machinedeployment {{machine_deployment_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "nodegroup", "rollout", "capi", "capo"]
+
+  - id: iksv2-machine-join-failure
+    title: "VM은 떴는데 노드가 클러스터에 안 붙는다 (join 실패 / NotReady)"
+    symptoms:
+      - "VM은 생성됐는데 노드로 동작하지 않는다"
+      - "노드가 NotReady에서 안 올라온다"
+      - "providerID는 있는데 Node로 등록되지 않는다"
+    evidence_keywords:
+      - "providerID"
+      - "phase=Provisioned"
+      - "nodeRef"
+      - "NodeHealthy"
+      - "WaitingForNodeRef"
+      - "NodeProvisioning"
+      - "NodeConditionsFailed"
+      - "BootstrapReady"
+      - "WaitingForDataSecret"
+      - "dataSecretName"
+      - "controlPlaneEndpoint"
+      - "KinxServiceGateway"
+      - "calico"
+    match_types: ["Timeout", "ProbeFailed"]
+    cause: "Machine.spec.providerID가 채워졌다 = OpenStack instance가 정상 생성됐다. 이후에도 노드가 동작하지 않으면 VM 문제가 아니라 kubelet/join 문제이며, 최종적으로 노드가 join되지 않은 것으로 간주한다. 분기 기준은 Machine.status.nodeRef 존재 여부다."
+    resolution: "nodeRef가 없으면 join 실패로 보고 bootstrap data/endpoint 도달성/cloud-init를 좁힌다. nodeRef가 있는데 NodeHealthy=False(NodeConditionsFailed)면 CNI(calico) 미배포를 본다."
+    decision_hints:
+      - "providerID 있음 + phase=Provisioned + nodeRef 없음 → join 실패(공통)."
+      - "join 실패 + BootstrapReady=False(WaitingForDataSecret) + KubeadmConfig.dataSecretName 비어 있음 → bootstrap data 문제(capi-kubeadm-bootstrap)."
+      - "join 실패 + BootstrapReady=True인데 nodeRef 없음 → control plane endpoint 도달 불가(KinxServiceGateway/SG/FIP/Static Route)."
+      - "endpoint/네트워크 정상인데 join 안 됨 → cloud-init/kubelet 구성 또는 join token 만료, 노드 OS 로그를 사용자가 직접 확인."
+      - "nodeRef 있음 + NodeHealthy=False(NodeConditionsFailed) → NotReady, 대개 CNI(calico) 미배포(iksv2-addon-rollout)."
+    related_objects:
+      - Machine
+      - OpenStackMachine
+      - KubeadmConfig
+      - TenantControlPlane
+      - KinxServiceGateway
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Machine phase/providerID/nodeRef/condition 요약"
+        command_template: "kubectl -n {{namespace}} get machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o jsonpath='{range .items[*]}{.metadata.name}{\"\\t\"}phase={.status.phase}{\"\\t\"}providerID={.spec.providerID}{\"\\t\"}nodeRef={.status.nodeRef.name}{\"\\n\"}{range .status.conditions[*]}  {.type}={.status} reason={.reason}{\"\\n\"}{end}{end}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "control plane endpoint와 service gateway 상태 확인"
+        command_template: "kubectl -n {{namespace}} get tenantcontrolplane {{cluster_name}} -o jsonpath='endpoint={.status.controlPlaneEndpoint}{\"\\n\"}'; kubectl -n {{namespace}} get kinxservicegateway -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "calico HelmReleaseProxy 상태 확인(NotReady 분기)"
+        command_template: "kubectl -n {{namespace}} get helmreleaseproxy -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o custom-columns=NAME:.metadata.name,CHART:.spec.chartName,READY:'.status.conditions[?(@.type==\"Ready\")].status',REASON:'.status.conditions[?(@.type==\"Ready\")].reason'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "join 실패 의심 시 노드 OS의 cloud-init/kubelet/kubeadm join 로그를 사용자가 직접 확인하도록 안내(management cluster에서 워커 OS 로그 도구 없음)"
+        automatic_candidate: false
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "join", "bootstrap", "kubelet", "notready", "cni", "servicegateway"]
+
+  - id: iksv2-machinehealthcheck-remediation
+    title: "MachineHealthCheck remediation 재생성 루프"
+    symptoms:
+      - "노드가 자꾸 지워지고 다시 생긴다"
+      - "Machine이 unhealthy로 반복 판정된다"
+    evidence_keywords:
+      - "MachineHealthCheck"
+      - "HealthCheckSucceeded"
+      - "NodeStartupTimeout"
+      - "UnhealthyNode"
+      - "OwnerRemediated"
+      - "RemediationInProgress"
+      - "RemediationFailed"
+    match_types: ["Timeout"]
+    cause: "MHC가 노드를 unhealthy로 판정하면 remediation이 Machine을 재생성한다. 근본 원인(join 실패/CNI 미배포)이 해소되지 않으면 노드 삭제/재생성이 반복된다."
+    resolution: "HealthCheckSucceeded reason과 OwnerRemediated를 확인하고, NodeStartupTimeout은 join 실패의 결과이므로 근본 원인을 먼저 해결한다."
+    decision_hints:
+      - "HealthCheckSucceeded=False reason NodeStartupTimeout은 시간 내 Node 미등장 → join 실패(iksv2-machine-join-failure)와 연결."
+      - "OwnerRemediated가 RemediationInProgress/RemediationFailed로 반복되면 근본 원인 미해소다."
+    related_objects:
+      - Machine
+      - MachineHealthCheck
+      - MachineDeployment
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Machine health 관련 condition 확인"
+        command_template: "kubectl -n {{namespace}} get machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{range .status.conditions[*]}  {.type}={.status} reason={.reason}{\"\\n\"}{end}{end}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "MachineHealthCheck 상태와 CAPI remediation 로그 확인"
+        command_template: "kubectl -n {{namespace}} get machinehealthcheck -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml; kubectl logs -n capi-system deploy/capi-controller-manager --since=30m | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: medium
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "mhc", "remediation", "nodegroup"]
+
+  - id: iksv2-nodegroup-scale
+    title: "NodeGroup scale가 안 끝난다"
+    symptoms:
+      - "노드 증설/축소가 끝나지 않는다"
+      - "replica가 desired에 도달하지 않는다"
+    evidence_keywords:
+      - "MachineDeployment"
+      - "status.phase"
+      - "ScalingUp"
+      - "ScalingDown"
+      - "nodegroup-scale-completed"
+      - "nodegroup-scale-failed"
+      - "last-scaled"
+      - "nodegroup-paused"
+    match_types: ["Timeout"]
+    cause: "scale는 MachineDeployment.spec.replicas patch 후 phase로 수렴을 본다. timeout이면 watcher가 실패를 마킹하고 pause한다."
+    resolution: "phase와 desired/current replica, nodegroup-scale-* annotation을 확인한다. 증설이 안 되면 VM 생성 실패 또는 신규 노드 join 실패로 좁힌다."
+    decision_hints:
+      - "phase=ScalingUp, desired>current 지속 → 신규 Machine 생성 실패(iksv2-vm-creation-openstackmachine) 또는 join 실패(iksv2-machine-join-failure)."
+      - "phase=ScalingDown 또는 Running인데 desired<current → 삭제 대상 Machine drain/detach(iksv2-nodegroup-deletion)."
+      - "nodegroup-scale-failed=true + pause → scale timeout 실패 확정."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - Machine
+    diagnostic_steps:
+      - type: diagnostic
+        description: "MachineDeployment scale 상태와 annotation 확인"
+        command_template: "kubectl -n {{namespace}} get machinedeployment {{machine_deployment_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "nodegroup", "scale"]
+
+  - id: iksv2-nodegroup-upgrade
+    title: "NodeGroup / Control Plane upgrade가 안 끝난다"
+    symptoms:
+      - "노드그룹 업그레이드가 끝나지 않는다"
+      - "old MachineSet이 사라지지 않는다"
+      - "control plane 업그레이드가 멈춘 것 같다"
+    evidence_keywords:
+      - "MachineDeployment"
+      - "MachineSet"
+      - "nodegroup-upgrade-in-progress"
+      - "nodegroup-upgrade-completed"
+      - "nodegroup-upgrade-failed"
+      - "last-upgraded"
+      - "OpenStackMachineTemplate"
+      - "version.status"
+      - "Upgrading"
+    match_types: ["Timeout"]
+    cause: "rolling upgrade는 새 MachineSet으로 교체하며 old MachineSet replica가 0이 될 때 완료된다. control plane 업그레이드는 TenantControlPlane version.status=Upgrading으로 나타난다."
+    resolution: "old MachineSet 잔존과 신규 Machine readiness, nodegroup-upgrade-* annotation을 확인한다. control plane은 version.status=Upgrading rollout을 본다."
+    decision_hints:
+      - "nodegroup-upgrade-in-progress=true 지속, old MachineSet replica 유지, 신규 Machine이 Running 못 됨 → 새 template(이미지) 문제 또는 신규 노드 join 실패."
+      - "version.status=Upgrading 지속 → control plane component rollout 지연(iksv2-hosted-control-plane)."
+      - "nodegroup-upgrade-failed=true + pause → upgrade timeout 실패 확정."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - OpenStackMachineTemplate
+      - TenantControlPlane
+    diagnostic_steps:
+      - type: diagnostic
+        description: "MachineDeployment와 MachineSet 버전/replica 확인"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,machineset -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: medium
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "nodegroup", "upgrade", "control-plane"]
+
+  - id: iksv2-addon-rollout
+    title: "addon(CAAPH) 미배포 / pending·wait 지연"
+    symptoms:
+      - "addon(calico/CSI/CCM)이 안 깔린다"
+      - "addon 설치가 너무 느리거나 오래 pending이다"
+      - "HelmChartProxy는 있는데 HelmReleaseProxy가 없다"
+    evidence_keywords:
+      - "HelmChartProxy"
+      - "HelmReleaseProxy"
+      - "HelmReleaseReady"
+      - "HelmReleasePending"
+      - "HelmInstallOrUpgradeFailed"
+      - "HelmReleaseProxySpecsUpToDate"
+      - "ValueParsingFailed"
+      - "ClusterSelectionFailed"
+      - "ClusterAvailable"
+      - "WaitingForControlPlaneAvailable"
+      - "pending-install"
+      - "pending-upgrade"
+      - "options.wait"
+      - "atomic"
+      - "calico"
+    match_types: ["Timeout", "ConfigError"]
+    cause: "addon은 HelmChartProxy로 선언되고 addon controller가 HelmReleaseProxy를 생성·reconcile한다. options.wait/atomic이면 install/upgrade가 리소스 Ready까지 동기 블록(미설정 timeout 기본 5분)하므로 pending 지연과 잔여 pending이 발생한다."
+    resolution: "HelmReleaseReady reason과 status.status로 진행/실패를 구분한다. HelmReleasePending+pending-*는 wait 블로킹 또는 잔여 pending이고, HelmInstallOrUpgradeFailed는 실제 실패다. HelmReleaseProxy 부재는 HelmChartProxy의 HelmReleaseProxySpecsUpToDate reason으로 좁힌다."
+    decision_hints:
+      - "HelmReleaseReady reason HelmReleasePending, status.status=pending-install/upgrade → wait 블로킹 또는 잔여 pending. CNI 전후 상호 대기로 매 reconcile이 timeout을 소진해 초기 배포 timeout을 유발할 수 있다."
+      - "컨트롤러 재시작/데드라인으로 release가 pending에 잔류하면 another operation in progress로 자동 회복이 안 된다(해소는 영향 큼, 사용자 확인 후)."
+      - "HelmInstallOrUpgradeFailed는 values/chart/CRD/소유권 충돌. atomic이면 rollback→reinstall 루프(HelmReleaseProxyReinstalling)."
+      - "ClusterAvailable=False reason WaitingForControlPlaneAvailable은 CP 미준비 대기(정상), GetKubeconfigFailed/GetClusterFailed는 워크로드 접근 실패."
+      - "HelmReleaseProxy 부재면 ValueParsingFailed/ClusterSelectionFailed/HelmReleaseProxyCreationFailed를 확인한다."
+    related_objects:
+      - HelmChartProxy
+      - HelmReleaseProxy
+      - HelmRelease
+      - Cluster
+    diagnostic_steps:
+      - type: diagnostic
+        description: "HelmReleaseProxy Ready/reason/helm 원상태 요약"
+        command_template: "kubectl -n {{namespace}} get helmreleaseproxy -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o custom-columns=NAME:.metadata.name,CHART:.spec.chartName,READY:'.status.conditions[?(@.type==\"Ready\")].status',REASON:'.status.conditions[?(@.type==\"Ready\")].reason',HELM:.status.status"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "HelmChartProxy condition과 wait/atomic 옵션 확인"
+        command_template: "kubectl -n {{namespace}} get helmchartproxy -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "CAAPH 컨트롤러 로그에서 pending/timeout/in progress 확인"
+        command_template: "kubectl logs -n caaph-system deploy/caaph-controller-manager --since=30m | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "addon", "helm", "caaph", "wait", "pending", "calico", "csi"]
+
+  - id: iksv2-cluster-suspend
+    title: "Cluster suspend가 안 끝난다"
+    symptoms:
+      - "suspend가 끝나지 않는다"
+      - "operation-state가 suspend-applied에서 멈췄다"
+    evidence_keywords:
+      - "cluster.x-k8s.io.am/operation-state"
+      - "suspend-requested"
+      - "suspend-applied"
+      - "last-suspended-done"
+      - "KamajiControlPlane"
+      - "readyReplicas"
+      - "version.status"
+      - "Sleeping"
+      - "spec.suspend"
+    match_types: ["Timeout"]
+    cause: "suspend는 operation-state annotation 상태기계로 진행하며, KCP/component replica가 0으로 수렴하고 version.status=Sleeping이 되어야 last-suspended-done이 기록된다."
+    resolution: "operation-state, KCP/component replica, version.status, last-suspended-done을 함께 본다."
+    decision_hints:
+      - "operation-state=suspend-requested 유지(전이 없음) → event-processor 미수행/에러. 비정상 조합 확인."
+      - "operation-state=suspend-applied인데 안 끝남 → KCP/component replica가 0으로 안 내려감(version.status=Sleeping 미도달)."
+      - "operation-state 없는데 last-suspended-done과 last-resumed-done 둘 다 있으면 비정상."
+    related_objects:
+      - Cluster
+      - KamajiControlPlane
+      - HelmRelease
+    diagnostic_steps:
+      - type: diagnostic
+        description: "operation-state와 done annotation 확인"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o jsonpath='{.metadata.annotations}{\"\\n\"}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "KamajiControlPlane replica와 version.status 확인"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane {{cluster_name}} -o jsonpath='spec.replicas={.spec.replicas}{\"\\t\"}readyReplicas={.status.readyReplicas}{\"\\n\"}'; kubectl -n {{namespace}} get tenantcontrolplane {{cluster_name}} -o jsonpath='version={.status.kubernetesResources.version.status}{\"\\n\"}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "event-processor 로그 확인"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-processor --since=30m | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "suspend", "operation-state"]
+
+  - id: iksv2-cluster-resume
+    title: "Cluster resume가 안 끝난다"
+    symptoms:
+      - "resume가 끝나지 않는다"
+      - "operation-state가 resume-applied에서 멈췄다"
+    evidence_keywords:
+      - "cluster.x-k8s.io.am/operation-state"
+      - "resume-requested"
+      - "resume-applied"
+      - "last-resumed-done"
+      - "last-suspended-done"
+      - "KamajiControlPlane"
+      - "readyReplicas"
+      - "version.status"
+      - "Ready"
+    match_types: ["Timeout"]
+    cause: "resume는 operation-state로 진행하며 KCP/component replica 복구와 version.status=Ready, paused 해제 후 last-resumed-done이 기록된다."
+    resolution: "operation-state, KCP/component replica, version.status, paused 해제, last-resumed-done을 함께 본다."
+    decision_hints:
+      - "operation-state=resume-requested 유지 → event-processor 미수행 또는 비정상 조합."
+      - "operation-state=resume-applied인데 안 끝남 → replica 복구/version.status=Ready 미도달."
+      - "operation-state=resume-requested인데 last-suspended-done 없으면 비정상."
+    related_objects:
+      - Cluster
+      - KamajiControlPlane
+      - HelmRelease
+    diagnostic_steps:
+      - type: diagnostic
+        description: "operation-state와 done annotation 확인"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o jsonpath='{.metadata.annotations}{\"\\n\"}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "KamajiControlPlane replica와 version.status 확인"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane {{cluster_name}} -o jsonpath='spec.replicas={.spec.replicas}{\"\\t\"}readyReplicas={.status.readyReplicas}{\"\\n\"}'; kubectl -n {{namespace}} get tenantcontrolplane {{cluster_name}} -o jsonpath='version={.status.kubernetesResources.version.status}{\"\\n\"}'"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "resume", "operation-state"]
+
+  - id: iksv2-service-loadbalancer
+    title: "LoadBalancer Service에 EXTERNAL-IP가 안 붙는다"
+    symptoms:
+      - "type=LoadBalancer Service에 EXTERNAL-IP가 안 붙는다"
+      - "OpenStack LB가 ERROR거나 생성 중에서 안 넘어간다"
+    evidence_keywords:
+      - "Service"
+      - "type=LoadBalancer"
+      - "service.beta.kubernetes.io/kinx-load-balancer-id"
+      - "tenant.meta.x-k8s.io/id"
+      - "cluster.meta.x-k8s.io/name"
+      - "PENDING_CREATE"
+      - "ACTIVE"
+      - "ERROR"
+      - "cloud-controller-manager"
+    match_types: ["ServiceNoEndpoint", "NetworkFailure"]
+    cause: "workload cluster의 LoadBalancer Service는 CCM이 OpenStack LB를 만든다. workload 리소스는 soot 컨트롤러가 root cluster와 연결된 뒤에만 관찰된다."
+    resolution: "LB ID annotation과 OpenStack LB provisioning status를 본다. ID가 오래 안 붙으면 CCM(iksv2-addon-rollout) 또는 LB quota를 의심한다."
+    decision_hints:
+      - "kinx-load-balancer-id 없음 → LB 생성 중(CCM 또는 LB quota)."
+      - "OpenStack LB PENDING_CREATE/PENDING_UPDATE → 생성/갱신 중, ACTIVE → 정상, ERROR → LB 오류."
+      - "workload 연결 자체가 안 되면 control plane endpoint/kubeconfig 문제(iksv2-machine-join-failure/iksv2-hosted-control-plane)."
+    related_objects:
+      - Service
+    diagnostic_steps:
+      - type: diagnostic
+        description: "workload Service 확인(workload kubeconfig 준비 후)"
+        command_template: "kubectl --context {{workload_context}} get svc -A -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "event-watcher soot service 로그 확인"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-watcher --since=30m | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "loadbalancer", "ccm", "openstack", "workload"]
+
+  - id: iksv2-persistentvolume
+    title: "PVC가 Pending이거나 볼륨이 안 붙는다"
+    symptoms:
+      - "PVC가 Pending이다"
+      - "볼륨이 attach되지 않는다"
+    evidence_keywords:
+      - "PersistentVolume"
+      - "PersistentVolumeClaim"
+      - "VolumeAttachment"
+      - "cinder.csi.openstack.org"
+      - "manila.csi.openstack.org"
+      - "Available"
+      - "Bound"
+      - "attached"
+    match_types: ["Pending"]
+    cause: "workload cluster의 동적 볼륨은 cinder/manila CSI가 OpenStack volume을 만든다. workload 리소스는 soot 연결 뒤에만 관찰된다."
+    resolution: "PV phase와 VolumeAttachment.attached, CSI driver를 본다. 생성/attach가 안 되면 CSI addon(iksv2-addon-rollout) 또는 volume quota/AZ/type을 의심한다."
+    decision_hints:
+      - "PV가 Available/Bound로 못 가면 CSI addon 또는 volume quota/AZ/type 문제."
+      - "VolumeAttachment.attached가 true 안 됨 → attach 단계 멈춤."
+    related_objects:
+      - PersistentVolume
+      - PersistentVolumeClaim
+      - VolumeAttachment
+    diagnostic_steps:
+      - type: diagnostic
+        description: "workload PV/PVC/VolumeAttachment 확인(workload kubeconfig 준비 후)"
+        command_template: "kubectl --context {{workload_context}} get pv,pvc -A; kubectl --context {{workload_context}} get volumeattachment"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "event-watcher soot pv 로그 확인"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-watcher --since=30m | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: low
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "pv", "csi", "cinder", "manila", "workload"]
+
+  - id: iksv2-cluster-deletion
+    title: "Cluster 삭제가 안 끝난다 / Deleting에 오래 멈춰 있다"
+    symptoms:
+      - "클러스터 삭제가 끝나지 않는다"
+      - "Cluster가 Deleting 상태로 오래 멈춰 있다"
+      - "cluster-delete-failed annotation이 있다"
+    evidence_keywords:
+      - "deletionTimestamp"
+      - "cluster-delete-started"
+      - "cluster-delete-completed"
+      - "cluster-delete-failed"
+      - "cluster.x-k8s.io/paused"
+      - "HelmRelease"
+      - "HelmChartProxy"
+      - "Ingress"
+      - "finalizers"
+      - "InstanceDeleteFailed"
+      - "cloud-conf"
+      - "ServiceGatewayClaim"
+    match_types: ["Timeout"]
+    cause: "삭제는 위에서 아래로(addon→worker→control plane→infra→외부 cleanup→finalizer 제거) 진행된다. 완료는 deletionTimestamp만으로 판단하지 않고 잔존 계층과 finalizer 제거를 함께 본다. paused면 CAPI가 삭제를 reconcile하지 않는다."
+    resolution: "paused 여부를 먼저 보고, 남아 있는 가장 바깥 계층(addon/worker/control plane/infra)과 finalizer를 확인한다. 외부 cleanup은 event-processor finalizer 단계에서 일어난다."
+    decision_hints:
+      - "cluster.x-k8s.io/paused=true + deletionTimestamp면 CAPI가 reconcile하지 않아 하위 삭제 미시작(초기배포 실패/suspend 후 삭제 시 발생). 잔존 하위 condition이 변화 없음. 해제는 영향 크므로 사용자 확인 후."
+      - "HelmRelease/HelmChartProxy/같은 이름 Ingress 잔존 → watcher가 삭제 완료로 안 봄."
+      - "Machine 잔존 + OpenStackMachine InstanceDeleteFailed → VM 삭제 거부(외부 의존/port·volume). InstanceNotFound면 finalizer만 남아 곧 정리."
+      - "TenantControlPlane/OpenStackCluster 잔존 → Kamaji/CAPO finalizer 미제거."
+      - "event-processor 외 finalizer 잔존 → 외부 cleanup 미시작. event-processor finalizer만 남으면 LB/PV/credential/SGW 정리 중/실패."
+    related_objects:
+      - Cluster
+      - HelmRelease
+      - HelmChartProxy
+      - HelmReleaseProxy
+      - Ingress
+      - OpenStackMachine
+      - TenantControlPlane
+      - OpenStackCluster
+      - ServiceGatewayClaim
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Cluster 삭제 상태(paused/finalizers/deletionTimestamp) 확인"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o jsonpath='paused={.metadata.annotations.cluster\\.x-k8s\\.io/paused}{\"\\n\"}finalizers={.metadata.finalizers}{\"\\n\"}deletionTimestamp={.metadata.deletionTimestamp}{\"\\n\"}'"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "삭제를 막는 잔존 계층 일괄 확인"
+        command_template: "kubectl -n {{namespace}} get helmrelease,helmchartproxy,helmreleaseproxy,machinedeployment,machineset,machine,openstackmachine,kamajicontrolplane,tenantcontrolplane,openstackcluster -l cluster.x-k8s.io/cluster-name={{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "같은 이름 Ingress와 ServiceGatewayClaim 확인"
+        command_template: "kubectl -n {{namespace}} get ingress/{{cluster_name}} servicegatewayclaim -l iksv2.kinx.net/cluster-name={{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "event-processor cleanup 로그 확인"
+        command_template: "kubectl logs -n dev-k8saas deploy/k8saas-cluster-api-manager-event-processor --since=30m | grep {{cluster_name}}"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: medium
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "cluster", "deletion", "deleting", "cleanup", "finalizer", "paused"]
+
+  - id: iksv2-nodegroup-deletion
+    title: "NodeGroup 삭제가 안 끝난다"
+    symptoms:
+      - "노드그룹 삭제가 끝나지 않는다"
+      - "MachineDeployment deletionTimestamp가 있는데 하위가 남아 있다"
+    evidence_keywords:
+      - "MachineDeployment"
+      - "MachineSet"
+      - "Machine"
+      - "OpenStackMachine"
+      - "deletionTimestamp"
+      - "MachineDeploymentFinalizer"
+      - "nodegroup-delete-failed"
+      - "DrainingSucceeded"
+      - "VolumeDetachSucceeded"
+    match_types: ["Timeout"]
+    cause: "node group 삭제는 하위(MachineSet/Machine/OpenStackMachine) 정리와 MachineDeployment finalizer 제거로 완료된다. Machine 삭제는 drain/volume detach/VM 삭제를 거친다."
+    resolution: "MachineDeployment deletionTimestamp, 하위 잔존, finalizer, nodegroup-delete-failed annotation을 본다. Machine이 남으면 DrainingSucceeded/VolumeDetachSucceeded를 확인한다."
+    decision_hints:
+      - "MachineSet/Machine/OpenStackMachine 잔존 → 하위 cleanup 진행 중."
+      - "Machine DrainingSucceeded reason Draining/DrainingFailed → drain 대상 워크로드가 안 빠짐."
+      - "Machine VolumeDetachSucceeded reason WaitingForVolumeDetach → OpenStack volume detach 지연."
+      - "MachineDeploymentFinalizer 제거되어야 완료."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - Machine
+      - OpenStackMachine
+    diagnostic_steps:
+      - type: diagnostic
+        description: "node group 삭제 계층과 finalizer 확인"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,machineset,machine,openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o wide"
+        automatic_candidate: true
+        requires_confirmation: false
+      - type: diagnostic
+        description: "남은 Machine의 drain/detach condition 확인"
+        command_template: "kubectl -n {{namespace}} get machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{range .status.conditions[*]}  {.type}={.status} reason={.reason}{\"\\n\"}{end}{end}'"
+        automatic_candidate: true
+        requires_confirmation: false
+    risk_level: medium
+    source: "iksv2-state-guide"
+    tags: ["iksv2", "nodegroup", "deletion", "finalizer", "drain"]

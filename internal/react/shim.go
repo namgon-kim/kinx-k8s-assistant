@@ -370,6 +370,11 @@ func repairUnescapedQuotesInJSONStrings(input string) string {
 		ch := input[i]
 		if inString {
 			if escaped {
+				if ch == '\'' {
+					out.WriteByte(ch)
+					escaped = false
+					continue
+				}
 				out.WriteByte(ch)
 				escaped = false
 				continue

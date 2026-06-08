@@ -267,7 +267,7 @@ func requirementAnalysisFromFunctionCall(call gollm.FunctionCall) (requirementAn
 		resource := requirementResource{
 			Kind:      strings.ToLower(strings.TrimSpace(kind)),
 			Name:      cleanUnknownPlaceholder(name),
-			Namespace: cleanUnknownPlaceholder(namespace),
+			Namespace: cleanNamespaceValue(namespace),
 			Role:      normalizeRequirementResourceRole(role),
 			Source:    normalizeRequirementResourceSource(source),
 		}
@@ -280,7 +280,7 @@ func requirementAnalysisFromFunctionCall(call gollm.FunctionCall) (requirementAn
 		namespace, _ := scopeRaw["namespace"].(string)
 		analysis.Scope.Type = strings.ToLower(strings.TrimSpace(scopeType))
 		if !isAllNamespacesValue(namespace) {
-			analysis.Scope.Namespace = strings.TrimSpace(namespace)
+			analysis.Scope.Namespace = cleanNamespaceValue(namespace)
 		}
 	}
 	if focusRaw, ok := call.Arguments["operational_focus"].(map[string]any); ok {
@@ -522,7 +522,7 @@ func requestContextFromFunctionCall(call gollm.FunctionCall) (requestContext, bo
 	if scopeRaw, ok := call.Arguments["scope"].(map[string]any); ok {
 		namespace, _ := scopeRaw["namespace"].(string)
 		if !isAllNamespacesValue(namespace) {
-			request.Scope.Namespace = strings.TrimSpace(namespace)
+			request.Scope.Namespace = cleanNamespaceValue(namespace)
 		}
 	}
 	switch strings.ToLower(strings.TrimSpace(resourceClass)) {

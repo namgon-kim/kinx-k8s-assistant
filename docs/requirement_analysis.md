@@ -111,6 +111,12 @@ The value tables below define preferred stable values. Natural-language requests
 | `unknown` | Scope is unclear. |
 | `other` | Scope is clear but no listed type fits. |
 
+Namespace phrasing rules:
+
+- When a value is explicitly introduced by namespace wording such as `namespace`, `네임스페이스`, or `네임스페이스의`, consider it as namespace scope before treating it as an object ID or target name.
+- If the same request also contains a separate quoted or name-like object and a resource kind, consider that separate object/kind as the primary resource candidate unless the user explicitly says the namespace-marked value is the object ID.
+- A UUID-shaped namespace candidate is not automatically an object ID. Use the user's wording and record ambiguity when multiple readings remain plausible.
+
 ## resource_candidates.role
 
 | Value | Meaning |
@@ -179,6 +185,8 @@ The field is not a RAG execution request. Guide lookup is selected by the model'
 - `resource_candidates.primary.source=user_request` means the current request explicitly changed or named the primary target.
 - `resource_candidates.primary.source=previous_context` means runtime may fill missing target name or namespace from the previous request context.
 - `resource_candidates.primary.source=model_inference` with `operational_focus.relationship_to_primary=related_to_primary` is not accepted as a target switch; runtime keeps the previous primary and moves the inferred resource into `operational_focus.related_resource_hints`.
+- Namespace fields must contain only real namespace values. If a namespace is unknown, leave the namespace field empty, use `scope.type=unknown` when appropriate, and record the ambiguity. Do not put placeholders such as `undefined`, `namespace of the object`, or `can be inferred from context` in namespace fields.
+- If a namespaced kind and object name are known but the namespace is unknown, the later phase plan should include context resolution with `kubectl get <kind> -A --field-selector metadata.name=<name>` to locate the object before exact namespaced observation. Do not use positional object-name lookup with `-A`.
 - Phrases such as "this cluster" / "이 클러스터" are anaphoric references. If prior accepted context contains a named Kubernetes `Cluster` object and the new request is a follow-up, keep that previous object as `resource_candidates.primary` with `source=previous_context`. If no prior named object exists and the wording refers to the active kubeconfig/context or overall environment health, classify as `target.category=cluster_environment` with empty `resource_candidates`. If both meanings are plausible, record the ambiguity instead of inventing a target.
 - For an explicitly named Kubernetes resource diagnosis, initial `evidence_needs` should be limited to the primary object's API state: metadata, spec, status, and conditions.
 - Do not add node status, related resources, events, or logs as initial evidence needs before the primary object has been observed. After the primary object observation, runtime discovery can classify CRD eligibility and the later phase can decide whether related resources, events, or guide lookup are needed.

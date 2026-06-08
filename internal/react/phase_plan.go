@@ -490,6 +490,7 @@ func (l *Loop) phaseStepAnchor() string {
 	}
 	b.WriteString("Rules:\n")
 	b.WriteString("- Use `phase_progress` to complete the active top-level phase_step when its completion condition is satisfied.\n")
+	b.WriteString("- When emitting an action after a tool observation, summarize what the latest executed command showed before explaining the next action. Include important statuses, missing objects, empty results, or errors.\n")
 	b.WriteString("- Do not use `guide_progress` for top-level phase completion; `guide_progress` is only for nested guidance_step entries while current_phase_name=guided_diagnosis.\n")
 	if strings.EqualFold(strings.TrimSpace(current.Name), "guidance_lookup") {
 		b.WriteString("- current_phase_name=guidance_lookup: return one top-level `resource_guide_lookup` object. Do not emit kubectl action, `phase_progress`, or `guide_progress` until the resource-guide lookup result is observed or recorded unavailable.\n")

@@ -667,6 +667,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		return nil
 	}
 	deferredProgressText := strings.TrimSpace(streamedText)
+	functionCalls = normalizeAssistantStructuredFunctionCalls(functionCalls)
 
 	if handled := l.rejectInvalidShimStructuredCalls(functionCalls); handled {
 		return nil
@@ -897,6 +898,45 @@ func (l *Loop) rejectAssistantManagedToolCalls(calls []gollm.FunctionCall) []gol
 		allowed = append(allowed, call)
 	}
 	return allowed
+}
+
+func normalizeAssistantStructuredFunctionCalls(calls []gollm.FunctionCall) []gollm.FunctionCall {
+	if len(calls) == 0 {
+		return calls
+	}
+	normalized := make([]gollm.FunctionCall, 0, len(calls))
+	for _, call := range calls {
+		if internalName := internalStructuredCallName(call.Name); internalName != "" {
+			call.Name = internalName
+		}
+		normalized = append(normalized, call)
+	}
+	return normalized
+}
+
+func internalStructuredCallName(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case bareInternalCallName(internalRequirementAnalysisCall), internalRequirementAnalysisCall:
+		return internalRequirementAnalysisCall
+	case bareInternalCallName(internalRequestContextCall), internalRequestContextCall:
+		return internalRequestContextCall
+	case bareInternalCallName(internalPhasePlanCall), internalPhasePlanCall:
+		return internalPhasePlanCall
+	case bareInternalCallName(internalPhaseProgressCall), internalPhaseProgressCall:
+		return internalPhaseProgressCall
+	case bareInternalCallName(internalResourceGuideLookupCall), internalResourceGuideLookupCall:
+		return internalResourceGuideLookupCall
+	case bareInternalCallName(internalFinalReportCall), internalFinalReportCall:
+		return internalFinalReportCall
+	case bareInternalCallName(internalNextDirectionsCall), internalNextDirectionsCall:
+		return internalNextDirectionsCall
+	default:
+		return ""
+	}
+}
+
+func bareInternalCallName(name string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(name), "__"), "__")
 }
 
 func (l *Loop) analyzeToolCalls(ctx context.Context, calls []gollm.FunctionCall) ([]PendingCall, error) {

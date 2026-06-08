@@ -59,6 +59,27 @@ func TestParseReActResponseRepairsUnescapedQuotesInAnswer(t *testing.T) {
 	}
 }
 
+func TestParseReActResponseRepairsEscapedSingleQuoteInString(t *testing.T) {
+	parsed, err := parseReActResponse("```json\n" + `{
+  "thought": "failureMessage says Quota exceeded for resources: [\'security_group\']",
+  "phase_progress": {
+    "phase_completed": 1,
+    "evidence_useful": true,
+    "completion_reason": "observed failureMessage with [\'security_group\']",
+    "next_phase": "response_synthesis"
+  }
+}` + "\n```")
+	if err != nil {
+		t.Fatalf("parse ReAct response with escaped single quote: %v", err)
+	}
+	if parsed.Thought != "failureMessage says Quota exceeded for resources: ['security_group']" {
+		t.Fatalf("unexpected thought: %q", parsed.Thought)
+	}
+	if parsed.PhaseProgress == nil || parsed.PhaseProgress.CompletionReason != "observed failureMessage with ['security_group']" {
+		t.Fatalf("unexpected phase_progress: %#v", parsed.PhaseProgress)
+	}
+}
+
 func TestParseReActResponseRepairsRawMultilineDescribeAnswer(t *testing.T) {
 	parsed, err := parseReActResponse("```json\n" + `{
   "thought": "describe 확인",

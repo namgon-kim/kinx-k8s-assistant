@@ -1,0 +1,1315 @@
+schema:
+  placeholder_policy:
+    - "{{namespace}}: management cluster에서 tenant/cluster 리소스가 생성되는 namespace. 값이 확실하지 않으면 먼저 all-namespaces field selector로 찾는다."
+    - "{{cluster_name}}: IKS v2 Cluster 리소스 이름."
+    - "{{machine_deployment_name}} 같은 단일 하위 리소스 이름은 requirement_analysis 후속 요청에서 새 primary target으로 확정된 경우에만 사용한다. Cluster 범위 guide step에서는 label selector를 사용한다."
+    - "workload context는 현재 ReAct guide step 렌더링 대상이 아니므로 diagnostic_steps에 직접 넣지 않는다. workload 리소스는 kubeconfig Secret 존재를 확인한 뒤 사용자에게 별도 확인을 안내한다."
+  diagnostic_policy:
+    - "문제가 발생했을 때는 primary CRD의 metadata/spec/status/conditions를 첫 관측으로 삼는다."
+    - "처음부터 Pod 목록, Node 목록, events, controller logs로 넓히지 않는다. CRD status와 lifecycle이 다음 검색 방향을 결정한다."
+    - "Cluster가 deleting이면 생성 failureMessage보다 deletionTimestamp, pause, child 잔존, finalizer, delete annotation을 먼저 추적한다."
+    - "문제 리소스는 증상 집계 리소스와 blocker 후보 리소스를 구분한다. Cluster가 증상을 보고해도 실제 blocker는 MachineDeployment, Machine, OpenStackMachine, addon, finalizer일 수 있다."
+    - "automatic_candidate=true 명령은 read-only kubectl 조회만 포함한다. controller logs는 CRD로 막힌 계층을 좁힌 뒤 수동 보조 증거로만 사용한다."
+    - "workload cluster 내부 Service/PersistentVolume 진단은 workload kubeconfig/context가 준비된 뒤에만 실행한다."
+
+cases:
+  - id: iksv2-v3-cluster-issue-entrypoint
+    title: "IKS v2 Cluster Issue Trace Entrypoint"
+    symptoms:
+      - "A user asks what is wrong with a specific IKS v2 Cluster"
+      - "Cluster health, availability, creation, or deletion state is unclear"
+      - "The request names a Cluster but does not yet identify the failing layer"
+    evidence_keywords:
+      - "Cluster"
+      - "metadata.deletionTimestamp"
+      - "status.conditions"
+      - "InfrastructureReady"
+      - "ControlPlaneReady"
+      - "WorkersAvailable"
+      - "Available"
+      - "Ready"
+      - "failureReason"
+      - "failureMessage"
+      - "finalizers"
+      - "cluster-create-failed"
+      - "cluster-delete-failed"
+      - "cluster.x-k8s.io/paused"
+      - "cluster.x-k8s.io.ew/paused"
+    cause: "Cluster is an aggregate symptom surface. The first task is to determine the current lifecycle and the first related layer that contradicts the expected state."
+    resolution: "Inspect only the Cluster object first, classify lifecycle as creating, running-health, deleting, suspend, resume, scale, or upgrade, then select a more specific guide for the failing layer."
+    decision_hints:
+      - "If metadata.deletionTimestamp exists, switch to deletion blocker tracing before interpreting old create failure messages."
+      - "If WorkersAvailable=False, do not stop at the Cluster. Trace MachineDeployment, MachineSet, Machine, OpenStackMachine, and Node registration evidence."
+      - "If InfrastructureReady=False or OpenStack failureMessage exists and the Cluster is not deleting, trace OpenStackCluster."
+      - "If ControlPlaneReady=False, trace KamajiControlPlane and TenantControlPlane."
+      - "If pause annotations exist, explain whether pause blocks reconcile in the current lifecycle."
+      - "Use create/delete annotations as lifecycle synchronization evidence, not as standalone root cause."
+      - "Do not use management-cluster kubectl get nodes or pods as the first observation for a Cluster CRD problem."
+    related_objects:
+      - Cluster
+      - OpenStackCluster
+      - KamajiControlPlane
+      - TenantControlPlane
+      - MachineDeployment
+      - Machine
+      - OpenStackMachine
+      - HelmReleaseProxy
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect the primary Cluster object and classify lifecycle"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Cluster metadata, deletionTimestamp, finalizers, annotations, spec, status, conditions, failureReason, and failureMessage are available for lifecycle classification."
+      - type: diagnostic
+        description: "Find Cluster namespace when namespace is unknown"
+        command_template: "kubectl get cluster -A --field-selector metadata.name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        preconditions:
+          - "{{namespace}} is empty or uncertain"
+        expected_outcome: "The Cluster namespace is identified without using invalid positional name plus --all-namespaces lookup."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "cluster", "entrypoint", "lifecycle", "issue-tracing", "crd-first"]
+
+  - id: iksv2-v3-cluster-deletion-blocker-trace
+    title: "IKS v2 Cluster Deletion Blocker Trace"
+    symptoms:
+      - "Cluster has deletionTimestamp"
+      - "Cluster deletion is stuck or delete failed"
+      - "Cluster is Deleting but previous create failureMessage is still visible"
+      - "Addon, worker, control-plane, infra, Secret, ServiceGatewayClaim, or finalizer remains during deletion"
+    evidence_keywords:
+      - "deletionTimestamp"
+      - "cluster-delete-started"
+      - "cluster-delete-completed"
+      - "cluster-delete-failed"
+      - "cluster-create-failed"
+      - "failureMessage"
+      - "finalizers"
+      - "cluster.x-k8s.io/paused"
+      - "cluster.x-k8s.io.ew/paused"
+      - "HelmRelease"
+      - "HelmChartProxy"
+      - "HelmReleaseProxy"
+      - "Ingress"
+      - "MachineDeployment"
+      - "MachineSet"
+      - "Machine"
+      - "OpenStackMachine"
+      - "InstanceDeleteFailed"
+      - "KamajiControlPlane"
+      - "TenantControlPlane"
+      - "OpenStackCluster"
+      - "ServiceGatewayClaim"
+      - "cloud-conf"
+      - "admin-kubeconfig"
+    cause: "Cluster deletion completes only after child resources and finalizers are cleared. Historical create failure messages can remain on a deleting Cluster and must not be treated as the current deletion cause without delete-specific evidence."
+    resolution: "Trace deletion blockers in order: pause and finalizers, addon/Ingress remnants, worker hierarchy, control plane, OpenStackCluster, credential Secrets, and ServiceGatewayClaim cleanup."
+    decision_hints:
+      - "When deletionTimestamp exists, current diagnosis is deletion lifecycle even if failureMessage mentions quota or creation."
+      - "cluster-delete-failed=true is a current deletion failure signal; cluster-create-failed=true may be historical."
+      - "If paused annotations remain with deletionTimestamp, CAPI or IKS reconcile may not progress."
+      - "HelmRelease, HelmChartProxy, HelmReleaseProxy, or same-name Ingress remaining can prevent delete completion."
+      - "Machine/OpenStackMachine remaining shifts the problem resource candidate away from Cluster to the worker or infra child."
+      - "OpenStackMachine InstanceDeleteFailed is delete-specific evidence and should be prioritized over old OpenStackCluster create messages."
+      - "If only event-processor finalizer remains, suspect external cleanup such as credentials, ServiceGatewayClaim, LB, or PV metadata."
+      - "Report both symptom resource and blocker candidate. Do not list Cluster as the sole problem resource when a child blocker is present."
+    related_objects:
+      - Cluster
+      - HelmRelease
+      - HelmChartProxy
+      - HelmReleaseProxy
+      - Ingress
+      - MachineDeployment
+      - MachineSet
+      - Machine
+      - OpenStackMachine
+      - KamajiControlPlane
+      - TenantControlPlane
+      - OpenStackCluster
+      - Secret
+      - ServiceGatewayClaim
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect Cluster deletion metadata, finalizers, and delete annotations"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "DeletionTimestamp, pause state, finalizers, create/delete annotations, and current failure messages are available."
+      - type: diagnostic
+        description: "Inspect addon and same-name Ingress deletion blockers"
+        command_template: "kubectl -n {{namespace}} get helmrelease,helmchartproxy,helmreleaseproxy,ingress -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Addon and ingress remnants are identified. If same-name Ingress is not labeled, inspect it separately."
+      - type: diagnostic
+        description: "Inspect same-name Ingress when label selector does not prove absence"
+        command_template: "kubectl -n {{namespace}} get ingress {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Same-name Ingress existence or absence is confirmed."
+      - type: diagnostic
+        description: "Inspect worker hierarchy remaining during deletion"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,machineset,machine,openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Remaining worker resources, deletionTimestamp, finalizers, and OpenStackMachine delete failure reasons are visible."
+      - type: diagnostic
+        description: "Inspect control-plane and infra children remaining during deletion"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane/{{cluster_name}} tenantcontrolplane/{{cluster_name}} openstackcluster/{{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Remaining hosted control plane and infra resources are identified."
+      - type: diagnostic
+        description: "Inspect credential Secrets that may remain during cleanup"
+        command_template: "kubectl -n {{namespace}} get secret/{{cluster_name}}-cloud-conf secret/{{cluster_name}}-ccm-cloud-config secret/{{cluster_name}}-admin-kubeconfig -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Credential Secret cleanup candidates are identified."
+      - type: diagnostic
+        description: "Inspect ServiceGatewayClaim cleanup targets"
+        command_template: "kubectl -n {{namespace}} get servicegatewayclaim -l iksv2.kinx.net/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "ServiceGatewayClaim cleanup candidates are identified."
+    risk_level: medium
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "cluster", "deletion", "cleanup", "finalizer", "blocker", "issue-tracing"]
+
+  - id: iksv2-v3-cluster-creation-trace
+    title: "IKS v2 Cluster Creation and Top-Level Resource Trace"
+    symptoms:
+      - "Cluster creation is stuck or incomplete"
+      - "InfrastructureReady or ControlPlaneReady is False"
+      - "OpenStackCluster or KamajiControlPlane is missing"
+      - "Initial deployment did not complete"
+    evidence_keywords:
+      - "cluster-create-started"
+      - "cluster-create-completed"
+      - "cluster-create-failed"
+      - "initial-deployment"
+      - "initial-deployment-completed"
+      - "initial-deployment-paused"
+      - "OpenStackCluster"
+      - "KamajiControlPlane"
+      - "TenantControlPlane"
+      - "InfrastructureReady"
+      - "ControlPlaneReady"
+      - "cloud-conf"
+      - "ccm-cloud-config"
+      - "Quota exceeded"
+      - "No valid host"
+      - "security_group"
+    cause: "Cluster creation starts from top-level CAPI/CAPO/Kamaji resources. Missing child resources must be interpreted only after confirming parent resources, annotations, and current lifecycle."
+    resolution: "Inspect Cluster, OpenStackCluster, KamajiControlPlane, TenantControlPlane, and initial deployment markers, then branch to infra, control-plane, addon, or worker guides."
+    decision_hints:
+      - "OpenStackCluster missing means api-manager creation or parent resource issue, unless deletion is already in progress."
+      - "InfrastructureReady=False with OpenStackCluster failureMessage points to CAPO/OpenStack infrastructure."
+      - "ControlPlaneReady=False with KCP present requires TenantControlPlane inspection."
+      - "initial-deployment-completed=false plus cluster-create-failed=true means watcher recorded initial deployment failure."
+      - "initial-deployment-paused=true means cleanup/pause handling may be active."
+      - "Do not diagnose node group or addon before confirming top-level resource readiness."
+    related_objects:
+      - Cluster
+      - OpenStackCluster
+      - KamajiControlPlane
+      - TenantControlPlane
+      - Secret
+      - MachineDeployment
+      - HelmReleaseProxy
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect top-level Cluster creation resources"
+        command_template: "kubectl -n {{namespace}} get cluster/{{cluster_name}} openstackcluster/{{cluster_name}} kamajicontrolplane/{{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Top-level resources, owner references, creation annotations, and status conditions are visible."
+      - type: diagnostic
+        description: "Inspect TenantControlPlane generated by Kamaji"
+        command_template: "kubectl -n {{namespace}} get tenantcontrolplane {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Tenant control plane existence and version/status are visible."
+      - type: diagnostic
+        description: "Inspect cloud config Secrets needed by hosted control plane and CCM"
+        command_template: "kubectl -n {{namespace}} get secret/{{cluster_name}}-cloud-conf secret/{{cluster_name}}-ccm-cloud-config -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Required cloud config Secret presence is confirmed."
+      - type: diagnostic
+        description: "Inspect initial deployment node group and addon resources"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,helmrelease,helmchartproxy,helmreleaseproxy -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Initial worker and addon resources are present or their absence is confirmed after top-level readiness."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "cluster", "creation", "top-level", "initial-deployment", "issue-tracing"]
+
+  - id: iksv2-v3-openstack-infrastructure-trace
+    title: "IKS v2 OpenStack Infrastructure Failure Trace"
+    symptoms:
+      - "InfrastructureReady is False"
+      - "OpenStackCluster has failureReason or failureMessage"
+      - "OpenStackMachine InstanceReady is False"
+      - "Quota, capacity, security group, network, router, or load balancer error is reported"
+    evidence_keywords:
+      - "OpenStackCluster"
+      - "OpenStackMachine"
+      - "InfrastructureReady"
+      - "InstanceReady"
+      - "failureReason"
+      - "failureMessage"
+      - "Quota exceeded"
+      - "No valid host"
+      - "security_group"
+      - "network"
+      - "port"
+      - "router"
+      - "LoadBalancer"
+      - "Unauthorized"
+      - "Forbidden"
+      - "providerID"
+    cause: "OpenStack problems are inferred from CAPO CRD status and conditions when direct OpenStack API access is not available."
+    resolution: "Use OpenStackCluster and OpenStackMachine status to determine whether infra, VM create, VM delete, or cloud credential reconciliation is blocking the operation."
+    decision_hints:
+      - "Quota exceeded is a strong creation failure signal only when the current lifecycle is creation or infra provisioning."
+      - "If the Cluster is deleting, quota messages may be historical. Look for delete-specific signals such as InstanceDeleteFailed and remaining finalizers."
+      - "OpenStackCluster.ready=false or failureMessage points to cluster-level infra."
+      - "OpenStackMachine.InstanceReady=False points to VM-level infra."
+      - "Machine.spec.providerID present means the VM likely exists; then node join or Node health should be checked."
+      - "Do not execute OpenStack CLI commands from this runbook. Keep evidence to Kubernetes CRD status."
+    related_objects:
+      - OpenStackCluster
+      - OpenStackMachine
+      - Machine
+      - Cluster
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect OpenStackCluster infra status"
+        command_template: "kubectl -n {{namespace}} get openstackcluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Cluster-level OpenStack readiness, generated fields, failureReason, and failureMessage are visible."
+      - type: diagnostic
+        description: "Inspect OpenStackMachine resources for VM-level status"
+        command_template: "kubectl -n {{namespace}} get openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "VM-level InstanceReady conditions, provider IDs, failure messages, and deletion state are visible."
+      - type: diagnostic
+        description: "Inspect Machines alongside OpenStackMachines"
+        command_template: "kubectl -n {{namespace}} get machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Machine providerID/nodeRef/conditions can be compared with OpenStackMachine status."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "openstack", "capo", "infrastructure", "failuremessage", "issue-tracing"]
+
+  - id: iksv2-v3-hosted-control-plane-trace
+    title: "IKS v2 Hosted Control Plane Readiness Trace"
+    symptoms:
+      - "ControlPlaneReady is False"
+      - "KamajiControlPlane exists but TenantControlPlane is missing"
+      - "Tenant control plane version status is NotReady or Provisioning"
+      - "Hosted control plane replicas are not ready"
+    evidence_keywords:
+      - "ControlPlaneReady"
+      - "KamajiControlPlane"
+      - "TenantControlPlane"
+      - "readyReplicas"
+      - "spec.replicas"
+      - "version.status"
+      - "kubeconfig"
+      - "admin-kubeconfig"
+    cause: "Hosted control plane readiness is derived from KamajiControlPlane and TenantControlPlane status rather than workload node state."
+    resolution: "Inspect KCP and TCP status, ready replica convergence, tenant version state, and kubeconfig Secret presence before attributing failures to workers or addons."
+    decision_hints:
+      - "KCP exists but TCP is missing means Kamaji provider child creation is the next focus."
+      - "KCP readyReplicas below spec.replicas means hosted control plane pod readiness is not converged."
+      - "TCP version.status Provisioning or NotReady means tenant API server is not ready."
+      - "Missing admin kubeconfig Secret can explain downstream workload observation failures."
+      - "Do not use management-cluster Node status as evidence for tenant control plane readiness."
+    related_objects:
+      - Cluster
+      - KamajiControlPlane
+      - TenantControlPlane
+      - Secret
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect hosted control plane resources"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane/{{cluster_name}} tenantcontrolplane/{{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "KCP/TCP existence, replicas, conditions, and version status are visible."
+      - type: diagnostic
+        description: "Inspect admin kubeconfig Secret"
+        command_template: "kubectl -n {{namespace}} get secret {{cluster_name}}-admin-kubeconfig -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Tenant kubeconfig Secret existence is confirmed."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "control-plane", "kamaji", "tenantcontrolplane", "issue-tracing"]
+
+  - id: iksv2-v3-worker-group-trace
+    title: "IKS v2 Worker Group and MachineDeployment Trace"
+    symptoms:
+      - "WorkersAvailable is False"
+      - "Node group, worker group, or MachineDeployment is not working"
+      - "MachineDeployment has zero available replicas"
+      - "Machine waits for Node or providerID"
+      - "Worker creation, scale, or upgrade is stuck"
+    evidence_keywords:
+      - "WorkersAvailable"
+      - "MachineDeployment"
+      - "MachineSet"
+      - "Machine"
+      - "OpenStackMachine"
+      - "availableReplicas"
+      - "readyReplicas"
+      - "updatedReplicas"
+      - "spec.replicas"
+      - "ScalingUp"
+      - "ScalingDown"
+      - "providerID"
+      - "nodeRef"
+      - "BootstrapReady"
+      - "InfrastructureReady"
+      - "NodeHealthy"
+      - "nodegroup-create-failed"
+      - "nodegroup-scale-failed"
+      - "nodegroup-upgrade-in-progress"
+      - "nodegroup-upgrade-failed"
+    cause: "Worker availability is a chain problem across MachineDeployment, MachineSet, Machine, OpenStackMachine, and Node registration."
+    resolution: "Trace the worker hierarchy from MachineDeployment to Node evidence and stop at the first layer where expected child or readiness evidence is missing."
+    decision_hints:
+      - "Node group is an operational focus. In CAPI context it usually maps to the worker hierarchy, but do not rewrite the user target without evidence."
+      - "MachineDeployment exists but MachineSet is missing points to CAPI rollout."
+      - "MachineSet exists but Machine is missing points to replica expansion."
+      - "Machine exists but OpenStackMachine is missing points to CAPO child creation."
+      - "OpenStackMachine InstanceReady=False points to VM create/delete failure."
+      - "Machine providerID exists but nodeRef is missing means VM exists but Node did not join."
+      - "nodeRef exists but NodeHealthy=False means Node condition, CNI, or kubelet-level issue."
+      - "When the Cluster only reports WorkersAvailable=False, propose the first failing worker child as the problem resource candidate."
+    related_objects:
+      - Cluster
+      - MachineDeployment
+      - MachineSet
+      - Machine
+      - OpenStackMachine
+      - Node
+      - OpenStackMachineTemplate
+      - KubeadmConfigTemplate
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect worker rollout hierarchy"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,machineset,machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "MachineDeployment replica status, MachineSet creation, Machine conditions, and rollout markers are visible."
+      - type: diagnostic
+        description: "Inspect VM-level worker infrastructure"
+        command_template: "kubectl -n {{namespace}} get openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "OpenStackMachine InstanceReady, failure messages, provider IDs, and deletion state are visible."
+      - type: diagnostic
+        description: "Inspect Machine condition summaries for join and health classification"
+        command_template: >-
+          kubectl -n {{namespace}} get machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o jsonpath='{range .items[*]}{.metadata.name}{" providerID="}{.spec.providerID}{" nodeRef="}{.status.nodeRef.name}{" phase="}{.status.phase}{"\n"}{range .status.conditions[*]}  {.type}={.status} reason={.reason} message={.message}{"\n"}{end}{end}'
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "providerID, nodeRef, phase, BootstrapReady, InfrastructureReady, and NodeHealthy signals are summarized."
+      - type: diagnostic
+        description: "Inspect templates involved in worker rollout or upgrade"
+        command_template: "kubectl -n {{namespace}} get openstackmachinetemplate,kubeadmconfigtemplate -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Template references, image/version drift, and upgrade-related configuration can be compared with MachineDeployment state."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "nodegroup", "worker-group", "machinedeployment", "machine", "node-join", "issue-tracing"]
+
+  - id: iksv2-v3-machine-provisioning-join-deletion-trace
+    title: "IKS v2 Machine Provisioning, Join, Health, and Deletion Trace"
+    symptoms:
+      - "A specific Machine is not ready"
+      - "Machine is waiting for providerID"
+      - "Machine has providerID but no nodeRef"
+      - "Machine has nodeRef but NodeHealthy is False"
+      - "Machine deletion is stuck on drain, detach, or finalizer"
+    evidence_keywords:
+      - "Machine"
+      - "OpenStackMachine"
+      - "providerID"
+      - "nodeRef"
+      - "BootstrapReady"
+      - "InfrastructureReady"
+      - "NodeHealthy"
+      - "HealthCheckSucceeded"
+      - "OwnerRemediated"
+      - "DrainingSucceeded"
+      - "VolumeDetachSucceeded"
+      - "MachineFinalizer"
+      - "deletionTimestamp"
+      - "InstanceReady"
+      - "InstanceDeleteFailed"
+    cause: "Machine state must be separated into VM provisioning, bootstrap data, Node join, Node health, remediation, and deletion cleanup."
+    resolution: "Compare Machine conditions with paired OpenStackMachine conditions, then classify the failure as VM create, bootstrap, join, health, drain, detach, or infra delete."
+    decision_hints:
+      - "InfrastructureReady=False usually means infra or OpenStackMachine is not ready."
+      - "BootstrapReady=False indicates bootstrap data or KubeadmConfig path."
+      - "providerID present and nodeRef missing means the VM likely exists but did not join the tenant cluster."
+      - "nodeRef present and NodeHealthy=False indicates post-join node condition failure."
+      - "OwnerRemediated repeating means remediation loop; look for the original readiness failure."
+      - "deletionTimestamp with DrainingSucceeded=False means drain is blocking."
+      - "deletionTimestamp with VolumeDetachSucceeded=False means volume detach is blocking."
+      - "OpenStackMachine InstanceDeleteFailed is delete-specific infra evidence."
+    related_objects:
+      - Machine
+      - OpenStackMachine
+      - Node
+      - VolumeAttachment
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect all Machines and OpenStackMachines in the Cluster"
+        command_template: "kubectl -n {{namespace}} get machine,openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Machine/OpenStackMachine pairs can be identified by labels without guessing unsupported placeholder values."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "machine", "openstackmachine", "providerid", "noderef", "deletion", "issue-tracing"]
+
+  - id: iksv2-v3-addon-rollout-trace
+    title: "IKS v2 Addon and Helm Proxy Rollout Trace"
+    symptoms:
+      - "Addon readiness is incomplete"
+      - "HelmChartProxy exists but HelmReleaseProxy is missing"
+      - "HelmReleaseProxy Ready condition is False"
+      - "HelmRelease is pending or install/upgrade failed"
+      - "Initial deployment waits for addons"
+    evidence_keywords:
+      - "HelmRelease"
+      - "HelmChartProxy"
+      - "HelmReleaseProxy"
+      - "HelmReleaseReady"
+      - "ValueParsingFailed"
+      - "ClusterSelectionFailed"
+      - "HelmReleasePending"
+      - "HelmInstallOrUpgradeFailed"
+      - "ClusterAvailable"
+      - "spec.suspend"
+      - "calico"
+      - "cinder-csi"
+      - "manila-csi"
+      - "ccm"
+    cause: "Addon rollout is declared through HelmChartProxy/HelmRelease and reconciled into HelmReleaseProxy; failure is identified by proxy conditions and Helm release status."
+    resolution: "Inspect addon CRDs and Helm release status after top-level Cluster and control plane readiness have been checked."
+    decision_hints:
+      - "HelmChartProxy without HelmReleaseProxy points to CAAPH reconciliation, selector, or values."
+      - "ValueParsingFailed points to values template."
+      - "ClusterSelectionFailed points to target cluster selector."
+      - "HelmReleasePending means wait/atomic/pending release rather than a confirmed install failure."
+      - "HelmInstallOrUpgradeFailed means chart install/upgrade failure."
+      - "ClusterAvailable=False can be caused by control plane or kubeconfig availability and should not be treated as an addon-only problem."
+      - "spec.suspend=true may be intentional after initial deployment failure or suspend."
+    related_objects:
+      - HelmChartProxy
+      - HelmReleaseProxy
+      - HelmRelease
+      - Cluster
+      - KamajiControlPlane
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect addon proxy and release resources"
+        command_template: "kubectl -n {{namespace}} get helmchartproxy,helmreleaseproxy,helmrelease -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Addon proxy conditions, HelmRelease status, suspend flags, and failure reasons are visible."
+      - type: diagnostic
+        description: "Inspect Cluster and control-plane readiness before blaming addon"
+        command_template: "kubectl -n {{namespace}} get cluster/{{cluster_name}} kamajicontrolplane/{{cluster_name}} tenantcontrolplane/{{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "ClusterAvailable or addon failures can be distinguished from control-plane unavailability."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "addon", "helmrelease", "helmreleaseproxy", "caaph", "issue-tracing"]
+
+  - id: iksv2-v3-operation-suspend-resume-trace
+    title: "IKS v2 Suspend and Resume Operation Trace"
+    symptoms:
+      - "Cluster suspend is requested but not completed"
+      - "Cluster resume is requested but not completed"
+      - "operation-state remains suspend-requested, suspend-applied, resume-requested, or resume-applied"
+      - "Control plane or addon replicas do not converge after suspend/resume"
+    evidence_keywords:
+      - "operation-state"
+      - "suspend-requested"
+      - "suspend-applied"
+      - "resume-requested"
+      - "resume-applied"
+      - "last-suspended-done"
+      - "last-resumed-done"
+      - "spec.replicas"
+      - "readyReplicas"
+      - "spec.suspend"
+      - "cluster.x-k8s.io/paused"
+    cause: "Suspend/resume is a multi-resource operation applied by event-processor and confirmed by replica convergence, HelmRelease suspend state, CAPI pause state, and done annotations."
+    resolution: "Inspect operation-state, KCP replicas, addon HelmRelease suspend flags, component Deployment replicas, MachineDeployment replicas, pause annotations, and done markers."
+    decision_hints:
+      - "operation-state=suspend-requested means processor has not applied suspend."
+      - "operation-state=suspend-applied means scale-down convergence is pending."
+      - "operation-state=resume-requested means processor has not applied resume."
+      - "operation-state=resume-applied means recovery convergence is pending."
+      - "resume-requested without last-suspended-done is an abnormal sequence."
+      - "Suspend is complete only when KCP, addon, and worker expectations match the suspended state and last-suspended-done exists."
+      - "Resume is complete only when KCP/addon/workers recover and last-resumed-done exists."
+    related_objects:
+      - Cluster
+      - KamajiControlPlane
+      - HelmRelease
+      - Deployment
+      - MachineDeployment
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect operation metadata on Cluster"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "operation-state, pause annotations, and done markers are visible."
+      - type: diagnostic
+        description: "Inspect control-plane replica convergence"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "KCP replica state can be compared with suspend/resume expectations."
+      - type: diagnostic
+        description: "Inspect worker replica convergence"
+        command_template: "kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Worker replica state can be compared with suspend/resume expectations."
+      - type: diagnostic
+        description: "Inspect addon suspend/resume state"
+        command_template: "kubectl -n {{namespace}} get helmrelease,deployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Addon suspend flags and component Deployment replica convergence are visible."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "suspend", "resume", "operation-state", "issue-tracing"]
+
+  - id: iksv2-v3-servicegateway-cleanup-trace
+    title: "IKS v2 ServiceGatewayClaim Creation and Cleanup Trace"
+    symptoms:
+      - "ServiceGatewayClaim is missing or stuck"
+      - "Worker group create failure requires data plane cleanup"
+      - "ServiceGatewayClaim remains during Cluster or NodeGroup cleanup"
+      - "Node group has nodegroup-create-failed and pause annotations"
+    evidence_keywords:
+      - "ServiceGatewayClaim"
+      - "KinxServiceGateway"
+      - "iksv2.kinx.net/cluster-name"
+      - "nodegroup-id"
+      - "nodegroup-create-failed"
+      - "nodegroup-delete-failed"
+      - "cluster.x-k8s.io/paused"
+      - "deletionTimestamp"
+      - "ownerReferences"
+    cause: "ServiceGatewayClaim lifecycle depends on Cluster, MachineDeployment metadata, nodegroup-id, ownerReferences, and cleanup triggers after create/delete failures."
+    resolution: "Inspect MachineDeployment metadata, Cluster deletion/pause state, existing ServiceGatewayClaim, ownerReferences, and failure/pause annotations."
+    decision_hints:
+      - "No nodegroup-id means ServiceGatewayClaim cannot be created."
+      - "nodegroup-create-failed=true without pause is not enough to prove data plane cleanup has started."
+      - "create failed plus paused indicates event-processor may request data plane deletion."
+      - "During Cluster deletion, remaining ServiceGatewayClaim can be a processor cleanup blocker."
+      - "Treat ServiceGatewayClaim as a cleanup target, not a reason to query workload Pods or Nodes."
+    related_objects:
+      - Cluster
+      - MachineDeployment
+      - ServiceGatewayClaim
+      - KinxServiceGateway
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect MachineDeployment metadata required for ServiceGatewayClaim"
+        command_template: "kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "nodegroup-id, create/delete failure markers, pause state, and owner references are visible."
+      - type: diagnostic
+        description: "Inspect ServiceGatewayClaim cleanup targets"
+        command_template: "kubectl -n {{namespace}} get servicegatewayclaim -l iksv2.kinx.net/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Existing ServiceGatewayClaims and owner references are visible."
+      - type: diagnostic
+        description: "Inspect Cluster cleanup context"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Cluster deletion and cleanup annotations can be correlated with ServiceGatewayClaim state."
+    risk_level: medium
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "servicegateway", "servicegatewayclaim", "nodegroup", "cleanup", "issue-tracing"]
+
+  - id: iksv2-v3-workload-service-pv-trace
+    title: "IKS v2 Workload Service and PersistentVolume Trace"
+    symptoms:
+      - "Workload Service LoadBalancer creation, update, or deletion is not synchronized"
+      - "PersistentVolume create, attach, detach, or delete is not synchronized"
+      - "Service load balancer cleanup finalizer remains"
+      - "PV protection or VolumeAttachment state blocks synchronization"
+    evidence_keywords:
+      - "Service"
+      - "LoadBalancer"
+      - "PersistentVolume"
+      - "PersistentVolumeClaim"
+      - "VolumeAttachment"
+      - "tenant.meta.x-k8s.io/id"
+      - "cluster.meta.x-k8s.io/name"
+      - "service.beta.kubernetes.io/kinx-load-balancer-id"
+      - "service.kubernetes.io/load-balancer-cleanup"
+      - "cluster.x-k8s.io.ew/resource-id"
+      - "resource-create-completed"
+      - "resource-update-completed"
+      - "resource-attach-completed"
+      - "resource-detach-completed"
+      - "resource-delete-completed"
+      - "cinder.csi.openstack.org"
+      - "manila.csi.openstack.org"
+      - "kubernetes.io/pv-protection"
+    cause: "Workload resources are observed through the workload cluster context and synchronized by event-watcher; management-cluster CRDs alone do not show Service/PV object state."
+    resolution: "Prepare workload kubeconfig/context first, then inspect Service/PV/PVC/VolumeAttachment state and compare with synchronization annotations and finalizers."
+    decision_hints:
+      - "This guide is for workload resources. Do not run workload Service/PV commands against the management cluster context."
+      - "Service LB ID missing means create may be pending or synchronization has not observed the external LB."
+      - "load-balancer-cleanup finalizer remaining means Service delete cleanup is not complete."
+      - "Cinder and Manila CSI drivers identify managed PVs."
+      - "PV phase Available or Bound with volumeHandle is create evidence."
+      - "VolumeAttachment.status.attached=true is attach evidence."
+      - "PV deletion requires pv-protection finalizer removal before delete completion."
+      - "If workload context is unavailable, report it as a blocker and do not invent management-cluster evidence."
+      - "After confirming the admin kubeconfig Secret exists, ask the user to inspect workload Services, PVs, PVCs, and VolumeAttachments with the prepared workload context. Do not put workload_context commands into guide diagnostic_steps."
+    related_objects:
+      - Service
+      - PersistentVolume
+      - PersistentVolumeClaim
+      - VolumeAttachment
+      - Secret
+      - Cluster
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect tenant admin kubeconfig Secret before workload observation"
+        command_template: "kubectl -n {{namespace}} get secret {{cluster_name}}-admin-kubeconfig -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "The kubeconfig source for workload_context is present or absent."
+    risk_level: medium
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "workload", "service", "loadbalancer", "persistentvolume", "volumeattachment", "issue-tracing"]
+
+  - id: iksv2-v3-initial-deployment-detail
+    title: "IKS v2 Initial Deployment Detail Trace"
+    symptoms:
+      - "Initial deployment is incomplete or failed"
+      - "Cluster creation failed after initial deployment timeout"
+      - "Cluster is paused after initial deployment failure"
+      - "Only some initial components are ready"
+    evidence_keywords:
+      - "initial-deployment"
+      - "initial-deployment-completed"
+      - "initial-deployment-paused"
+      - "cluster-create-started"
+      - "cluster-create-completed"
+      - "cluster-create-failed"
+      - "Ingress"
+      - "ControlPlaneReady"
+      - "MachineDeployment"
+      - "HelmRelease"
+      - "HelmReleaseProxy"
+      - "cluster.x-k8s.io/paused"
+    cause: "Initial deployment is an aggregate operational phase over bastion ingress, hosted control plane, initial worker group, and addons. It is not a standalone Kubernetes resource."
+    resolution: "Use initial deployment annotations to identify the phase, then inspect each initial component and select the first missing or failed component as the blocker candidate."
+    decision_hints:
+      - "initial-deployment-completed=false plus cluster-create-failed=true means watcher recorded initial deployment failure."
+      - "initial-deployment-paused=true marks a cleanup/pause path after failure."
+      - "The initial worker group is identified by cluster.x-k8s.io.ew/initial-deployment=true on MachineDeployment."
+      - "Do not infer initial deployment failure from workload Nodes before the hosted control plane and initial MachineDeployment are observed."
+      - "If addon resources are suspended, determine whether it is failure cleanup, suspend operation, or intentional pause."
+    related_objects:
+      - Cluster
+      - Ingress
+      - KamajiControlPlane
+      - TenantControlPlane
+      - MachineDeployment
+      - HelmRelease
+      - HelmReleaseProxy
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect initial deployment markers on Cluster"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Initial deployment annotations, create annotations, pause state, and Cluster conditions are visible."
+      - type: diagnostic
+        description: "Inspect initial worker group"
+        command_template: "kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{cluster_name}},cluster.x-k8s.io.ew/initial-deployment=true -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Initial MachineDeployment existence and replica state are visible."
+      - type: diagnostic
+        description: "Inspect initial addon and ingress components"
+        command_template: "kubectl -n {{namespace}} get ingress,helmrelease,helmchartproxy,helmreleaseproxy -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Initial ingress and addon readiness or absence is visible."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "initial-deployment", "cluster-create", "paused", "detail", "issue-tracing"]
+
+  - id: iksv2-v3-nodegroup-create-rollout-detail
+    title: "IKS v2 NodeGroup Creation Rollout Detail"
+    symptoms:
+      - "Node group creation is stuck"
+      - "MachineDeployment exists but MachineSet or Machine is missing"
+      - "Machine exists but OpenStackMachine is missing"
+      - "Node group create failed annotation is present"
+      - "Machine waits for Node with providerID or nodeRef missing"
+    evidence_keywords:
+      - "nodegroup-create-started"
+      - "nodegroup-create-completed"
+      - "nodegroup-create-failed"
+      - "nodegroup-paused"
+      - "MachineDeployment"
+      - "MachineSet"
+      - "Machine"
+      - "OpenStackMachine"
+      - "ScalingUp"
+      - "availableReplicas"
+      - "providerID"
+      - "nodeRef"
+      - "BootstrapReady"
+      - "InfrastructureReady"
+      - "NodeHealthy"
+      - "cluster.x-k8s.io/paused"
+    cause: "NodeGroup creation rolls out through MachineDeployment, MachineSet, Machine, OpenStackMachine, and Node registration. Each child must be interpreted in parent order."
+    resolution: "Inspect the worker hierarchy in order and classify whether the blocker is CAPI rollout, CAPO VM provisioning, bootstrap, join, or Node health."
+    decision_hints:
+      - "MachineDeployment without MachineSet points to CAPI rollout."
+      - "MachineSet without Machine points to replica expansion."
+      - "Machine without OpenStackMachine points to CAPO child creation."
+      - "OpenStackMachine InstanceReady=False points to VM provisioning."
+      - "providerID present and nodeRef missing points to Node join rather than VM creation."
+      - "nodegroup-create-failed=true plus pause means watcher timeout and pause handling."
+      - "Do not query management-cluster nodes as worker evidence."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - Machine
+      - OpenStackMachine
+      - Node
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect node group creation hierarchy"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,machineset,machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "The first missing or non-ready worker hierarchy layer can be identified."
+      - type: diagnostic
+        description: "Inspect OpenStackMachine readiness for node group creation"
+        command_template: "kubectl -n {{namespace}} get openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "VM provisioning or provider failure messages are visible."
+      - type: diagnostic
+        description: "Inspect node group annotations and pause state"
+        command_template: "kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "nodegroup-create markers, pause annotations, and replica counters are visible."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "nodegroup", "creation", "rollout", "detail", "issue-tracing"]
+
+  - id: iksv2-v3-nodegroup-scale-detail
+    title: "IKS v2 NodeGroup Scale Detail"
+    symptoms:
+      - "Node group scale-up or scale-down is in progress"
+      - "Desired replicas differ from current or available replicas"
+      - "Node group scale timed out or paused"
+    evidence_keywords:
+      - "nodegroup-scale-started"
+      - "nodegroup-scale-completed"
+      - "nodegroup-scale-failed"
+      - "last-scaled"
+      - "ScalingUp"
+      - "ScalingDown"
+      - "spec.replicas"
+      - "status.replicas"
+      - "readyReplicas"
+      - "availableReplicas"
+      - "MachineSet"
+      - "Machine"
+      - "cluster.x-k8s.io/paused"
+    cause: "Scale state is the convergence between MachineDeployment desired replicas and child MachineSet/Machine readiness, with watcher annotations marking completion or timeout."
+    resolution: "Compare desired/current/ready/available replicas, determine scale direction, then inspect child MachineSets and Machines if convergence is blocked."
+    decision_hints:
+      - "ScalingUp with actual replicas below desired means new child Machines are still being created or blocked."
+      - "ScalingDown with current replicas above desired means child deletion is still progressing."
+      - "nodegroup-scale-failed=true indicates watcher timeout, not necessarily root cause."
+      - "availableReplicas=0 is a symptom; inspect child Machine and OpenStackMachine state for the blocker."
+      - "If a specific MachineDeployment is named, prefer that object. Otherwise use cluster label selector."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - Machine
+      - OpenStackMachine
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect all MachineDeployments for scale status"
+        command_template: "kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Replica counters, phase, annotations, and target MachineDeployment can be identified."
+      - type: diagnostic
+        description: "Inspect MachineSets and Machines involved in scale convergence"
+        command_template: "kubectl -n {{namespace}} get machineset,machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Scale-up or scale-down child convergence is visible."
+      - type: diagnostic
+        description: "Inspect OpenStackMachine state if scale-up creates new VMs"
+        command_template: "kubectl -n {{namespace}} get openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "VM creation readiness and failure messages are visible when scale-up is blocked."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "nodegroup", "scale", "replicas", "detail", "issue-tracing"]
+
+  - id: iksv2-v3-nodegroup-upgrade-detail
+    title: "IKS v2 NodeGroup Upgrade Detail"
+    symptoms:
+      - "Node group upgrade is in progress or timed out"
+      - "Old MachineSets remain after version or image change"
+      - "updatedReplicas, readyReplicas, or availableReplicas do not match desired replicas"
+      - "nodegroup-upgrade-failed annotation is present"
+    evidence_keywords:
+      - "nodegroup-upgrade-in-progress"
+      - "nodegroup-upgrade-completed"
+      - "nodegroup-upgrade-failed"
+      - "last-upgraded"
+      - "updatedReplicas"
+      - "readyReplicas"
+      - "availableReplicas"
+      - "MachineSet"
+      - "OpenStackMachineTemplate"
+      - "KubeadmConfigTemplate"
+      - "spec.template.spec.version"
+      - "image"
+      - "rollout"
+    cause: "NodeGroup upgrade is a rollout over MachineDeployment templates, new and old MachineSets, replacement Machines, and eventual replica convergence."
+    resolution: "Inspect MachineDeployment rollout status, old/new MachineSets, template version/image drift, and Machine/OpenStackMachine failures during replacement."
+    decision_hints:
+      - "Upgrade is in progress when old MachineSets still have replicas or updated replicas do not match desired replicas."
+      - "Upgrade completes only when old MachineSets are gone and updated/ready/available replicas converge."
+      - "nodegroup-upgrade-in-progress should be removed when watcher observes completion."
+      - "nodegroup-upgrade-failed=true indicates timeout; inspect Machine and OpenStackMachine for the actual blocker."
+      - "Template drift can explain why new Machines are not created as expected."
+    related_objects:
+      - MachineDeployment
+      - MachineSet
+      - Machine
+      - OpenStackMachine
+      - OpenStackMachineTemplate
+      - KubeadmConfigTemplate
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect MachineDeployment and MachineSets for upgrade rollout"
+        command_template: "kubectl -n {{namespace}} get machinedeployment,machineset -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Old and new MachineSets, rollout counters, and upgrade annotations are visible."
+      - type: diagnostic
+        description: "Inspect templates used by node group upgrade"
+        command_template: "kubectl -n {{namespace}} get openstackmachinetemplate,kubeadmconfigtemplate -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Image/version/template drift can be compared with rollout state."
+      - type: diagnostic
+        description: "Inspect replacement Machine and OpenStackMachine failures"
+        command_template: "kubectl -n {{namespace}} get machine,openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Replacement VM, bootstrap, join, or Node health blockers are visible."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "nodegroup", "upgrade", "rollout", "detail", "issue-tracing"]
+
+  - id: iksv2-v3-machine-join-detail
+    title: "IKS v2 Machine Node Join Detail"
+    symptoms:
+      - "Machine has providerID but no nodeRef"
+      - "Machine waits for Node to exist"
+      - "BootstrapReady is True but Node is not registered"
+      - "Worker VM exists but Kubernetes Node is missing"
+    evidence_keywords:
+      - "providerID"
+      - "nodeRef"
+      - "BootstrapReady"
+      - "InfrastructureReady"
+      - "KubeadmConfig"
+      - "bootstrap"
+      - "kubeadm join"
+      - "control plane endpoint"
+      - "ServiceGatewayClaim"
+      - "security group"
+      - "NodeHealthy"
+    cause: "Machine join failure occurs after VM provisioning when kubeadm/bootstrap or network path to the hosted control plane prevents Node registration."
+    resolution: "Confirm VM existence with providerID and OpenStackMachine readiness, then use Machine bootstrap and nodeRef evidence to classify join failure."
+    decision_hints:
+      - "providerID absent means this is not a join failure yet; inspect VM provisioning first."
+      - "providerID present and nodeRef absent means Node registration failed or has not completed."
+      - "BootstrapReady=False points to bootstrap data rather than network join."
+      - "BootstrapReady=True with nodeRef absent points to kubeadm join, control-plane endpoint, servicegateway, or security group path."
+      - "Management-cluster Node listing does not prove workload Node registration."
+      - "VM console/cloud-init/kubelet logs are external follow-up only after CRD evidence classifies join failure."
+    related_objects:
+      - Machine
+      - OpenStackMachine
+      - KubeadmConfig
+      - ServiceGatewayClaim
+      - Node
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect Machine join indicators across the cluster"
+        command_template: >-
+          kubectl -n {{namespace}} get machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o jsonpath='{range .items[*]}{.metadata.name}{" providerID="}{.spec.providerID}{" nodeRef="}{.status.nodeRef.name}{" phase="}{.status.phase}{"\n"}{range .status.conditions[*]}  {.type}={.status} reason={.reason} message={.message}{"\n"}{end}{end}'
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "providerID, nodeRef, BootstrapReady, InfrastructureReady, and NodeHealthy are summarized."
+      - type: diagnostic
+        description: "Inspect OpenStackMachine readiness before join classification"
+        command_template: "kubectl -n {{namespace}} get openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "VM readiness and failure messages are visible."
+      - type: diagnostic
+        description: "Inspect ServiceGatewayClaim when endpoint connectivity is suspected"
+        command_template: "kubectl -n {{namespace}} get servicegatewayclaim -l iksv2.kinx.net/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Service gateway linkage for worker to hosted control plane can be checked."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "machine", "node-join", "providerid", "noderef", "bootstrap", "detail", "issue-tracing"]
+
+  - id: iksv2-v3-machine-deletion-detail
+    title: "IKS v2 Machine Deletion Detail"
+    symptoms:
+      - "Machine deletion is stuck"
+      - "Machine remains with deletionTimestamp"
+      - "Drain or volume detach has not completed"
+      - "OpenStackMachine delete failed"
+      - "Machine finalizer remains"
+    evidence_keywords:
+      - "deletionTimestamp"
+      - "DrainingSucceeded"
+      - "VolumeDetachSucceeded"
+      - "MachineFinalizer"
+      - "OpenStackMachine"
+      - "InstanceDeleteFailed"
+      - "NodeDrain"
+      - "VolumeAttachment"
+      - "providerID"
+      - "finalizers"
+    cause: "Machine deletion can be blocked by drain, volume detach, CAPI finalizer cleanup, or OpenStack instance deletion."
+    resolution: "Inspect Machine deletion conditions and paired OpenStackMachine delete state, then identify whether Kubernetes drain/detach or OpenStack instance deletion is the blocker."
+    decision_hints:
+      - "Machine.deletionTimestamp means deletion lifecycle is active."
+      - "DrainingSucceeded=False or Unknown means pod drain is still blocking or in progress."
+      - "VolumeDetachSucceeded=False or Unknown means volume detach is still blocking or in progress."
+      - "OpenStackMachine InstanceDeleteFailed is VM deletion failure evidence."
+      - "MachineFinalizer remaining means CAPI cleanup has not completed."
+      - "Do not treat old Machine create failure as deletion blocker if delete-specific conditions identify another layer."
+    related_objects:
+      - Machine
+      - OpenStackMachine
+      - VolumeAttachment
+      - Node
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect deleting Machines and their conditions"
+        command_template: "kubectl -n {{namespace}} get machine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Machine deletionTimestamp, finalizers, drain, detach, and node cleanup conditions are visible."
+      - type: diagnostic
+        description: "Inspect OpenStackMachine delete state"
+        command_template: "kubectl -n {{namespace}} get openstackmachine -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "InstanceDeleteFailed or other infra delete reasons are visible."
+    risk_level: medium
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "machine", "deletion", "drain", "detach", "finalizer", "detail", "issue-tracing"]
+
+  - id: iksv2-v3-cluster-suspend-detail
+    title: "IKS v2 Cluster Suspend Detail"
+    symptoms:
+      - "Cluster suspend is requested but not completed"
+      - "operation-state remains suspend-requested or suspend-applied"
+      - "Control plane, addon, or worker replicas have not scaled down"
+      - "last-suspended-done is missing"
+    evidence_keywords:
+      - "suspend-requested"
+      - "suspend-applied"
+      - "last-suspended-done"
+      - "operation-state"
+      - "spec.replicas"
+      - "readyReplicas"
+      - "spec.suspend"
+      - "cluster.x-k8s.io/paused"
+      - "KamajiControlPlane"
+      - "HelmRelease"
+      - "MachineDeployment"
+    cause: "Suspend is applied by event-processor and completes only after control plane, addons, and workers converge to suspended state."
+    resolution: "Inspect operation-state, KCP replicas, HelmRelease suspend flags, worker replicas, pause annotation, and last-suspended-done."
+    decision_hints:
+      - "suspend-requested means processor has not applied the operation."
+      - "suspend-applied means desired suspended state was applied but convergence is pending."
+      - "KCP readyReplicas should converge to 0 during suspend."
+      - "HelmRelease should be suspended when addon suspension is expected."
+      - "CAPI pause may be expected after suspend but can block unrelated deletion if lifecycle changes."
+    related_objects:
+      - Cluster
+      - KamajiControlPlane
+      - HelmRelease
+      - MachineDeployment
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect suspend operation metadata"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "operation-state, pause, and last-suspended-done markers are visible."
+      - type: diagnostic
+        description: "Inspect suspend convergence for control plane and workers"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane,machinedeployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Control plane and worker replica convergence is visible."
+      - type: diagnostic
+        description: "Inspect addon suspend state"
+        command_template: "kubectl -n {{namespace}} get helmrelease -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "HelmRelease suspend flags are visible."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "suspend", "operation-state", "detail", "issue-tracing"]
+
+  - id: iksv2-v3-cluster-resume-detail
+    title: "IKS v2 Cluster Resume Detail"
+    symptoms:
+      - "Cluster resume is requested but not completed"
+      - "operation-state remains resume-requested or resume-applied"
+      - "Control plane, addon, or worker replicas have not recovered"
+      - "last-resumed-done is missing"
+    evidence_keywords:
+      - "resume-requested"
+      - "resume-applied"
+      - "last-suspended-done"
+      - "last-resumed-done"
+      - "operation-state"
+      - "spec.replicas"
+      - "readyReplicas"
+      - "spec.suspend"
+      - "cluster.x-k8s.io/paused"
+      - "KamajiControlPlane"
+      - "HelmRelease"
+      - "MachineDeployment"
+    cause: "Resume is applied only after a suspended state exists and completes when control plane, addons, and workers converge back to active state."
+    resolution: "Inspect previous suspend marker, operation-state, pause removal, HelmRelease unsuspend, KCP readiness, worker readiness, and last-resumed-done."
+    decision_hints:
+      - "resume-requested without last-suspended-done is an abnormal sequence."
+      - "resume-requested means processor has not applied resume."
+      - "resume-applied means desired active state was applied but convergence is pending."
+      - "KCP readyReplicas should recover to the expected active replica count."
+      - "HelmRelease spec.suspend should be false when addon resume is expected."
+      - "If workers do not recover, branch to worker group trace."
+    related_objects:
+      - Cluster
+      - KamajiControlPlane
+      - HelmRelease
+      - MachineDeployment
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect resume operation metadata"
+        command_template: "kubectl -n {{namespace}} get cluster {{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "operation-state, last-suspended-done, last-resumed-done, and pause state are visible."
+      - type: diagnostic
+        description: "Inspect resume convergence for control plane and workers"
+        command_template: "kubectl -n {{namespace}} get kamajicontrolplane,machinedeployment -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "Control plane and worker readiness after resume is visible."
+      - type: diagnostic
+        description: "Inspect addon resume state"
+        command_template: "kubectl -n {{namespace}} get helmrelease -l cluster.x-k8s.io/cluster-name={{cluster_name}} -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "HelmRelease unsuspend state is visible."
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "resume", "operation-state", "detail", "issue-tracing"]
+
+  - id: iksv2-v3-service-loadbalancer-detail
+    title: "IKS v2 Workload Service LoadBalancer Detail"
+    symptoms:
+      - "Workload Service LoadBalancer creation is pending"
+      - "Workload Service LoadBalancer update is stuck"
+      - "OpenStack load balancer provisioning is ERROR"
+      - "Service deletion is stuck on load balancer cleanup"
+    evidence_keywords:
+      - "Service"
+      - "LoadBalancer"
+      - "tenant.meta.x-k8s.io/id"
+      - "cluster.meta.x-k8s.io/name"
+      - "service.beta.kubernetes.io/kinx-load-balancer-id"
+      - "cluster.x-k8s.io.ew/resource-id"
+      - "service.kubernetes.io/load-balancer-cleanup"
+      - "PENDING_CREATE"
+      - "PENDING_UPDATE"
+      - "PENDING_DELETE"
+      - "ACTIVE"
+      - "ERROR"
+      - "resource-create-completed"
+      - "resource-update-completed"
+      - "resource-delete-completed"
+    cause: "Workload Service LB state is synchronized from workload Service annotations/finalizers and external LB provisioning state observed by controllers."
+    resolution: "Use workload context to inspect the Service, then compare LB ID, provisioning state evidence, deletionTimestamp, cleanup finalizer, and synchronization annotations."
+    decision_hints:
+      - "This is a workload-cluster resource. Do not run Service LB inspection against the management cluster context."
+      - "Missing LB ID annotation means creation may be pending or not synchronized."
+      - "PENDING_CREATE or PENDING_UPDATE means external LB is still progressing."
+      - "ERROR means LB-side failure."
+      - "Service deletion completes only after load-balancer-cleanup finalizer is gone and external LB is deleted or not found."
+      - "Service metadata uses tenant.meta.x-k8s.io/id and cluster.meta.x-k8s.io/name annotations, so label selectors may not find every object."
+      - "After confirming the admin kubeconfig Secret exists, ask the user to inspect workload Services with the prepared workload context. Do not put workload_context commands into guide diagnostic_steps."
+    related_objects:
+      - Service
+      - Secret
+      - Cluster
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect tenant admin kubeconfig Secret before workload Service observation"
+        command_template: "kubectl -n {{namespace}} get secret {{cluster_name}}-admin-kubeconfig -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "The kubeconfig source for workload_context is present or absent."
+    risk_level: medium
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "service", "loadbalancer", "workload", "detail", "issue-tracing"]
+
+  - id: iksv2-v3-persistentvolume-detail
+    title: "IKS v2 Workload PersistentVolume Detail"
+    symptoms:
+      - "PersistentVolume create, attach, detach, or delete is not synchronized"
+      - "PV remains in an unexpected phase"
+      - "VolumeAttachment is not attached"
+      - "PV deletion is blocked by finalizers"
+    evidence_keywords:
+      - "PersistentVolume"
+      - "PersistentVolumeClaim"
+      - "VolumeAttachment"
+      - "cinder.csi.openstack.org"
+      - "manila.csi.openstack.org"
+      - "volumeHandle"
+      - "Available"
+      - "Bound"
+      - "Released"
+      - "attached"
+      - "kubernetes.io/pv-protection"
+      - "Retain"
+      - "resource-create-completed"
+      - "resource-attach-completed"
+      - "resource-detach-completed"
+      - "resource-delete-completed"
+    cause: "PV synchronization is based on workload PV/PVC/VolumeAttachment state, CSI driver, finalizers, and event-watcher synchronization markers."
+    resolution: "Use workload context to inspect PV/PVC/VolumeAttachment, classify create/attach/detach/delete state, and identify finalizer or attachment blockers."
+    decision_hints:
+      - "This is a workload-cluster resource. Do not inspect PVs against the management cluster context."
+      - "Cinder and Manila CSI drivers identify managed PVs."
+      - "PV phase Available or Bound with volumeHandle is create evidence."
+      - "VolumeAttachment.status.attached=true is attach completion evidence."
+      - "Released phase can be detach evidence."
+      - "PV deletion requires pv-protection finalizer removal before delete completion."
+      - "Retain reclaim policy can require external metadata cleanup during cluster deletion."
+      - "After confirming the admin kubeconfig Secret exists, ask the user to inspect workload PVs, PVCs, and VolumeAttachments with the prepared workload context. Do not put workload_context commands into guide diagnostic_steps."
+    related_objects:
+      - PersistentVolume
+      - PersistentVolumeClaim
+      - VolumeAttachment
+      - Secret
+      - Cluster
+    diagnostic_steps:
+      - type: diagnostic
+        description: "Inspect tenant admin kubeconfig Secret before workload PV observation"
+        command_template: "kubectl -n {{namespace}} get secret {{cluster_name}}-admin-kubeconfig -o yaml"
+        automatic_candidate: true
+        requires_confirmation: false
+        expected_outcome: "The kubeconfig source for workload_context is present or absent."
+    risk_level: medium
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "persistentvolume", "volumeattachment", "workload", "detail", "issue-tracing"]
+
+  - id: iksv2-v3-controller-log-followup
+    title: "IKS v2 Controller Log Follow-up After CRD Trace"
+    symptoms:
+      - "CRD state identifies a responsible controller but not the internal reconciliation reason"
+      - "Controller-created child resource is missing after parent readiness is confirmed"
+      - "Watcher or processor synchronization appears delayed after CRD evidence is collected"
+      - "Cleanup is stuck but Kubernetes child/finalizer evidence does not explain why"
+    evidence_keywords:
+      - "event-watcher"
+      - "event-processor"
+      - "capi-controller-manager"
+      - "capo-controller-manager"
+      - "caaph-controller-manager"
+      - "capi-kamaji-controller-manager"
+      - "kamaji"
+      - "cluster key"
+      - "controller logs"
+      - "reconcile"
+      - "cleanup"
+    cause: "Controller logs are secondary evidence used only after CRD status narrows the responsible controller or sync component."
+    resolution: "Ask the user to run cluster-filtered controller log commands for the responsible controller. Do not claim logs were observed unless a log command actually ran."
+    decision_hints:
+      - "Do not use this guide as the first guide for a generic Cluster problem."
+      - "Do not search logs only by ERROR; always filter by cluster name or cluster key first."
+      - "event-watcher records observation and synchronization markers."
+      - "event-processor handles lifecycle operations and cleanup."
+      - "If MachineSet or Machine is missing, inspect capi-controller-manager logs."
+      - "If OpenStackMachine or OpenStackCluster is stuck, inspect capo-controller-manager logs."
+      - "If HelmReleaseProxy is missing or failed, inspect caaph-controller-manager logs."
+      - "If TenantControlPlane is missing or not ready, inspect Kamaji controller logs."
+    related_objects:
+      - Cluster
+      - MachineDeployment
+      - Machine
+      - OpenStackMachine
+      - HelmReleaseProxy
+      - TenantControlPlane
+      - ServiceGatewayClaim
+    risk_level: low
+    source: "iksv2-issue-tracing-v3"
+    tags: ["iksv2", "logs", "controller", "followup", "secondary-evidence", "issue-tracing"]

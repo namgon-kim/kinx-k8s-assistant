@@ -99,11 +99,17 @@ func inconsistentActionTargetMessage(call gollm.FunctionCall) (string, bool) {
 	if normalizeKubectlResource(strings.ToLower(strings.TrimSpace(target.Resource))) == "namespace" && target.Namespace != "" {
 		return fmt.Sprintf("Action target declared resource %q with namespace scope %q, but Namespace objects are cluster-scoped. Use resource=namespace only when diagnosing a Namespace object itself; otherwise keep namespace as scope for the real target resource.", target.Resource, target.Namespace), true
 	}
+	if target.Namespace != "" && !isAllNamespacesValue(target.Namespace) && !isValidKubernetesNamespace(target.Namespace) {
+		return fmt.Sprintf("Action target declared namespace %q, but namespace fields must contain a real Kubernetes namespace name, not a placeholder or explanatory phrase. Return one corrected response: use the actual namespace if known; if the object name is known but the namespace is not, omit target.namespace or use all-namespaces scope and locate it with `kubectl get <kind> -A --field-selector metadata.name=<name>`; ask for clarification only when the target cannot be located safely.", target.Namespace), true
+	}
 	if target.Resource != "" && !commandMentionsResource(command, target.Resource) {
 		return fmt.Sprintf("Action target declared resource %q, but command %q does not include that resource. Preserve the declared target and return one corrected next action.", target.Resource, command), true
 	}
 	if target.Name != "" && !commandMentionsToken(command, target.Name) && !commandUsesSelectorForName(command, target.Name) {
 		return fmt.Sprintf("Action target declared name %q, but command %q does not include that name. Preserve the declared target and return one corrected next action.", target.Name, command), true
+	}
+	if target.Name != "" && commandUsesAllNamespaces(command) && commandUsesPositionalObjectName(command, target.Resource, target.Name) {
+		return fmt.Sprintf("Command %q combines all-namespaces scope with a positional object name. To locate a namespaced object when namespace is unknown, use an all-namespaces list filtered by field selector, for example `kubectl get %s -A --field-selector metadata.name=%s -o yaml`, then use the discovered namespace for exact object observation.", command, target.Resource, target.Name), true
 	}
 	if target.Namespace != "" && !commandUsesNamespace(command, target.Namespace) {
 		if isAllNamespacesValue(target.Namespace) {
@@ -124,7 +130,7 @@ func actionTargetFromFunctionCall(call gollm.FunctionCall) (actionTarget, bool) 
 	name, _ := raw["name"].(string)
 	target := actionTarget{
 		Resource:  strings.TrimSpace(resource),
-		Namespace: strings.TrimSpace(namespace),
+		Namespace: cleanUnknownPlaceholder(namespace),
 		Name:      cleanUnknownPlaceholder(name),
 	}
 	if target.Resource == "" && target.Namespace == "" && target.Name == "" {
@@ -359,7 +365,68 @@ func commandUsesSelectorForName(command, name string) bool {
 	lower := strings.ToLower(command)
 	return strings.Contains(lower, "cluster-name="+name) ||
 		strings.Contains(lower, "cluster-name: "+name) ||
-		strings.Contains(lower, "cluster.x-k8s.io/cluster-name="+name)
+		strings.Contains(lower, "cluster.x-k8s.io/cluster-name="+name) ||
+		strings.Contains(lower, "metadata.name="+name)
+}
+
+func commandUsesPositionalObjectName(command, resource, name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return false
+	}
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(command)))
+	for i := 0; i < len(fields); i++ {
+		if strings.Trim(fields[i], "'\"") != "kubectl" {
+			continue
+		}
+		verb, verbIndex, ok := kubectlVerbAndIndexFromFields(fields, i)
+		if !ok || verb != "get" {
+			continue
+		}
+		if kubectlGetUsesPositionalObjectName(fields, verbIndex+1, resource, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func kubectlGetUsesPositionalObjectName(fields []string, start int, resource, name string) bool {
+	resource = strings.ToLower(strings.TrimSpace(resource))
+	seenResource := false
+	for i := start; i < len(fields); i++ {
+		field := strings.Trim(fields[i], "'\"")
+		if field == "" {
+			continue
+		}
+		if strings.HasPrefix(field, "--") {
+			if strings.Contains(field, "=") {
+				continue
+			}
+			if kubectlFlagRequiresValue(field) && i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(field, "-") {
+			if kubectlShortFlagRequiresValue(field) && len(field) == 2 && i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		if !seenResource {
+			parts := strings.SplitN(field, "/", 2)
+			if !resourceNamesEquivalent(parts[0], resource) {
+				return false
+			}
+			seenResource = true
+			if len(parts) == 2 && strings.TrimSpace(parts[1]) == name {
+				return true
+			}
+			continue
+		}
+		return strings.TrimSpace(field) == name
+	}
+	return false
 }
 
 func commandUsesNamespace(command, namespace string) bool {
@@ -406,9 +473,37 @@ func cleanUnknownPlaceholder(value string) string {
 	return value
 }
 
+func cleanNamespaceValue(value string) string {
+	value = cleanUnknownPlaceholder(value)
+	if value == "" || isAllNamespacesValue(value) {
+		return value
+	}
+	if !isValidKubernetesNamespace(value) {
+		return ""
+	}
+	return value
+}
+
+func isValidKubernetesNamespace(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 63 {
+		return false
+	}
+	for i, r := range value {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-'
+		if !valid {
+			return false
+		}
+		if (i == 0 || i == len(value)-1) && r == '-' {
+			return false
+		}
+	}
+	return true
+}
+
 func isUnknownPlaceholder(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "unknown", "unknown_name", "unknown-name", "n/a", "na", "null", "none":
+	case "", "unknown", "unknown_name", "unknown-name", "undefined", "undefined_namespace", "undefined-namespace", "n/a", "na", "null", "none":
 		return true
 	default:
 		return false
