@@ -20,6 +20,18 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 		if call.Name != internalResourceGuideLookupCall {
 			continue
 		}
+		if !l.phaseAllowsResourceGuideLookup() {
+			if !l.appendCorrectionWithCompaction("resource_guide_wrong_phase", "Resource guide lookup is only allowed from the guidance_lookup phase after observation evidence is available. Complete or advance the current phase with phase_progress, or continue the active phase with the next safest diagnostic.") {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "잘못된 phase의 resource_guide_lookup 요청이 반복되어 진단을 중단합니다.")
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return true
+			}
+			l.currIteration++
+			l.state = StateRunning
+			return true
+		}
 		request, ok := resourceGuideLookupFromFunctionCall(call)
 		if !ok {
 			if !l.appendCorrectionWithCompaction("invalid_resource_guide_lookup", "Resource guide lookup request was invalid. Continue with the next safest kubectl diagnostic.") {
@@ -64,44 +76,63 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 	return false
 }
 
-func (l *Loop) interceptCustomResourceFunctionCalls(ctx context.Context, calls []gollm.FunctionCall) bool {
-	if l.resourceGuideInjected || l.initialGuideAttempted {
+func (l *Loop) rejectActionDuringGuidanceLookupWithoutGuide(calls []gollm.FunctionCall) bool {
+	if l.phaseStepState == nil || l.resourceGuideInjected {
 		return false
 	}
-	if l.requestContext == nil {
+	if l.resourceClassification == nil || l.resourceClassification.Kind != resourceClassificationCRD {
+		return false
+	}
+	current := l.phaseStepState.currentStep()
+	if !strings.EqualFold(strings.TrimSpace(current.Name), "guidance_lookup") {
 		return false
 	}
 	for _, call := range calls {
-		command, ok := kubectlCommandFromFunctionCall(call)
-		if !ok {
+		if call.Name == internalResourceGuideLookupCall || call.Name == internalPhaseProgressCall {
 			continue
 		}
-		resource, ok := customResourceCandidateFromKubectl(command)
-		if !ok {
+		if _, ok := kubectlCommandFromFunctionCall(call); !ok {
 			continue
 		}
-		classification := l.classifyResourceByDiscovery(ctx, resource)
-		if classification.Kind != resourceClassificationCRD {
-			continue
+		message := "Active phase is guidance_lookup for a CRD-backed primary target. This phase must request a top-level `resource_guide_lookup` before any kubectl action. Return one `resource_guide_lookup` object for the accepted primary resource and operational problem focus."
+		if !l.appendCorrectionWithCompaction("guidance_lookup_action_before_lookup", message) {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "resource_guide_lookup 전 kubectl action이 반복되어 진단을 중단합니다:\n"+message)
+			l.pendingCalls = nil
+			l.currIteration = 0
+			l.state = StateDone
+			return true
 		}
-		l.resourceClassification = &classification
-		l.resourceGuideEvidence = append(l.resourceGuideEvidence, command)
-		l.initialGuideAttempted = true
-		l.searchAndInjectResourceGuide(ctx, resource, l.resourceGuideQuery(resource))
+		l.pendingCalls = nil
+		l.currIteration++
+		l.state = StateRunning
 		return true
 	}
 	return false
 }
 
+func (l *Loop) phaseAllowsResourceGuideLookup() bool {
+	if l.phaseStepState == nil {
+		return false
+	}
+	name := strings.ToLower(strings.TrimSpace(l.phaseStepState.currentStep().Name))
+	switch name {
+	case "guidance_lookup":
+		return true
+	default:
+		return false
+	}
+}
+
 func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query string) {
-	l.markResourceGuideQuery(query)
 	client, err := guidance.NewResourceGuideClient(l.cfg)
 	if err != nil {
 		klog.Warningf("resource guidance client init failed: %v", err)
+		l.markResourceGuideQuery(query)
 		l.injectResourceGuideUnavailable(resource, "client_init_failed")
 		return
 	}
 	if client.KnowledgeProvider() != guidance.KnowledgeProviderQdrant {
+		l.markResourceGuideQuery(query)
 		l.injectResourceGuideUnavailable(resource, "provider="+string(client.KnowledgeProvider()))
 		return
 	}
@@ -110,10 +141,23 @@ func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query
 	cancel()
 	if err != nil {
 		klog.Warningf("resource guidance search failed: %v", err)
+		l.markResourceGuideQuery(query)
 		l.injectResourceGuideUnavailable(resource, "search_failed")
 		return
 	}
-	l.injectResourceGuideAttempt(resource, found)
+	originalCaseCount := 0
+	if found != nil {
+		originalCaseCount = len(found.Cases)
+	}
+	found = l.filterResourceGuidesForRequest(found, query)
+	if originalCaseCount > 0 && (found == nil || len(found.Cases) == 0) {
+		l.markResourceGuideQuery(query)
+		l.injectResourceGuideUnavailable(resource, "filtered_no_applicable_guides")
+		return
+	}
+	if l.injectResourceGuideAttempt(resource, found) {
+		l.markResourceGuideQuery(query)
+	}
 }
 
 func (l *Loop) resourceGuideQueryAlreadyUsed(query string) bool {
@@ -131,11 +175,30 @@ func (l *Loop) markResourceGuideQuery(query string) {
 	l.resourceGuideQueries[query] = struct{}{}
 }
 
-func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.GuideSearchResult) {
-	l.resourceGuideInjected = true
+func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.GuideSearchResult) bool {
 	l.guideStepState = l.buildGuideStepState(found)
 	l.finalReportRequested = false
+	l.guidedPhaseProgressRequested = false
 	l.pendingResponseDirective = ""
+	if l.guideStepState != nil {
+		if !l.enterGuidedDiagnosisPhase() {
+			l.guideStepState = nil
+			l.phaseStepState = nil
+			message := "A resource guide was found, but the accepted phase_plan has no guided_diagnosis phase_step. Return one corrected phase_plan that declares guidance_lookup, guided_diagnosis, and the final response phase as explicit phase_steps before using guide steps. guidance_step entries can run only inside a declared guided_diagnosis phase_step."
+			if !l.appendCorrectionWithCompaction("guided_diagnosis_phase_missing", message) {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "guided_diagnosis phase 누락 오류가 반복되어 진단을 중단합니다:\n"+message)
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return false
+			}
+			l.pendingCalls = nil
+			l.currIteration++
+			l.state = StateRunning
+			return false
+		}
+	}
+	l.resourceGuideInjected = true
 	includeClusterAPI := guideResultImpliesClusterAPI(found)
 	l.promptOptions = l.newPromptOptions(l.requestIntent, true, includeClusterAPI)
 	if l.shouldCompactForStateRewrite() {
@@ -146,7 +209,7 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			l.pendingCalls = nil
 			l.state = StateDone
-			return
+			return true
 		}
 		l.currChatContent = []any{l.compactedStateMessage("Use the following guide context as decision support, then choose the next safest step.")}
 		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
@@ -157,7 +220,7 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			l.pendingCalls = nil
 			l.state = StateDone
-			return
+			return true
 		}
 		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
 		klog.Infof("resource guide injected for CRD %s without context compact", resource)
@@ -165,12 +228,14 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 	l.pendingCalls = nil
 	l.currIteration++
 	l.state = StateRunning
+	return true
 }
 
 func (l *Loop) injectResourceGuideUnavailable(resource, reason string) {
 	l.resourceGuideInjected = true
 	l.guideStepState = nil
 	l.finalReportRequested = false
+	l.guidedPhaseProgressRequested = false
 	l.pendingResponseDirective = ""
 	l.promptOptions = l.newPromptOptions(l.requestIntent, true, false)
 	content := formatResourceGuideUnavailableObservation(resource, reason)
@@ -236,6 +301,54 @@ func (l *Loop) resourceGuideRefinementQuery(request resourceGuideLookup) string 
 		"reason for refinement: " + request.Reason,
 		"observed evidence: " + request.Evidence,
 	}, "\n")
+}
+
+func (l *Loop) filterResourceGuidesForRequest(found *guidance.GuideSearchResult, query string) *guidance.GuideSearchResult {
+	if found == nil || len(found.Cases) == 0 {
+		return found
+	}
+	if requestOrQuerySuggestsDeletion(l.originalQuery, query) {
+		return found
+	}
+	filtered := *found
+	filtered.Cases = nil
+	for _, c := range found.Cases {
+		if guideCaseIsDeletionOrCleanup(c) {
+			continue
+		}
+		filtered.Cases = append(filtered.Cases, c)
+	}
+	return &filtered
+}
+
+func requestOrQuerySuggestsDeletion(values ...string) bool {
+	for _, value := range values {
+		lower := strings.ToLower(value)
+		for _, marker := range []string{
+			"delete", "deletion", "deleting", "cleanup", "clean up", "deletiontimestamp",
+			"cluster-delete", "nodegroup-delete", "resource-delete",
+			"삭제", "삭제중", "삭제 중", "정리",
+		} {
+			if strings.Contains(lower, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func guideCaseIsDeletionOrCleanup(c guidance.GuideCase) bool {
+	fields := []string{
+		c.ID,
+		c.Title,
+		c.Cause,
+		c.Resolution,
+		strings.Join(c.Symptoms, " "),
+		strings.Join(c.EvidenceKeywords, " "),
+		strings.Join(c.DecisionHints, " "),
+		strings.Join(c.Tags, " "),
+	}
+	return requestOrQuerySuggestsDeletion(fields...)
 }
 
 func resourceGuideLookupFromFunctionCall(call gollm.FunctionCall) (resourceGuideLookup, bool) {
@@ -448,12 +561,40 @@ func (l *Loop) buildGuideStepState(found *guidance.GuideSearchResult) *guideStep
 			Index:           i + 1,
 			Description:     desc,
 			CommandTemplate: strings.TrimSpace(step.CommandTemplate),
+			RenderedCommand: l.renderGuideStepCommand(step),
 			ExpectedOutcome: strings.TrimSpace(step.ExpectedOutcome),
 			Preconditions:   append([]string(nil), step.Preconditions...),
 		})
 	}
 	l.persistGuideStepDetails(state)
 	return state
+}
+
+func (l *Loop) renderGuideStepCommand(step guidance.PlanStep) string {
+	rendered := strings.TrimSpace(step.RenderedCommand)
+	if rendered == "" {
+		rendered = strings.TrimSpace(step.CommandTemplate)
+	}
+	if rendered == "" {
+		return ""
+	}
+	replacements := map[string]string{}
+	if l.requestContext != nil {
+		replacements["namespace"] = l.requestContext.Scope.Namespace
+		replacements["name"] = l.requestContext.PrimaryTarget.Name
+		replacements["cluster_name"] = l.requestContext.PrimaryTarget.Name
+		replacements["kind"] = l.requestContext.PrimaryTarget.Resource
+	}
+	for key, value := range step.Variables {
+		replacements[key] = value
+	}
+	for key, value := range replacements {
+		rendered = strings.ReplaceAll(rendered, "{{"+key+"}}", value)
+	}
+	if strings.Contains(rendered, "{{") {
+		return ""
+	}
+	return rendered
 }
 
 func (l *Loop) persistGuideStepDetails(state *guideStepState) {

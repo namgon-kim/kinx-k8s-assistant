@@ -87,28 +87,51 @@ Events:
 	}
 }
 
-func TestShimCandidateSeparatesThoughtAndAnswerWithBlankLine(t *testing.T) {
+func TestShimCandidateFinalAnswerOmitsThought(t *testing.T) {
 	candidate := &shimCandidate{candidate: &reActResponse{
 		Thought: "default 네임스페이스의 팟 정보가 제공되었습니다.",
 		Answer:  "Name: example-nginx\nNamespace: default",
 	}}
 	parts := candidate.Parts()
-	if len(parts) != 2 {
+	if len(parts) != 1 {
 		t.Fatalf("unexpected part count: %d", len(parts))
 	}
-	thought, ok := parts[0].AsText()
-	if !ok {
-		t.Fatal("expected thought text part")
-	}
-	if thought != "default 네임스페이스의 팟 정보가 제공되었습니다.\n\n" {
-		t.Fatalf("unexpected thought text: %q", thought)
-	}
-	answer, ok := parts[1].AsText()
+	answer, ok := parts[0].AsText()
 	if !ok {
 		t.Fatal("expected answer text part")
 	}
 	if answer != "Name: example-nginx\nNamespace: default" {
 		t.Fatalf("unexpected answer text: %q", answer)
+	}
+}
+
+func TestParseReActResponseMovesTopLevelGuideProgressIntoAction(t *testing.T) {
+	parsed, err := parseReActResponse("```json\n" + `{
+  "thought": "inspect",
+  "guide_progress": {
+    "step_completed": 1,
+    "evidence_useful": true
+  },
+  "action": {
+    "name": "kubectl",
+    "reason": "inspect guide step",
+    "target": {
+      "resource": "cluster",
+      "namespace": "tenant-a",
+      "name": "clst-a"
+    },
+    "command": "kubectl -n tenant-a get cluster/clst-a -o yaml",
+    "modifies_resource": "no"
+  }
+}` + "\n```")
+	if err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if parsed.Action == nil || parsed.Action.GuideProgress == nil {
+		t.Fatalf("expected action guide progress, got %#v", parsed.Action)
+	}
+	if parsed.Action.GuideProgress.StepCompleted != 1 || !parsed.Action.GuideProgress.EvidenceUseful {
+		t.Fatalf("unexpected guide progress: %#v", parsed.Action.GuideProgress)
 	}
 }
 
@@ -154,6 +177,33 @@ func TestParseReActResponseRejectsPlainText(t *testing.T) {
 	}
 }
 
+func TestParseReActResponseTreatsStringFinalReportAsInvalidCall(t *testing.T) {
+	parsed, err := parseReActResponse("```json\n" + `{
+  "thought": "done",
+  "final_report": "The cluster has a problem."
+}` + "\n```")
+	if err != nil {
+		t.Fatalf("parse invalid final_report shape: %v", err)
+	}
+	if !parsed.InvalidFinalReport {
+		t.Fatal("expected invalid final_report marker")
+	}
+	parts := (&shimCandidate{candidate: parsed}).Parts()
+	if len(parts) != 2 {
+		t.Fatalf("unexpected part count: %d", len(parts))
+	}
+	calls, ok := parts[1].AsFunctionCalls()
+	if !ok || len(calls) != 1 {
+		t.Fatalf("expected invalid final_report function call, got %#v", calls)
+	}
+	if calls[0].Name != internalFinalReportCall {
+		t.Fatalf("unexpected call name: %q", calls[0].Name)
+	}
+	if len(calls[0].Arguments) != 0 {
+		t.Fatalf("expected empty arguments for correction path, got %#v", calls[0].Arguments)
+	}
+}
+
 func TestShimPartConvertsResourceGuideLookupToInternalCall(t *testing.T) {
 	part := &shimPart{resourceGuideLookup: &resourceGuideLookup{
 		ResourceFamily: "cluster-api",
@@ -174,6 +224,51 @@ func TestShimPartConvertsResourceGuideLookupToInternalCall(t *testing.T) {
 	}
 }
 
+func TestShimPartConvertsPhasePlanToInternalCall(t *testing.T) {
+	part := &shimPart{phasePlan: &phasePlan{
+		RequestGoal:       "diagnose cluster health",
+		CurrentPhaseIndex: 1,
+		PhaseSteps: []phaseStep{{
+			Index:               1,
+			Name:                "observation_planning",
+			Goal:                "choose first observation",
+			CompletionCondition: "next observation action is selected",
+			AllowedNext:         []string{"observation_execution"},
+		}},
+	}}
+
+	calls, ok := part.AsFunctionCalls()
+	if !ok || len(calls) != 1 {
+		t.Fatalf("expected one internal phase-plan call, got %#v", calls)
+	}
+	if calls[0].Name != internalPhasePlanCall {
+		t.Fatalf("unexpected call name: %q", calls[0].Name)
+	}
+	if calls[0].Arguments["request_goal"] != "diagnose cluster health" {
+		t.Fatalf("unexpected request goal: %#v", calls[0].Arguments["request_goal"])
+	}
+}
+
+func TestShimPartConvertsPhaseProgressToInternalCall(t *testing.T) {
+	part := &shimPart{phaseProgress: &phaseProgress{
+		PhaseCompleted:   2,
+		EvidenceUseful:   true,
+		CompletionReason: "cluster status was observed",
+		NextPhase:        "observation_completion",
+	}}
+
+	calls, ok := part.AsFunctionCalls()
+	if !ok || len(calls) != 1 {
+		t.Fatalf("expected one internal phase-progress call, got %#v", calls)
+	}
+	if calls[0].Name != internalPhaseProgressCall {
+		t.Fatalf("unexpected call name: %q", calls[0].Name)
+	}
+	if calls[0].Arguments["phase_completed"] != float64(2) {
+		t.Fatalf("unexpected completed phase: %#v", calls[0].Arguments["phase_completed"])
+	}
+}
+
 func TestShimPartConvertsRequirementAnalysisToInternalCall(t *testing.T) {
 	part := &shimPart{requirementAnalysis: &requirementAnalysis{
 		RequestType: "diagnosis",
@@ -181,6 +276,17 @@ func TestShimPartConvertsRequirementAnalysisToInternalCall(t *testing.T) {
 		Target: requirementAnalysisTarget{
 			Category:    "cluster",
 			Description: "connected Kubernetes cluster",
+		},
+		OperationalFocus: &requirementOperationalFocus{
+			Summary:               "worker group availability",
+			RelationshipToPrimary: "related_to_primary",
+			ChangedFromPrevious:   true,
+			RelatedResourceHints: []requirementRelatedResource{{
+				Kind:   "machinedeployment",
+				Role:   "suspected_related",
+				Source: "previous_context",
+			}},
+			EvidenceNeeds: []string{"MachineDeployment status"},
 		},
 		Evidence: []string{"current cluster health evidence"},
 	}}
@@ -194,6 +300,13 @@ func TestShimPartConvertsRequirementAnalysisToInternalCall(t *testing.T) {
 	}
 	if calls[0].Arguments["request_type"] != "diagnosis" {
 		t.Fatalf("unexpected request type: %#v", calls[0].Arguments["request_type"])
+	}
+	focus, ok := calls[0].Arguments["operational_focus"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected operational_focus argument, got %#v", calls[0].Arguments["operational_focus"])
+	}
+	if focus["summary"] != "worker group availability" {
+		t.Fatalf("unexpected operational focus: %#v", focus)
 	}
 }
 

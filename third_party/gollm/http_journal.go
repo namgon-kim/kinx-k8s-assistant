@@ -16,6 +16,7 @@ package gollm
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httputil"
@@ -30,11 +31,30 @@ type journalingRoundTripper struct {
 	next http.RoundTripper // The actual transport that does the network call
 }
 
+type verboseLogRecorder struct{}
+
+func (r *verboseLogRecorder) Write(ctx context.Context, event *journal.Event) error {
+	log := klog.FromContext(ctx)
+	log.V(3).Info("Tracing event", "event", event)
+	return nil
+}
+
+func (r *verboseLogRecorder) Close() error {
+	return nil
+}
+
+func recorderFromContext(ctx context.Context) journal.Recorder {
+	if recorder, ok := ctx.Value(journal.RecorderKey).(journal.Recorder); ok {
+		return recorder
+	}
+	return &verboseLogRecorder{}
+}
+
 // RoundTrip satisfies the http.RoundTripper interface. It intercepts an HTTP request,
 // logs it, passes it to the next handler, and then logs the response.
 // It includes special handling to correctly parse and summarize streaming responses.
 func (jrt *journalingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	recorder := journal.RecorderFromContext(req.Context())
+	recorder := recorderFromContext(req.Context())
 
 	// Log the outgoing request.
 	reqBytes, err := httputil.DumpRequestOut(req, true)

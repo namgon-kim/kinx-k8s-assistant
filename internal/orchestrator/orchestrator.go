@@ -537,7 +537,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		errText = sanitizeDisplayText(errText)
 		PrintMessage(o.formatter.FormatError(errText))
 		o.logEntry("error", errText)
-		return o.incidentGuidance.AfterAgentText(o, errText)
+		return nil
 
 	case api.MessageTypeToolCallRequest:
 		desc, ok := msg.Payload.(string)

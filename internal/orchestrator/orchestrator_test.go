@@ -206,6 +206,19 @@ func TestLooksIncidentGuidanceWorthyIgnoresNoErrorSummary(t *testing.T) {
 	}
 }
 
+func TestLooksIncidentGuidanceWorthyIgnoresInternalRuntimeErrors(t *testing.T) {
+	cases := []string{
+		"next_directions 형식 오류가 반복되어 진단을 중단합니다.",
+		"Error: parsing shim JSON",
+		"Action target declared namespace \"all\"",
+	}
+	for _, tc := range cases {
+		if looksIncidentGuidanceWorthy(tc) {
+			t.Fatalf("internal runtime error should not trigger incident guidance: %q", tc)
+		}
+	}
+}
+
 func TestIncidentGuidanceFlowTransitionsFromEvidenceToOffer(t *testing.T) {
 	flow := NewIncidentGuidanceFlow()
 	flow.ObserveUserInput("OOMKilled 원인을 분석해줘")

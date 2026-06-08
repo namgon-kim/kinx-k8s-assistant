@@ -47,6 +47,7 @@ func (l *Loop) requestFinalReportFromModel() {
 	b.WriteString("- evidence_known: facts directly observed from tool output; required when conclusive=true.\n")
 	b.WriteString("- evidence_missing: facts that would have helped but were not obtainable; for conclusive=false include this or blockers if evidence_known is empty.\n")
 	b.WriteString("- most_likely_cause: best-guess cause given partial evidence; use the literal string \"inconclusive\" if no cause is supported.\n")
+	b.WriteString("- problematic_resources: suspected blocker/root-cause investigation targets only. Include kind, name, namespace, and reason when a related resource is the likely next object to investigate. Do not list the original primary resource merely because it reports a symptom; if the related resource name is unknown, put that gap in evidence_missing or recommended_user_actions instead.\n")
 	b.WriteString("- recommended_user_actions: concrete next steps the user can run outside this session (optional).\n")
 	b.WriteString("- blockers: hard constraints that prevented full diagnosis (optional). Examples: \"workload kubeconfig not available in this session\".\n")
 	b.WriteString("Do not emit `action`, `resource_guide_lookup`, or `next_directions` in this response.")
@@ -82,7 +83,11 @@ func (l *Loop) consumeFinalReport(ctx context.Context, calls []gollm.FunctionCal
 		l.emitFinalReportMessage(ctx, report)
 		l.guideStepState = nil
 		l.finalReportRequested = false
+		l.guidedPhaseProgressRequested = false
 		if report.Conclusive {
+			if l.promptProblematicResourceInvestigation(report) {
+				return nil, true
+			}
 			l.state = StateDone
 			l.pendingCalls = nil
 			l.currIteration = 0
@@ -98,14 +103,7 @@ func (l *Loop) consumeFinalReport(ctx context.Context, calls []gollm.FunctionCal
 }
 
 func finalReportFromFunctionCall(call gollm.FunctionCall) (finalReport, bool) {
-	raw, err := json.Marshal(call.Arguments)
-	if err != nil {
-		return finalReport{}, false
-	}
-	var report finalReport
-	if err := json.Unmarshal(raw, &report); err != nil {
-		return finalReport{}, false
-	}
+	report := finalReportFromArguments(call.Arguments)
 	if len(report.Attempted) == 0 || strings.TrimSpace(report.MostLikelyCause) == "" {
 		return finalReport{}, false
 	}
@@ -119,6 +117,75 @@ func finalReportFromFunctionCall(call gollm.FunctionCall) (finalReport, bool) {
 		return finalReport{}, false
 	}
 	return report, true
+}
+
+func finalReportFromArguments(args map[string]any) finalReport {
+	return finalReport{
+		Conclusive:             boolFromAny(args["conclusive"]),
+		Conclusion:             stringFromAny(args["conclusion"]),
+		Attempted:              stringSliceFromAnyLoose(args["attempted"]),
+		EvidenceKnown:          stringSliceFromAnyLoose(args["evidence_known"]),
+		EvidenceMissing:        stringSliceFromAnyLoose(args["evidence_missing"]),
+		MostLikelyCause:        stringFromAny(args["most_likely_cause"]),
+		RecommendedUserActions: stringSliceFromAnyLoose(args["recommended_user_actions"]),
+		ProblematicResources:   problematicResourcesFromAny(args["problematic_resources"]),
+		Blockers:               stringSliceFromAnyLoose(args["blockers"]),
+	}
+}
+
+func stringSliceFromAnyLoose(value any) []string {
+	switch v := value.(type) {
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if text := strings.TrimSpace(item); text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			text, ok := item.(string)
+			if !ok {
+				continue
+			}
+			if text = strings.TrimSpace(text); text != "" {
+				out = append(out, text)
+			}
+		}
+		return out
+	case string:
+		if text := strings.TrimSpace(v); text != "" {
+			return []string{text}
+		}
+	}
+	return nil
+}
+
+func problematicResourcesFromAny(value any) []problematicResource {
+	raw, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]problematicResource, 0, len(raw))
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		res := problematicResource{
+			Kind:      stringFromAny(m["kind"]),
+			Name:      stringFromAny(m["name"]),
+			Namespace: stringFromAny(m["namespace"]),
+			Reason:    stringFromAny(m["reason"]),
+		}
+		if res.Kind == "" && res.Name == "" && res.Namespace == "" && res.Reason == "" {
+			continue
+		}
+		out = append(out, res)
+	}
+	return out
 }
 
 func (l *Loop) emitFinalReportMessage(ctx context.Context, report finalReport) {
@@ -146,9 +213,48 @@ func renderFinalReport(report finalReport) string {
 	if cause := strings.TrimSpace(report.MostLikelyCause); cause != "" {
 		fmt.Fprintf(&b, "\nMost likely cause: %s\n", cause)
 	}
+	appendProblematicResources(&b, report.ProblematicResources)
 	appendBulletList(&b, "Recommended user actions", report.RecommendedUserActions)
 	appendBulletList(&b, "Blockers", report.Blockers)
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func appendProblematicResources(b *strings.Builder, resources []problematicResource) {
+	if len(resources) == 0 {
+		return
+	}
+	b.WriteString("\nProblematic resources:\n")
+	for _, res := range resources {
+		label := resourceLabel(res)
+		if label == "" {
+			label = "resource"
+		}
+		if reason := strings.TrimSpace(res.Reason); reason != "" {
+			fmt.Fprintf(b, "- %s: %s\n", label, reason)
+		} else {
+			fmt.Fprintf(b, "- %s\n", label)
+		}
+	}
+}
+
+func resourceLabel(res problematicResource) string {
+	var b strings.Builder
+	if res.Kind != "" {
+		b.WriteString(res.Kind)
+	}
+	if res.Name != "" {
+		if b.Len() > 0 {
+			b.WriteString("/")
+		}
+		b.WriteString(res.Name)
+	}
+	if res.Namespace != "" {
+		if b.Len() > 0 {
+			b.WriteString(" ")
+		}
+		fmt.Fprintf(&b, "(namespace %s)", res.Namespace)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func appendBulletList(b *strings.Builder, label string, items []string) {
@@ -178,8 +284,8 @@ func (l *Loop) requestNextDirectionsFromModel(report finalReport) {
 	b.WriteString("- kind: \"another_guide\" or \"different_approach\".\n")
 	b.WriteString("- summary: one short user-facing sentence describing what this option will do.\n")
 	b.WriteString("- why: one short sentence describing why it might unblock progress.\n")
-	b.WriteString("- For kind=another_guide: include `resource_family` and `problem_focus` so the runtime can request a refined resource-guide lookup.\n")
-	b.WriteString("- For kind=different_approach: include `instruction`, a short directive describing the alternative diagnostic angle (e.g., switch to logs of a related controller, ask the user for workload kubeconfig).\n")
+	b.WriteString("- For kind=another_guide: include `resource_family` and `problem_focus` so the runtime can resume the phase workflow with that guidance focus; the model must reach guidance_lookup before emitting resource_guide_lookup.\n")
+	b.WriteString("- For kind=different_approach: include `instruction`, a short directive describing the alternative diagnostic angle (e.g., inspect related controller status/events, ask the user for workload kubeconfig).\n")
 	b.WriteString("Keep options distinct. Do not repeat ideas already exhausted in the previous attempts.")
 	l.queueResponseDirective(b.String())
 }

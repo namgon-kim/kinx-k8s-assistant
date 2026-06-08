@@ -102,14 +102,138 @@ func (l *Loop) compactedStateMessage(nextInstruction string) string {
 }
 
 func (l *Loop) priorConversationStateMessage() string {
-	if !l.hasConversationState() {
+	if !l.hasPriorConversationMemory() && !l.hasConversationState() {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("Prior conversation state. Use it only if the new user request is a follow-up; explicit target/scope in the new request wins.\n")
-	l.writeConversationState(&b, false)
+	b.WriteString("Previous conversation context for requirement analysis. Use it only when the new user request is a follow-up; explicit resource, name, namespace, or all-namespaces scope in the new request wins.\n")
+	if l.hasPriorConversationMemory() {
+		l.writePriorConversationMemory(&b)
+	} else {
+		l.writeConversationState(&b, false)
+	}
+	b.WriteString("Follow-up handling: if the new request is a follow-up without naming a new target/scope, default to the previous request_context target and scope and express the new diagnostic angle in requirement_analysis.operational_focus. Do not invent a new Kubernetes resource kind from follow-up wording alone.\n")
 	b.WriteString("Do not repeat previous raw assistant JSON, guide bodies, corrections, or diagnostics unless the user asks for them.")
 	return b.String()
+}
+
+func (l *Loop) hasPriorConversationMemory() bool {
+	return l.lastOriginalQuery != "" ||
+		l.lastRequirementAnalysis != nil ||
+		l.lastRequestContext != nil ||
+		strings.TrimSpace(l.lastDiagnosisSummary) != ""
+}
+
+func (l *Loop) writePriorConversationMemory(b *strings.Builder) {
+	if l.lastOriginalQuery != "" {
+		b.WriteString("previous_original_query: ")
+		b.WriteString(compactPriorString(l.lastOriginalQuery, 1000))
+		b.WriteString("\n")
+	}
+	if l.lastRequirementAnalysis != nil {
+		if raw, err := json.Marshal(compactPriorRequirementAnalysis(l.lastRequirementAnalysis)); err == nil {
+			b.WriteString("previous_requirement_analysis: ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
+	}
+	if l.lastRequestContext != nil {
+		if raw, err := json.Marshal(compactPriorRequestContext(l.lastRequestContext)); err == nil {
+			b.WriteString("previous_request_context: ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
+	}
+	if strings.TrimSpace(l.lastDiagnosisSummary) != "" {
+		if raw, err := json.Marshal(l.lastDiagnosisSummary); err == nil {
+			b.WriteString("previous_diagnosis_summary: ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
+	}
+}
+
+func compactPriorRequirementAnalysis(analysis *requirementAnalysis) map[string]any {
+	if analysis == nil {
+		return nil
+	}
+	out := map[string]any{
+		"request_type": analysis.RequestType,
+		"action":       analysis.Action,
+		"target": map[string]any{
+			"category":    analysis.Target.Category,
+			"name":        analysis.Target.Name,
+			"description": compactPriorString(analysis.Target.Description, 500),
+		},
+		"scope": analysis.Scope,
+	}
+	if len(analysis.Resources) > 0 {
+		limit := len(analysis.Resources)
+		if limit > 3 {
+			limit = 3
+		}
+		out["resource_candidates"] = append([]requirementResource(nil), analysis.Resources[:limit]...)
+	}
+	if analysis.OperationalFocus != nil {
+		focus := map[string]any{
+			"summary":                 compactPriorString(analysis.OperationalFocus.Summary, 500),
+			"relationship_to_primary": analysis.OperationalFocus.RelationshipToPrimary,
+			"changed_from_previous":   analysis.OperationalFocus.ChangedFromPrevious,
+			"reason":                  compactPriorString(analysis.OperationalFocus.Reason, 500),
+			"evidence_needs":          compactPriorStringSlice(analysis.OperationalFocus.EvidenceNeeds, 3, 300),
+		}
+		if len(analysis.OperationalFocus.RelatedResourceHints) > 0 {
+			limit := len(analysis.OperationalFocus.RelatedResourceHints)
+			if limit > 3 {
+				limit = 3
+			}
+			hints := append([]requirementRelatedResource(nil), analysis.OperationalFocus.RelatedResourceHints[:limit]...)
+			for i := range hints {
+				hints[i].Evidence = compactPriorString(hints[i].Evidence, 300)
+			}
+			focus["related_resource_hints"] = hints
+		}
+		out["operational_focus"] = focus
+	}
+	if len(analysis.Evidence) > 0 {
+		out["evidence_needs"] = compactPriorStringSlice(analysis.Evidence, 3, 300)
+	}
+	return out
+}
+
+func compactPriorRequestContext(ctx *requestContext) map[string]any {
+	if ctx == nil {
+		return nil
+	}
+	return map[string]any{
+		"primary_target": ctx.PrimaryTarget,
+		"scope":          ctx.Scope,
+		"resource_class": ctx.ResourceClass,
+	}
+}
+
+func compactPriorStringSlice(values []string, limit int, maxBytes int) []string {
+	if limit <= 0 || len(values) == 0 {
+		return nil
+	}
+	if len(values) < limit {
+		limit = len(values)
+	}
+	out := make([]string, 0, limit)
+	for _, value := range values[:limit] {
+		if text := compactPriorString(value, maxBytes); text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func compactPriorString(value string, maxBytes int) string {
+	value = strings.TrimSpace(value)
+	if value == "" || maxBytes <= 0 || len(value) <= maxBytes {
+		return value
+	}
+	return safeStringHead(value, maxBytes) + " ...[truncated " + contextHash(value) + "]"
 }
 
 func (l *Loop) hasConversationState() bool {
@@ -121,6 +245,50 @@ func (l *Loop) hasConversationState() bool {
 		len(l.injectedGuides) > 0 ||
 		len(l.completedActions) > 0 ||
 		strings.TrimSpace(l.lastAssistantText) != ""
+}
+
+func (l *Loop) compactDiagnosisSummary() string {
+	var b strings.Builder
+	if len(l.completedActions) > 0 {
+		if raw, err := json.Marshal(l.compactedActionSummaries()); err == nil {
+			b.WriteString("completed_procedure_and_clues: ")
+			b.Write(raw)
+			b.WriteString("\n")
+		}
+	}
+	if strings.TrimSpace(l.lastAssistantText) != "" {
+		if raw, err := json.Marshal(compactStateText(l.lastAssistantText)); err == nil {
+			b.WriteString("last_assistant_text: ")
+			b.Write(raw)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func cloneRequirementAnalysis(value *requirementAnalysis) *requirementAnalysis {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	cloned.Resources = append([]requirementResource(nil), value.Resources...)
+	if value.OperationalFocus != nil {
+		focus := *value.OperationalFocus
+		focus.RelatedResourceHints = append([]requirementRelatedResource(nil), value.OperationalFocus.RelatedResourceHints...)
+		focus.EvidenceNeeds = append([]string(nil), value.OperationalFocus.EvidenceNeeds...)
+		cloned.OperationalFocus = &focus
+	}
+	cloned.Evidence = append([]string(nil), value.Evidence...)
+	cloned.Constraints = append([]string(nil), value.Constraints...)
+	cloned.Ambiguities = append([]string(nil), value.Ambiguities...)
+	return &cloned
+}
+
+func cloneRequestContext(value *requestContext) *requestContext {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func (l *Loop) writeConversationState(b *strings.Builder, includeGuideContent bool) {

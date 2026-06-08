@@ -71,10 +71,21 @@ func firstKubectlResourceArg(fields []string, start int) (string, bool) {
 			}
 			continue
 		}
-		resource := strings.Trim(field, ",")
+		resource := kubectlResourceKindFromArg(strings.Trim(field, ","))
 		return resource, resource != ""
 	}
 	return "", false
+}
+
+func kubectlResourceKindFromArg(arg string) string {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return ""
+	}
+	if slash := strings.Index(arg, "/"); slash > 0 {
+		arg = arg[:slash]
+	}
+	return strings.Trim(arg, ",")
 }
 
 func kubectlFlagRequiresValue(flag string) bool {
