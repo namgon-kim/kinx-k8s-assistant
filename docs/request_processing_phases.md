@@ -96,7 +96,7 @@ The model should return a phase plan near the start of the request, after `requi
 
 `phases` is allowed as a backward-compatible field name while the schema is being introduced, but the stable contract should use `phase_steps`. A `phase_step` is the top-level unit of request processing.
 
-`allowed_next` is a closed graph over declared `phase_step` names. Every name in `allowed_next` must appear as a `phase_steps[].name` in the same `phase_plan`. There are no implicit or virtual phase steps: if `guidance_lookup`, `guided_diagnosis`, `response_synthesis`, or `final_report` can be used as a next phase, it must be declared as an explicit `phase_step` first.
+`allowed_next` is a closed graph over declared `phase_step` names. Every name in `allowed_next` must appear as a `phase_steps[].name` in the same `phase_plan`. There are no implicit or virtual phase steps: if `guidance_lookup`, `guided_diagnosis`, `response_synthesis`, or `final_report` can be used as a next phase, it must be declared as an explicit `phase_step` first. Any non-terminal `phase_step` with a later step in the plan must declare at least one `allowed_next`; only terminal steps may leave it empty.
 
 The runtime stores this plan compactly. Each iteration should include only:
 

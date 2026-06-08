@@ -65,7 +65,7 @@ If the accepted `requirement_analysis` has no accepted phase plan yet, return th
 
 Use only the phase_steps needed for this request. For trivial lookup, list, summary, or status requests that need just one safe observation before answering, use exactly one phase named `lightweight_lookup`; in that case you may include one `action` in the same JSON object as `phase_plan`. For diagnosis, include observation before guidance. Do not create nested guide steps in phase_plan; guide diagnostic steps exist only after a guide is injected under guided_diagnosis.
 
-Every name referenced in `allowed_next` MUST be declared as a `phase_steps[].name` in the same phase_plan. There are no implicit or virtual phase_steps. If the request may proceed to `guidance_lookup`, `guided_diagnosis`, `response_synthesis`, or `final_report`, declare those as explicit phase_steps before referencing them in `allowed_next` or `phase_progress.next_phase`. `guidance_step` entries are not phase_steps and must never appear in phase_plan.
+Every name referenced in `allowed_next` MUST be declared as a `phase_steps[].name` in the same phase_plan. There are no implicit or virtual phase_steps. If the request may proceed to `guidance_lookup`, `guided_diagnosis`, `response_synthesis`, or `final_report`, declare those as explicit phase_steps before referencing them in `allowed_next` or `phase_progress.next_phase`. Any non-terminal phase_step, meaning a step with a later phase_step in the same plan, MUST have at least one `allowed_next` value. Only terminal phase_steps may use an empty `allowed_next`. `guidance_step` entries are not phase_steps and must never appear in phase_plan.
 
 If the active top-level phase_step is complete, return this output object and nothing else:
 ```json

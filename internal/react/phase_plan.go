@@ -293,6 +293,9 @@ func phasePlanValid(plan phasePlan) bool {
 		}
 	}
 	for _, step := range plan.PhaseSteps {
+		if phaseStepHasLaterStep(plan.PhaseSteps, step.Index) && len(nonEmptyStrings(step.AllowedNext)) == 0 {
+			return false
+		}
 		for _, next := range step.AllowedNext {
 			nextName := strings.ToLower(strings.TrimSpace(next))
 			if nextName == "" {
@@ -304,6 +307,25 @@ func phasePlanValid(plan phasePlan) bool {
 		}
 	}
 	return foundCurrent
+}
+
+func phaseStepHasLaterStep(steps []phaseStep, index int) bool {
+	for _, step := range steps {
+		if step.Index > index {
+			return true
+		}
+	}
+	return false
+}
+
+func nonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func phaseProgressFromFunctionCall(call gollm.FunctionCall) (phaseProgress, bool) {
