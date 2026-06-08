@@ -194,7 +194,7 @@ Emitted only after an inconclusive `final_report`. The model proposes 1–3 dist
 
 | `kind` | Required fields | Runtime behavior on user pick |
 |---|---|---|
-| `another_guide` | `resource_family`, `problem_focus` | Reset guide step state, run `searchAndInjectResourceGuide(family, query)` and resume. |
+| `another_guide` | `resource_family`, `problem_focus` | Reset guide step state, rewind to the pre-guidance phase, and let the model reach `guidance_lookup` before emitting a new `resource_guide_lookup`. Runtime does not inject guide steps outside a declared `guided_diagnosis` phase. |
 | `different_approach` | `instruction` | Inject the directive as a user message and resume the ReAct loop. |
 | `investigate_resource` | `resource_kind`, `resource_name`, optional `namespace` | Runtime-created option after a conclusive report with `problematic_resources`; starts a new query from requirement_analysis for that resource. |
 
@@ -283,6 +283,7 @@ New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirec
 
 - `phaseStepState` is non-nil after the model-declared `phase_plan` is accepted and remains active until `final_report`, `startQuery`, or `clearConversationState`.
 - `guideStepState` is non-nil only while the active `phase_step` is `guided_diagnosis`; it is cleared when that parent phase completes, when a different guide is selected, or on `startQuery`/`clearConversationState`.
+- `another_guide` never bypasses `phase_step`: it clears prior guide progress and resumes the top-level phase workflow so that a new guide can be requested only through `guidance_lookup` and consumed only under `guided_diagnosis`.
 - `finalReportRequested` is set when `requestFinalReportFromModel` queues its instruction. It prevents duplicate instruction text from being re-appended on every dispatch. It is cleared on `applyDirectionOption`, `startQuery`, `clearConversationState`, and at every `injectResourceGuide*` entry.
 - `pendingDirectionPrompt` is non-nil only while in `StateWaitingDirectionChoice`. The user's `Choice` index is mapped back to a concrete `nextDirectionOption` (or the synthetic finalize / free-input rows) using `FreeInputIdx` and `FinalizeIdx`.
 - `phase_progress.phase_completed` is the model's self-report for the top-level phase. It is ignored when the corresponding observation is blocked, declined, failed, errored, or structurally unrelated to the active phase goal.

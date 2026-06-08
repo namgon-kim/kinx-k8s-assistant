@@ -668,6 +668,10 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 	deferredProgressText := strings.TrimSpace(streamedText)
 
+	if handled := l.rejectInvalidShimStructuredCalls(functionCalls); handled {
+		return nil
+	}
+
 	if handled := l.requireRequirementAnalysisBeforeAction(functionCalls); handled {
 		return nil
 	}
@@ -691,10 +695,6 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	var phaseProgressHandled bool
 	functionCalls, phaseProgressHandled = l.consumePhaseProgress(functionCalls)
 	if phaseProgressHandled {
-		return nil
-	}
-
-	if handled := l.rejectInvalidShimStructuredCalls(functionCalls); handled {
 		return nil
 	}
 

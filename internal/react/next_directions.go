@@ -267,22 +267,7 @@ func (l *Loop) applyDirectionOption(ctx context.Context, opt nextDirectionOption
 
 	switch opt.Kind {
 	case "another_guide":
-		// Reset guide step state and trigger a refined resource-guide lookup.
-		l.guideStepState = nil
-		l.resourceGuideInjected = false
-		family := strings.TrimSpace(opt.ResourceFamily)
-		if family == "" && l.requestContext != nil {
-			family = l.requestContext.PrimaryTarget.Resource
-		}
-		query := strings.Join([]string{
-			l.originalQuery,
-			"resource family: " + family,
-			"problem focus: " + opt.ProblemFocus,
-			"reason for refinement: user selected this continuation after the previous guide was exhausted",
-			"summary: " + opt.Summary,
-		}, "\n")
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("선택한 방향으로 가이드를 다시 검색합니다: %s", opt.Summary))
-		l.searchAndInjectResourceGuide(ctx, family, query)
+		l.continueWithGuideFocus(opt)
 		return
 	case "different_approach":
 		if continuingAfterFinalReport {
@@ -312,24 +297,28 @@ func (l *Loop) applyDirectionOption(ctx context.Context, opt nextDirectionOption
 }
 
 func (l *Loop) continueAfterFinalReport(opt nextDirectionOption) {
+	l.continueWithGuideFocus(opt)
+}
+
+func (l *Loop) continueWithGuideFocus(opt nextDirectionOption) {
 	l.guideStepState = nil
 	l.resourceGuideInjected = false
 	l.rewindPhaseBeforeGuidance()
 
 	var b strings.Builder
-	b.WriteString("The user chose to continue after the final_report. Resume from the appropriate diagnostic phase for this continuation. Guidance lookup is allowed again when the accepted phase plan reaches guidance_lookup and runtime discovery confirms CRD eligibility.\n")
+	b.WriteString("The user chose to continue the diagnosis. Resume from the appropriate diagnostic phase for this continuation. Guidance lookup is allowed when the accepted phase plan reaches guidance_lookup and runtime discovery confirms CRD eligibility.\n")
 	fmt.Fprintf(&b, "continuation_summary: %s\n", opt.Summary)
 	if opt.Why != "" {
 		fmt.Fprintf(&b, "rationale: %s\n", opt.Why)
 	}
+	if opt.ResourceFamily != "" {
+		fmt.Fprintf(&b, "requested_resource_family_focus: %s\n", opt.ResourceFamily)
+	}
+	if opt.ProblemFocus != "" {
+		fmt.Fprintf(&b, "requested_problem_focus: %s\n", opt.ProblemFocus)
+	}
 	if opt.Kind == "another_guide" {
-		if opt.ResourceFamily != "" {
-			fmt.Fprintf(&b, "requested_resource_family_focus: %s\n", opt.ResourceFamily)
-		}
-		if opt.ProblemFocus != "" {
-			fmt.Fprintf(&b, "requested_problem_focus: %s\n", opt.ProblemFocus)
-		}
-		b.WriteString("Use the requested focus as a continuation angle. If guidance is useful and the active phase allows it, emit resource_guide_lookup.\n")
+		b.WriteString("Use the requested focus as a continuation angle. Do not inject or assume guide steps directly; if guidance is useful, reach the declared guidance_lookup phase and emit resource_guide_lookup there. guidance_step entries are valid only inside a declared guided_diagnosis phase after a guide result is observed.\n")
 	} else if opt.Instruction != "" {
 		fmt.Fprintf(&b, "directive: %s\n", opt.Instruction)
 	}

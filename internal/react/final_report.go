@@ -146,7 +146,11 @@ func stringSliceFromAnyLoose(value any) []string {
 	case []any:
 		out := make([]string, 0, len(v))
 		for _, item := range v {
-			if text := strings.TrimSpace(fmt.Sprintf("%v", item)); text != "" {
+			text, ok := item.(string)
+			if !ok {
+				continue
+			}
+			if text = strings.TrimSpace(text); text != "" {
 				out = append(out, text)
 			}
 		}
@@ -168,9 +172,6 @@ func problematicResourcesFromAny(value any) []problematicResource {
 	for _, item := range raw {
 		m, ok := item.(map[string]any)
 		if !ok {
-			if text := strings.TrimSpace(fmt.Sprintf("%v", item)); text != "" {
-				out = append(out, problematicResource{Reason: text})
-			}
 			continue
 		}
 		res := problematicResource{
@@ -283,7 +284,7 @@ func (l *Loop) requestNextDirectionsFromModel(report finalReport) {
 	b.WriteString("- kind: \"another_guide\" or \"different_approach\".\n")
 	b.WriteString("- summary: one short user-facing sentence describing what this option will do.\n")
 	b.WriteString("- why: one short sentence describing why it might unblock progress.\n")
-	b.WriteString("- For kind=another_guide: include `resource_family` and `problem_focus` so the runtime can request a refined resource-guide lookup when the user selects it.\n")
+	b.WriteString("- For kind=another_guide: include `resource_family` and `problem_focus` so the runtime can resume the phase workflow with that guidance focus; the model must reach guidance_lookup before emitting resource_guide_lookup.\n")
 	b.WriteString("- For kind=different_approach: include `instruction`, a short directive describing the alternative diagnostic angle (e.g., inspect related controller status/events, ask the user for workload kubeconfig).\n")
 	b.WriteString("Keep options distinct. Do not repeat ideas already exhausted in the previous attempts.")
 	l.queueResponseDirective(b.String())

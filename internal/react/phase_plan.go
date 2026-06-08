@@ -21,6 +21,7 @@ const lightweightLookupPhase = "lightweight_lookup"
 
 func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
 	var remaining []gollm.FunctionCall
+	var accepted *phasePlan
 	for _, call := range calls {
 		if call.Name != internalPhasePlanCall {
 			remaining = append(remaining, call)
@@ -31,7 +32,7 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 		}
 		plan, ok := phasePlanFromFunctionCall(call)
 		if !ok {
-			message := "Phase plan was invalid. Return only one corrected phase_plan object before choosing any action. Include request_goal, current_phase_index, and ordered phase_steps with index, name, goal, completion_condition, and allowed_next."
+			message := "Phase plan was invalid. Return only one corrected phase_plan object before choosing any action. Include request_goal, current_phase_index, and ordered phase_steps with index, name, goal, completion_condition, and allowed_next. Every allowed_next value must name a declared phase_steps[].name; do not reference implicit phases such as final_report or guided_diagnosis unless they are listed as phase_steps."
 			if !l.appendCorrectionWithCompaction("invalid_phase_plan", message) {
 				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 phase plan 오류로 루프를 중단했습니다:\n"+message)
 				l.pendingCalls = nil
@@ -44,8 +45,31 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 			l.state = StateRunning
 			return nil, true
 		}
+		accepted = &plan
 		l.phaseStepState = newPhaseStepState(plan)
 		continue
+	}
+	if accepted != nil {
+		if len(remaining) == 0 {
+			l.currIteration++
+			l.state = StateRunning
+			return nil, true
+		}
+		if !phasePlanAllowsTrailingCalls(*accepted, remaining) {
+			message := "Phase plan was accepted, but the same response also included additional structured output. Return only the phase_plan object first, except for a single-step lightweight_lookup phase where exactly one action may be included with the phase_plan."
+			if !l.appendCorrectionWithCompaction("phase_plan_unexpected_trailing_calls", message) {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 phase plan 동시 출력 오류로 루프를 중단했습니다:\n"+message)
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return nil, true
+			}
+			l.phaseStepState = nil
+			l.pendingCalls = nil
+			l.currIteration++
+			l.state = StateRunning
+			return nil, true
+		}
 	}
 	return remaining, false
 }
@@ -131,7 +155,7 @@ func (l *Loop) requirePhasePlanBeforeAction(calls []gollm.FunctionCall) bool {
 			return false
 		}
 	}
-	message := "After requirement_analysis is accepted, return only one phase_plan object before choosing any action, resource_guide_lookup, final_report, or answer. The plan must define ordered phase_steps, each with a goal and completion_condition."
+	message := "After requirement_analysis is accepted, return only one phase_plan object before choosing any action, resource_guide_lookup, final_report, or answer. The plan must define ordered phase_steps, each with a goal, completion_condition, and allowed_next values that reference only declared phase_steps[].name entries."
 	if !l.appendCorrectionWithCompaction("missing_phase_plan", message) {
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 phase plan 누락으로 루프를 중단했습니다:\n"+message)
 		l.pendingCalls = nil
@@ -197,6 +221,25 @@ func phasePlanFromFunctionCall(call gollm.FunctionCall) (phasePlan, bool) {
 		PhaseSteps:        steps,
 	}
 	return plan, phasePlanValid(plan)
+}
+
+func phasePlanAllowsTrailingCalls(plan phasePlan, calls []gollm.FunctionCall) bool {
+	if len(calls) != 1 || !singleLightweightPhase(plan) {
+		return false
+	}
+	return !isInternalReactCall(calls[0].Name)
+}
+
+func singleLightweightPhase(plan phasePlan) bool {
+	if len(plan.PhaseSteps) != 1 {
+		return false
+	}
+	step := plan.PhaseSteps[0]
+	return strings.EqualFold(strings.TrimSpace(step.Name), lightweightLookupPhase)
+}
+
+func isInternalReactCall(name string) bool {
+	return strings.HasPrefix(strings.TrimSpace(name), "__")
 }
 
 func phaseStepsFromValue(value any) ([]phaseStep, bool) {
@@ -301,8 +344,16 @@ func (s *phaseStepState) acceptProgress(progress phaseProgress) bool {
 			delete(s.Completed, progress.PhaseCompleted)
 			return false
 		}
-	} else if next := s.firstIncompleteAfter(progress.PhaseCompleted); next != 0 {
-		s.CurrentPhaseIndex = next
+	} else if len(current.AllowedNext) > 0 {
+		if next := s.firstAllowedNextIndex(current); next != 0 {
+			s.CurrentPhaseIndex = next
+		} else {
+			delete(s.Completed, progress.PhaseCompleted)
+			return false
+		}
+	} else if s.firstIncompleteAfter(progress.PhaseCompleted) != 0 {
+		delete(s.Completed, progress.PhaseCompleted)
+		return false
 	}
 	return true
 }
@@ -352,6 +403,18 @@ func (s *phaseStepState) allowedNextIndex(current phaseStep, name string) int {
 	for _, step := range s.PhaseSteps {
 		if strings.ToLower(strings.TrimSpace(step.Name)) == name && !s.Completed[step.Index] {
 			return step.Index
+		}
+	}
+	return 0
+}
+
+func (s *phaseStepState) firstAllowedNextIndex(current phaseStep) int {
+	if s == nil {
+		return 0
+	}
+	for _, candidate := range current.AllowedNext {
+		if next := s.allowedNextIndex(current, candidate); next != 0 {
+			return next
 		}
 	}
 	return 0
@@ -426,14 +489,16 @@ func (l *Loop) requestGuidedDiagnosisPhaseProgress() {
 	l.queueResponseDirective(b.String())
 }
 
-func (l *Loop) enterGuidedDiagnosisPhase() {
+func (l *Loop) enterGuidedDiagnosisPhase() bool {
 	if l.phaseStepState == nil {
-		return
+		return false
 	}
 	if index := l.phaseStepState.indexByName("guided_diagnosis"); index != 0 {
 		l.phaseStepState.CurrentPhaseIndex = index
 		delete(l.phaseStepState.Completed, index)
+		return true
 	}
+	return false
 }
 
 func (l *Loop) rewindPhaseBeforeGuidance() {

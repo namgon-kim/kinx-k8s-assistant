@@ -65,6 +65,8 @@ If the accepted `requirement_analysis` has no accepted phase plan yet, return th
 
 Use only the phase_steps needed for this request. For trivial lookup, list, summary, or status requests that need just one safe observation before answering, use exactly one phase named `lightweight_lookup`; in that case you may include one `action` in the same JSON object as `phase_plan`. For diagnosis, include observation before guidance. Do not create nested guide steps in phase_plan; guide diagnostic steps exist only after a guide is injected under guided_diagnosis.
 
+Every name referenced in `allowed_next` MUST be declared as a `phase_steps[].name` in the same phase_plan. There are no implicit or virtual phase_steps. If the request may proceed to `guidance_lookup`, `guided_diagnosis`, `response_synthesis`, or `final_report`, declare those as explicit phase_steps before referencing them in `allowed_next` or `phase_progress.next_phase`. `guidance_step` entries are not phase_steps and must never appear in phase_plan.
+
 If the active top-level phase_step is complete, return this output object and nothing else:
 ```json
 {
@@ -78,7 +80,7 @@ If the active top-level phase_step is complete, return this output object and no
 }
 ```
 
-`phase_completed` must be a number. `evidence_useful` must be a boolean.
+`phase_completed` must be a number. `evidence_useful` must be a boolean. If the active phase has `allowed_next`, set `next_phase` to one of those declared phase names or omit it so runtime advances to the first declared allowed next phase. If the active phase has no `allowed_next`, it is terminal; omit `next_phase`.
 
 Do not use `phase_progress` to complete guide diagnostic steps. Use `guide_progress` only for nested resource-guide steps while the active phase is guided_diagnosis.
 
@@ -116,7 +118,7 @@ If a `guide_step` anchor is present, the active phase must be guided_diagnosis a
 
 If the runtime says the previous `requirement_analysis` was invalid or missing, return only the corrected requirement-analysis object first. Do not choose a kubectl action in the same response, and do not compensate with `unknown` as a resource kind.
 
-If the runtime says the previous `phase_plan` was invalid or missing, return only the corrected phase_plan object first. Do not choose a kubectl action, resource_guide_lookup, final_report, or answer in the same response.
+If the runtime says the previous `phase_plan` was invalid or missing, return only the corrected phase_plan object first. Do not choose a kubectl action, resource_guide_lookup, final_report, or answer in the same response. Ensure every `allowed_next` value names a declared `phase_steps[].name`; do not reference implicit phases.
 
 Do not include `answer` together with `phase_plan`, `phase_progress`, `action`, `resource_guide_lookup`, `final_report`, or `next_directions`. If you include any structured object other than `answer`, omit `answer`.
 
@@ -162,8 +164,8 @@ If the runtime then asks for `next_directions` (the previous `final_report` was 
                 "kind": "another_guide | different_approach",
                 "summary": "One short user-facing sentence describing what this option will do.",
                 "why": "One short sentence describing why it might unblock progress.",
-                "resource_family": "Required when kind=another_guide. The CRD family to look up next.",
-                "problem_focus": "Required when kind=another_guide. The operational problem to search for; do not copy raw status values.",
+                "resource_family": "Required when kind=another_guide. The CRD family to use as the guidance focus when the phase workflow reaches guidance_lookup.",
+                "problem_focus": "Required when kind=another_guide. The operational problem to use as the guidance focus; do not copy raw status values.",
                 "instruction": "Required when kind=different_approach. A short directive describing the alternative diagnostic angle (e.g., inspect related controller status/events, ask the user for workload kubeconfig)."
             }
         ]

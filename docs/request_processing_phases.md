@@ -96,6 +96,8 @@ The model should return a phase plan near the start of the request, after `requi
 
 `phases` is allowed as a backward-compatible field name while the schema is being introduced, but the stable contract should use `phase_steps`. A `phase_step` is the top-level unit of request processing.
 
+`allowed_next` is a closed graph over declared `phase_step` names. Every name in `allowed_next` must appear as a `phase_steps[].name` in the same `phase_plan`. There are no implicit or virtual phase steps: if `guidance_lookup`, `guided_diagnosis`, `response_synthesis`, or `final_report` can be used as a next phase, it must be declared as an explicit `phase_step` first.
+
 The runtime stores this plan compactly. Each iteration should include only:
 
 - request goal;
@@ -117,6 +119,8 @@ The model must report phase completion explicitly, for example:
   }
 }
 ```
+
+If the active phase has `allowed_next`, `phase_progress.next_phase` must be one of those declared phase names. If `next_phase` is omitted, runtime advances to the first declared allowed next phase. Runtime must not fall through to an undeclared later phase. If the active phase has no `allowed_next`, it is terminal and `next_phase` should be omitted.
 
 Runtime should not infer a phase as complete just because one command ran. It may reject or ignore completion for blocked, declined, malformed, or internal-error observations.
 
@@ -143,6 +147,8 @@ request
 Rules:
 
 - A `guidance_step` must not exist before a guide is injected.
+- A `guidance_step` is not a `phase_step` and must not be listed in `phase_plan` or `allowed_next`.
+- `guided_diagnosis` is the parent `phase_step` that owns injected `guidance_step` entries.
 - `guide_progress` must not be used to complete ordinary `phase_step` entries.
 - `phase_progress` completes top-level `phase_step` entries.
 - `guide_progress` completes nested `guidance_step` entries within `guided_diagnosis`.

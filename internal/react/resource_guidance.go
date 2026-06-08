@@ -124,14 +124,15 @@ func (l *Loop) phaseAllowsResourceGuideLookup() bool {
 }
 
 func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query string) {
-	l.markResourceGuideQuery(query)
 	client, err := guidance.NewResourceGuideClient(l.cfg)
 	if err != nil {
 		klog.Warningf("resource guidance client init failed: %v", err)
+		l.markResourceGuideQuery(query)
 		l.injectResourceGuideUnavailable(resource, "client_init_failed")
 		return
 	}
 	if client.KnowledgeProvider() != guidance.KnowledgeProviderQdrant {
+		l.markResourceGuideQuery(query)
 		l.injectResourceGuideUnavailable(resource, "provider="+string(client.KnowledgeProvider()))
 		return
 	}
@@ -140,6 +141,7 @@ func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query
 	cancel()
 	if err != nil {
 		klog.Warningf("resource guidance search failed: %v", err)
+		l.markResourceGuideQuery(query)
 		l.injectResourceGuideUnavailable(resource, "search_failed")
 		return
 	}
@@ -149,10 +151,13 @@ func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query
 	}
 	found = l.filterResourceGuidesForRequest(found, query)
 	if originalCaseCount > 0 && (found == nil || len(found.Cases) == 0) {
+		l.markResourceGuideQuery(query)
 		l.injectResourceGuideUnavailable(resource, "filtered_no_applicable_guides")
 		return
 	}
-	l.injectResourceGuideAttempt(resource, found)
+	if l.injectResourceGuideAttempt(resource, found) {
+		l.markResourceGuideQuery(query)
+	}
 }
 
 func (l *Loop) resourceGuideQueryAlreadyUsed(query string) bool {
@@ -170,15 +175,30 @@ func (l *Loop) markResourceGuideQuery(query string) {
 	l.resourceGuideQueries[query] = struct{}{}
 }
 
-func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.GuideSearchResult) {
-	l.resourceGuideInjected = true
+func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.GuideSearchResult) bool {
 	l.guideStepState = l.buildGuideStepState(found)
 	l.finalReportRequested = false
 	l.guidedPhaseProgressRequested = false
 	l.pendingResponseDirective = ""
 	if l.guideStepState != nil {
-		l.enterGuidedDiagnosisPhase()
+		if !l.enterGuidedDiagnosisPhase() {
+			l.guideStepState = nil
+			l.phaseStepState = nil
+			message := "A resource guide was found, but the accepted phase_plan has no guided_diagnosis phase_step. Return one corrected phase_plan that declares guidance_lookup, guided_diagnosis, and the final response phase as explicit phase_steps before using guide steps. guidance_step entries can run only inside a declared guided_diagnosis phase_step."
+			if !l.appendCorrectionWithCompaction("guided_diagnosis_phase_missing", message) {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "guided_diagnosis phase 누락 오류가 반복되어 진단을 중단합니다:\n"+message)
+				l.pendingCalls = nil
+				l.currIteration = 0
+				l.state = StateDone
+				return false
+			}
+			l.pendingCalls = nil
+			l.currIteration++
+			l.state = StateRunning
+			return false
+		}
 	}
+	l.resourceGuideInjected = true
 	includeClusterAPI := guideResultImpliesClusterAPI(found)
 	l.promptOptions = l.newPromptOptions(l.requestIntent, true, includeClusterAPI)
 	if l.shouldCompactForStateRewrite() {
@@ -189,7 +209,7 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			l.pendingCalls = nil
 			l.state = StateDone
-			return
+			return true
 		}
 		l.currChatContent = []any{l.compactedStateMessage("Use the following guide context as decision support, then choose the next safest step.")}
 		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
@@ -200,7 +220,7 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			l.pendingCalls = nil
 			l.state = StateDone
-			return
+			return true
 		}
 		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
 		klog.Infof("resource guide injected for CRD %s without context compact", resource)
@@ -208,6 +228,7 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 	l.pendingCalls = nil
 	l.currIteration++
 	l.state = StateRunning
+	return true
 }
 
 func (l *Loop) injectResourceGuideUnavailable(resource, reason string) {
