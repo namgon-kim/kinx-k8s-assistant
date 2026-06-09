@@ -349,14 +349,13 @@ func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 	if result.Validation != nil && !result.Validation.Valid {
 		b.WriteString("- 주의: 일부 runbook 명령은 대상 정보가 부족해 자동 실행 후보에서 제외했습니다.\n")
 	}
-	showCommands := result.Validation == nil || result.Validation.Valid
 
 	steps := executableIncidentSummarySteps(result.Plan.Steps, 5)
 	b.WriteString("\n**권장 단계**\n")
 	for i, step := range steps {
 		b.WriteString(fmt.Sprintf("%d. %s", i+1, step.Description))
-		if showCommands && step.RenderedCommand != "" && !step.RequiresConfirmation {
-			b.WriteString(fmt.Sprintf(" `%s`", step.RenderedCommand))
+		if cmd, ok := incidentSummaryStepCommand(step, result.Plan.Target); ok {
+			b.WriteString(fmt.Sprintf(" `%s`", cmd))
 		}
 		b.WriteString("\n")
 	}
@@ -365,8 +364,8 @@ func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 		b.WriteString("\n**검증**\n")
 		for _, step := range verifySteps {
 			b.WriteString(fmt.Sprintf("- %s", step.Description))
-			if showCommands && step.RenderedCommand != "" {
-				b.WriteString(fmt.Sprintf(" `%s`", step.RenderedCommand))
+			if cmd, ok := incidentSummaryStepCommand(step, result.Plan.Target); ok {
+				b.WriteString(fmt.Sprintf(" `%s`", cmd))
 			}
 			b.WriteString("\n")
 		}
@@ -377,16 +376,114 @@ func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 func executableIncidentSummarySteps(steps []guidance.PlanStep, limit int) []guidance.PlanStep {
 	var result []guidance.PlanStep
 	for _, step := range steps {
-		cmd := strings.TrimSpace(step.RenderedCommand)
-		if strings.Contains(cmd, "{{") || strings.Contains(cmd, " / ") {
-			continue
-		}
 		result = append(result, step)
 		if len(result) >= limit {
 			return result
 		}
 	}
 	return result
+}
+
+func incidentSummaryStepCommand(step guidance.PlanStep, target diagnostic.KubernetesTarget) (string, bool) {
+	cmd := strings.TrimSpace(step.RenderedCommand)
+	if cmd == "" || step.RequiresConfirmation || strings.Contains(cmd, "{{") || strings.Contains(cmd, " / ") {
+		return "", false
+	}
+	if !incidentRenderedCommandComplete(cmd) {
+		return "", false
+	}
+	if !incidentStepTemplateValuesAvailable(step, target) {
+		return "", false
+	}
+	return cmd, true
+}
+
+func incidentRenderedCommandComplete(cmd string) bool {
+	fields := strings.Fields(cmd)
+	for i, field := range fields {
+		switch {
+		case field == "-n" || field == "--namespace":
+			if i+1 >= len(fields) || strings.HasPrefix(fields[i+1], "-") {
+				return false
+			}
+		case strings.HasPrefix(field, "--namespace="):
+			if strings.TrimSpace(strings.TrimPrefix(field, "--namespace=")) == "" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func incidentStepTemplateValuesAvailable(step guidance.PlanStep, target diagnostic.KubernetesTarget) bool {
+	if strings.TrimSpace(step.CommandTemplate) == "" {
+		return true
+	}
+	for _, name := range incidentTemplatePlaceholders(step.CommandTemplate) {
+		if incidentTemplateValue(name, step, target) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func incidentTemplatePlaceholders(tmpl string) []string {
+	seen := map[string]struct{}{}
+	var names []string
+	for {
+		start := strings.Index(tmpl, "{{")
+		if start < 0 {
+			return names
+		}
+		tmpl = tmpl[start+2:]
+		end := strings.Index(tmpl, "}}")
+		if end < 0 {
+			return names
+		}
+		name := strings.TrimSpace(tmpl[:end])
+		if name != "" {
+			if _, ok := seen[name]; !ok {
+				seen[name] = struct{}{}
+				names = append(names, name)
+			}
+		}
+		tmpl = tmpl[end+2:]
+	}
+}
+
+func incidentTemplateValue(name string, step guidance.PlanStep, target diagnostic.KubernetesTarget) string {
+	if step.Variables != nil {
+		if value := strings.TrimSpace(step.Variables[name]); value != "" {
+			return value
+		}
+	}
+	switch name {
+	case "cluster":
+		return strings.TrimSpace(target.Cluster)
+	case "context":
+		return strings.TrimSpace(target.Context)
+	case "namespace":
+		return strings.TrimSpace(target.Namespace)
+	case "kind":
+		return strings.TrimSpace(target.Kind)
+	case "name":
+		return strings.TrimSpace(target.Name)
+	case "pod_name":
+		if value := strings.TrimSpace(target.PodName); value != "" {
+			return value
+		}
+		return strings.TrimSpace(target.Name)
+	case "container", "container_name":
+		return strings.TrimSpace(target.Container)
+	case "owner_kind":
+		return strings.TrimSpace(target.OwnerKind)
+	case "owner_name":
+		return strings.TrimSpace(target.OwnerName)
+	case "node_name":
+		return ""
+	default:
+		return ""
+	}
 }
 
 func summarizeDetectionTypes(types []diagnostic.DetectionType) string {

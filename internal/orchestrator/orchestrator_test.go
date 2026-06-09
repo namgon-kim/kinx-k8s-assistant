@@ -6,6 +6,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/diagnostic"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/guidance"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react"
 )
 
@@ -239,6 +241,47 @@ func TestExtractTargetDoesNotDefaultToPod(t *testing.T) {
 	unknown := extractTarget("the workload is unhealthy")
 	if unknown.Kind != "" || unknown.Name != "" || unknown.PodName != "" {
 		t.Fatalf("unidentified target should stay empty, got %#v", unknown)
+	}
+}
+
+func TestIncidentSummaryStepCommandUsesStepLevelSafety(t *testing.T) {
+	target := diagnostic.KubernetesTarget{
+		Namespace: "prod",
+		Kind:      "pod",
+		Name:      "app",
+	}
+
+	if cmd, ok := incidentSummaryStepCommand(guidance.PlanStep{
+		CommandTemplate: "kubectl describe {{kind}} {{name}} -n {{namespace}}",
+		RenderedCommand: "kubectl describe pod app -n prod",
+	}, target); !ok || cmd != "kubectl describe pod app -n prod" {
+		t.Fatalf("valid rendered command should be shown, got ok=%v cmd=%q", ok, cmd)
+	}
+
+	if _, ok := incidentSummaryStepCommand(guidance.PlanStep{
+		CommandTemplate: "kubectl describe {{kind}} {{name}} -n {{namespace}}",
+		RenderedCommand: "kubectl describe pod app -n",
+	}, diagnostic.KubernetesTarget{Kind: "pod", Name: "app"}); ok {
+		t.Fatal("missing namespace value should hide only the command text")
+	}
+
+	if _, ok := incidentSummaryStepCommand(guidance.PlanStep{
+		RenderedCommand: "kubectl describe pod app -n",
+	}, target); ok {
+		t.Fatal("raw rendered command with namespace flag missing a value should be hidden")
+	}
+
+	if cmd, ok := incidentSummaryStepCommand(guidance.PlanStep{
+		RenderedCommand: "kubectl describe pod app-n",
+	}, target); !ok || cmd != "kubectl describe pod app-n" {
+		t.Fatalf("resource names ending in -n should not be filtered, got ok=%v cmd=%q", ok, cmd)
+	}
+
+	if _, ok := incidentSummaryStepCommand(guidance.PlanStep{
+		RenderedCommand:      "kubectl delete pod app -n prod",
+		RequiresConfirmation: true,
+	}, target); ok {
+		t.Fatal("confirmation-required command should not be shown as a copyable summary command")
 	}
 }
 

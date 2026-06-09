@@ -82,6 +82,75 @@ func TestAnalyzeToolCallsAllowsKubectlReadOnlyWithGlobalFlagsBeforeVerb(t *testi
 	}
 }
 
+func TestKubectlVerbAndIndexFromFieldsHandlesPreVerbFlagsConservatively(t *testing.T) {
+	tests := []struct {
+		name      string
+		fields    []string
+		wantVerb  string
+		wantOK    bool
+		wantIndex int
+	}{
+		{
+			name:      "global namespace before verb",
+			fields:    []string{"kubectl", "-n", "prod", "get", "pods"},
+			wantVerb:  "get",
+			wantOK:    true,
+			wantIndex: 3,
+		},
+		{
+			name:      "global context before verb",
+			fields:    []string{"kubectl", "--context", "prod", "describe", "pod", "app"},
+			wantVerb:  "describe",
+			wantOK:    true,
+			wantIndex: 3,
+		},
+		{
+			name:      "global flag with equals before verb",
+			fields:    []string{"kubectl", "--request-timeout=5s", "get", "pods"},
+			wantVerb:  "get",
+			wantOK:    true,
+			wantIndex: 2,
+		},
+		{
+			name:      "boolean global flag before verb",
+			fields:    []string{"kubectl", "--insecure-skip-tls-verify", "get", "pods"},
+			wantVerb:  "get",
+			wantOK:    true,
+			wantIndex: 2,
+		},
+		{
+			name:   "command output flag before verb is unsupported",
+			fields: []string{"kubectl", "-o", "json", "get", "pods"},
+			wantOK: false,
+		},
+		{
+			name:   "unknown flag before verb is unsupported",
+			fields: []string{"kubectl", "--unknown", "value", "get", "pods"},
+			wantOK: false,
+		},
+		{
+			name:   "global flag missing value is unsupported",
+			fields: []string{"kubectl", "--namespace"},
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotVerb, gotIndex, gotOK := kubectlVerbAndIndexFromFields(tt.fields, 0)
+			if gotOK != tt.wantOK {
+				t.Fatalf("ok = %v, want %v (verb=%q index=%d)", gotOK, tt.wantOK, gotVerb, gotIndex)
+			}
+			if !tt.wantOK {
+				return
+			}
+			if gotVerb != tt.wantVerb || gotIndex != tt.wantIndex {
+				t.Fatalf("verb/index = %q/%d, want %q/%d", gotVerb, gotIndex, tt.wantVerb, tt.wantIndex)
+			}
+		})
+	}
+}
+
 func TestAnalyzeToolCallsBlocksKubectlMutationWithGlobalFlagsBeforeVerb(t *testing.T) {
 	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
 	if err != nil {
