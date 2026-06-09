@@ -633,6 +633,10 @@ func (l *Loop) runIteration(ctx context.Context) error {
 
 	if len(functionCalls) == 0 {
 		if strings.TrimSpace(streamedText) != "" {
+			// Native text fallback intentionally recovers only the minimum
+			// planning gates. Full structured recovery remains owned by native
+			// function calling or shim parsing so runtime-internal calls do not
+			// silently diverge between execution modes.
 			if parsed, err := parseReActResponse(streamedText); err == nil && l.requirementAnalysis == nil && parsed.RequirementAnalysis != nil {
 				functionCalls = []gollm.FunctionCall{{
 					Name:      internalRequirementAnalysisCall,
@@ -1706,13 +1710,9 @@ func (l *Loop) recordAction(call PendingCall, result map[string]any) {
 	}
 	if guideProgressObservationUseful(result) && l.guideProgressAllowedForCurrentPhase() {
 		if step, ok := guideStepCompletedFromFunctionCall(call.FunctionCall); ok {
-			if l.markGuideStepCompleted(step) {
-				l.requestPostGuideCompletionDirective()
-			}
+			l.markGuideStepCompleted(step)
 		} else if step, ok := l.inferGuideStepCompletedFromFunctionCall(call.FunctionCall); ok {
-			if l.markGuideStepCompleted(step) {
-				l.requestPostGuideCompletionDirective()
-			}
+			l.markGuideStepCompleted(step)
 		}
 	}
 }
@@ -1749,9 +1749,7 @@ func (l *Loop) consumeGuideProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 			l.state = StateRunning
 			return remaining, true
 		}
-		if l.markGuideStepCompleted(step) {
-			l.requestPostGuideCompletionDirective()
-		}
+		completedAll := l.markGuideStepCompleted(step)
 		l.currChatContent = append(l.currChatContent, gollm.FunctionCallResult{
 			ID:   call.ID,
 			Name: call.Name,
@@ -1760,6 +1758,9 @@ func (l *Loop) consumeGuideProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 				"step_completed": step,
 			},
 		})
+		if completedAll {
+			l.requestPostGuideCompletionDirective()
+		}
 	}
 	if handled && len(remaining) == 0 {
 		l.currIteration++

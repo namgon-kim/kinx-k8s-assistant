@@ -150,6 +150,8 @@ flowchart TD
 | `/lang` | 출력 언어 조회/변경 |
 | `/readonly` | read-only 모드 조회/변경 |
 | `/save` | config 저장 |
+| `/clear`, `/reset` | active agent와 orchestrator conversation/guidance 상태 초기화 |
+| `/exit`, `/quit` | process 종료 |
 
 agent invalidation이 필요한 변경:
 
