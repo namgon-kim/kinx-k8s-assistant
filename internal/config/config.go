@@ -177,7 +177,7 @@ func normalizeLangConfig(cfg *Config) {
 	case "":
 		cfg.Lang.Language = "English"
 	default:
-		cfg.Lang.Language = strings.TrimSpace(cfg.Lang.Language)
+		cfg.Lang.Language = "English"
 	}
 }
 

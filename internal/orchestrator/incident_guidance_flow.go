@@ -349,12 +349,13 @@ func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 	if result.Validation != nil && !result.Validation.Valid {
 		b.WriteString("- 주의: 일부 runbook 명령은 대상 정보가 부족해 자동 실행 후보에서 제외했습니다.\n")
 	}
+	showCommands := result.Validation == nil || result.Validation.Valid
 
 	steps := executableIncidentSummarySteps(result.Plan.Steps, 5)
 	b.WriteString("\n**권장 단계**\n")
 	for i, step := range steps {
 		b.WriteString(fmt.Sprintf("%d. %s", i+1, step.Description))
-		if step.RenderedCommand != "" && !step.RequiresConfirmation {
+		if showCommands && step.RenderedCommand != "" && !step.RequiresConfirmation {
 			b.WriteString(fmt.Sprintf(" `%s`", step.RenderedCommand))
 		}
 		b.WriteString("\n")
@@ -364,7 +365,7 @@ func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 		b.WriteString("\n**검증**\n")
 		for _, step := range verifySteps {
 			b.WriteString(fmt.Sprintf("- %s", step.Description))
-			if step.RenderedCommand != "" {
+			if showCommands && step.RenderedCommand != "" {
 				b.WriteString(fmt.Sprintf(" `%s`", step.RenderedCommand))
 			}
 			b.WriteString("\n")
@@ -377,7 +378,7 @@ func executableIncidentSummarySteps(steps []guidance.PlanStep, limit int) []guid
 	var result []guidance.PlanStep
 	for _, step := range steps {
 		cmd := strings.TrimSpace(step.RenderedCommand)
-		if strings.Contains(cmd, "{{") || strings.Contains(cmd, " -n  ") || strings.Contains(cmd, " / ") || strings.HasSuffix(cmd, " -n") || strings.HasSuffix(cmd, "-n") {
+		if strings.Contains(cmd, "{{") || strings.Contains(cmd, " / ") {
 			continue
 		}
 		result = append(result, step)

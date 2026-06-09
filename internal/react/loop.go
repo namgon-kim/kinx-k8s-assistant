@@ -1431,18 +1431,35 @@ func kubectlVerbAndIndexFromFields(fields []string, kubectlIndex int) (string, i
 		}
 		if strings.HasPrefix(field, "--") {
 			if strings.Contains(field, "=") {
+				if kubectlGlobalFlagName(strings.SplitN(field, "=", 2)[0]) {
+					continue
+				}
+				return "", -1, false
+			}
+			if kubectlGlobalFlagRequiresValue(field) {
+				if i+1 >= len(fields) {
+					return "", -1, false
+				}
+				i++
 				continue
 			}
-			if kubectlGlobalFlagRequiresValue(field) && i+1 < len(fields) {
-				i++
+			if kubectlGlobalFlagName(field) {
+				continue
 			}
-			continue
+			return "", -1, false
 		}
 		if strings.HasPrefix(field, "-") {
-			if kubectlShortGlobalFlagRequiresValue(field) && len(field) == 2 && i+1 < len(fields) {
+			if kubectlShortGlobalFlagRequiresValue(field) && len(field) == 2 {
+				if i+1 >= len(fields) {
+					return "", -1, false
+				}
 				i++
+				continue
 			}
-			continue
+			if kubectlShortGlobalFlagName(field) {
+				continue
+			}
+			return "", -1, false
 		}
 		return strings.ToLower(field), i, true
 	}
@@ -1461,6 +1478,20 @@ func kubectlGlobalFlagRequiresValue(flag string) bool {
 	}
 }
 
+func kubectlGlobalFlagName(flag string) bool {
+	if kubectlGlobalFlagRequiresValue(flag) {
+		return true
+	}
+	switch flag {
+	case "--alsologtostderr", "--insecure-skip-tls-verify", "--match-server-version",
+		"--skip-headers", "--skip-log-headers", "--stderrthreshold", "--use-openapi-print-columns",
+		"--warnings-as-errors":
+		return true
+	default:
+		return false
+	}
+}
+
 func kubectlShortGlobalFlagRequiresValue(flag string) bool {
 	switch flag {
 	case "-n", "-s", "-v":
@@ -1468,6 +1499,10 @@ func kubectlShortGlobalFlagRequiresValue(flag string) bool {
 	default:
 		return false
 	}
+}
+
+func kubectlShortGlobalFlagName(flag string) bool {
+	return kubectlShortGlobalFlagRequiresValue(flag)
 }
 
 func isKubectlReadOnlyVerb(verb string) bool {

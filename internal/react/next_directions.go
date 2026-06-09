@@ -25,7 +25,7 @@ func (l *Loop) consumeNextDirections(ctx context.Context, calls []gollm.Function
 		}
 		nd, ok := nextDirectionsFromFunctionCall(call)
 		if !ok {
-			if !l.appendCorrection("invalid_next_directions", "next_directions payload was invalid. Re-emit a next_directions object with 1-3 options; each option needs `kind` (another_guide|different_approach) and `summary`.") {
+			if !l.appendCorrectionWithCompaction("invalid_next_directions", "next_directions payload was invalid. Re-emit a next_directions object with 1-3 options; each option needs `kind` (another_guide|different_approach) and `summary`.") {
 				klog.Warning("next_directions remained invalid after correction; falling back to runtime continuation choices")
 				nd = l.fallbackNextDirections()
 				l.pendingNextDirections = &nd

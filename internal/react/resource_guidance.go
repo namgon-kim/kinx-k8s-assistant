@@ -209,7 +209,7 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			l.pendingCalls = nil
 			l.state = StateDone
-			return true
+			return false
 		}
 		l.currChatContent = []any{l.compactedStateMessage("Use the following guide context as decision support, then choose the next safest step.")}
 		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
@@ -220,7 +220,7 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			l.pendingCalls = nil
 			l.state = StateDone
-			return true
+			return false
 		}
 		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
 		klog.Infof("resource guide injected for CRD %s without context compact", resource)
