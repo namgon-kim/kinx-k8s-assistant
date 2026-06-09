@@ -166,18 +166,18 @@ func (f *IncidentGuidanceFlow) handleRemediationApproval(o *Orchestrator, active
 }
 
 func (f *IncidentGuidanceFlow) buildRemediationPrompt() string {
-	return fmt.Sprintf(`사용자가 incident guidance 조치 계획 기반 진행을 승인했습니다.
+	return fmt.Sprintf(`The user approved continuing from the incident guidance remediation plan.
 
-아래 incident guidance 결과를 바탕으로 문제 해결을 진행하세요.
+Use the incident guidance result below as planning context and continue the diagnosis in the ReAct/tool loop.
 
-진행 규칙:
-1. 먼저 현재 클러스터 상태를 다시 확인하세요.
-2. 진단 명령은 실행해도 됩니다.
-3. 리소스 변경, 삭제, 재시작, scale, patch, apply, set resources 작업 전에는 반드시 구체적인 변경 내용을 사용자에게 승인받으세요.
-4. incident guidance 결과는 계획 근거입니다. 새로운 incident guidance/log-analyzer 도구 호출을 반복하지 마세요.
-5. 실행 결과와 다음 조치를 한국어로 요약하세요.
+Rules:
+1. Re-check the current cluster state first.
+2. Diagnostic commands are allowed.
+3. Before any resource change, deletion, restart, scale, patch, apply, or set resources operation, request explicit user approval with concrete change details.
+4. Treat the incident guidance result as planning evidence. Do not repeatedly call incident guidance or log-analyzer tools for the same plan.
+5. Follow the active language policy from the system prompt for user-facing output.
 
-incident guidance 결과 요약:
+Incident guidance result summary:
 %s`, f.remediationBrief)
 }
 
@@ -222,7 +222,7 @@ func (f *IncidentGuidanceFlow) buildProblemSignal(o *Orchestrator) diagnostic.Pr
 }
 
 func extractTarget(text string) diagnostic.KubernetesTarget {
-	target := diagnostic.KubernetesTarget{Kind: "pod"}
+	target := diagnostic.KubernetesTarget{}
 	if match := regexp.MustCompile(`([A-Za-z0-9_-]+)\s*네임스페이스`).FindStringSubmatch(text); len(match) == 2 {
 		target.Namespace = match[1]
 	}
@@ -237,32 +237,72 @@ func extractTarget(text string) diagnostic.KubernetesTarget {
 		}
 	}
 
-	patterns := []string{
-		`(?i)([a-z0-9][a-z0-9_.-]*)이라는\s*포드`,
-		`(?i)포드\s+['"]?([a-z0-9][a-z0-9_.-]*)['"]?`,
-		`(?i)pod\s+named\s+['"]?([a-z0-9][a-z0-9_.-]*)['"]?`,
-		`(?i)\bpod\s+['"]?([a-z0-9][a-z0-9_.-]*)['"]?\b`,
-	}
-	for _, pattern := range patterns {
-		if match := regexp.MustCompile(pattern).FindStringSubmatch(text); len(match) == 2 {
-			target.Name = match[1]
-			target.PodName = match[1]
-			break
-		}
+	target.Kind, target.Name = extractKubernetesKindName(text)
+	if strings.EqualFold(target.Kind, "pod") {
+		target.PodName = target.Name
 	}
 	if target.Name == "" {
 		if match := regexp.MustCompile(`(?i)\b([a-z0-9][a-z0-9-]*oom[a-z0-9-]*)\b`).FindStringSubmatch(text); len(match) == 2 {
+			target.Kind = "pod"
 			target.Name = match[1]
 			target.PodName = match[1]
 		}
 	}
 	if target.Name == "" {
 		if match := regexp.MustCompile(`(?i)\b(test-[a-z0-9-]+)\b`).FindStringSubmatch(text); len(match) == 2 {
+			target.Kind = "pod"
 			target.Name = match[1]
 			target.PodName = match[1]
 		}
 	}
 	return target
+}
+
+func extractKubernetesKindName(text string) (string, string) {
+	kindPattern := `(?i)\b(pod|pods|deployment|deployments|node|nodes|statefulset|statefulsets|daemonset|daemonsets|job|jobs|cronjob|cronjobs|service|services|ingress|ingresses|cluster|clusters)\b`
+	namePattern := `['"]?([a-z0-9][a-z0-9_.-]*)['"]?`
+	patterns := []string{
+		kindPattern + `\s*(?:named|name)?\s+` + namePattern,
+		namePattern + `\s*(?:이라는|인)?\s*` + kindPattern,
+		kindPattern + `/` + namePattern,
+	}
+	for _, pattern := range patterns {
+		match := regexp.MustCompile(pattern).FindStringSubmatch(text)
+		if len(match) == 3 {
+			if strings.Contains(pattern, namePattern+`\s*`) {
+				return normalizeTargetKind(match[2]), match[1]
+			}
+			return normalizeTargetKind(match[1]), match[2]
+		}
+	}
+	return "", ""
+}
+
+func normalizeTargetKind(kind string) string {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "pods":
+		return "pod"
+	case "deployments":
+		return "deployment"
+	case "nodes":
+		return "node"
+	case "statefulsets":
+		return "statefulset"
+	case "daemonsets":
+		return "daemonset"
+	case "jobs":
+		return "job"
+	case "cronjobs":
+		return "cronjob"
+	case "services":
+		return "service"
+	case "ingresses":
+		return "ingress"
+	case "clusters":
+		return "cluster"
+	default:
+		return strings.ToLower(strings.TrimSpace(kind))
+	}
 }
 
 func detectTypes(text string) []diagnostic.DetectionType {
@@ -314,8 +354,8 @@ func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 	b.WriteString("\n**권장 단계**\n")
 	for i, step := range steps {
 		b.WriteString(fmt.Sprintf("%d. %s", i+1, step.Description))
-		if step.RenderedCommand != "" && !step.RequiresConfirmation {
-			b.WriteString(fmt.Sprintf(" `%s`", step.RenderedCommand))
+		if cmd, ok := incidentSummaryStepCommand(step, result.Plan.Target); ok {
+			b.WriteString(fmt.Sprintf(" `%s`", cmd))
 		}
 		b.WriteString("\n")
 	}
@@ -324,8 +364,8 @@ func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 		b.WriteString("\n**검증**\n")
 		for _, step := range verifySteps {
 			b.WriteString(fmt.Sprintf("- %s", step.Description))
-			if step.RenderedCommand != "" {
-				b.WriteString(fmt.Sprintf(" `%s`", step.RenderedCommand))
+			if cmd, ok := incidentSummaryStepCommand(step, result.Plan.Target); ok {
+				b.WriteString(fmt.Sprintf(" `%s`", cmd))
 			}
 			b.WriteString("\n")
 		}
@@ -336,16 +376,114 @@ func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 func executableIncidentSummarySteps(steps []guidance.PlanStep, limit int) []guidance.PlanStep {
 	var result []guidance.PlanStep
 	for _, step := range steps {
-		cmd := strings.TrimSpace(step.RenderedCommand)
-		if strings.Contains(cmd, "{{") || strings.Contains(cmd, " -n  ") || strings.Contains(cmd, " / ") || strings.HasSuffix(cmd, " -n") || strings.HasSuffix(cmd, "-n") {
-			continue
-		}
 		result = append(result, step)
 		if len(result) >= limit {
 			return result
 		}
 	}
 	return result
+}
+
+func incidentSummaryStepCommand(step guidance.PlanStep, target diagnostic.KubernetesTarget) (string, bool) {
+	cmd := strings.TrimSpace(step.RenderedCommand)
+	if cmd == "" || step.RequiresConfirmation || strings.Contains(cmd, "{{") || strings.Contains(cmd, " / ") {
+		return "", false
+	}
+	if !incidentRenderedCommandComplete(cmd) {
+		return "", false
+	}
+	if !incidentStepTemplateValuesAvailable(step, target) {
+		return "", false
+	}
+	return cmd, true
+}
+
+func incidentRenderedCommandComplete(cmd string) bool {
+	fields := strings.Fields(cmd)
+	for i, field := range fields {
+		switch {
+		case field == "-n" || field == "--namespace":
+			if i+1 >= len(fields) || strings.HasPrefix(fields[i+1], "-") {
+				return false
+			}
+		case strings.HasPrefix(field, "--namespace="):
+			if strings.TrimSpace(strings.TrimPrefix(field, "--namespace=")) == "" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func incidentStepTemplateValuesAvailable(step guidance.PlanStep, target diagnostic.KubernetesTarget) bool {
+	if strings.TrimSpace(step.CommandTemplate) == "" {
+		return true
+	}
+	for _, name := range incidentTemplatePlaceholders(step.CommandTemplate) {
+		if incidentTemplateValue(name, step, target) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func incidentTemplatePlaceholders(tmpl string) []string {
+	seen := map[string]struct{}{}
+	var names []string
+	for {
+		start := strings.Index(tmpl, "{{")
+		if start < 0 {
+			return names
+		}
+		tmpl = tmpl[start+2:]
+		end := strings.Index(tmpl, "}}")
+		if end < 0 {
+			return names
+		}
+		name := strings.TrimSpace(tmpl[:end])
+		if name != "" {
+			if _, ok := seen[name]; !ok {
+				seen[name] = struct{}{}
+				names = append(names, name)
+			}
+		}
+		tmpl = tmpl[end+2:]
+	}
+}
+
+func incidentTemplateValue(name string, step guidance.PlanStep, target diagnostic.KubernetesTarget) string {
+	if step.Variables != nil {
+		if value := strings.TrimSpace(step.Variables[name]); value != "" {
+			return value
+		}
+	}
+	switch name {
+	case "cluster":
+		return strings.TrimSpace(target.Cluster)
+	case "context":
+		return strings.TrimSpace(target.Context)
+	case "namespace":
+		return strings.TrimSpace(target.Namespace)
+	case "kind":
+		return strings.TrimSpace(target.Kind)
+	case "name":
+		return strings.TrimSpace(target.Name)
+	case "pod_name":
+		if value := strings.TrimSpace(target.PodName); value != "" {
+			return value
+		}
+		return strings.TrimSpace(target.Name)
+	case "container", "container_name":
+		return strings.TrimSpace(target.Container)
+	case "owner_kind":
+		return strings.TrimSpace(target.OwnerKind)
+	case "owner_name":
+		return strings.TrimSpace(target.OwnerName)
+	case "node_name":
+		return ""
+	default:
+		return ""
+	}
 }
 
 func summarizeDetectionTypes(types []diagnostic.DetectionType) string {

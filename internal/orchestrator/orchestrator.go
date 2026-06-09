@@ -87,6 +87,10 @@ func GetMetaCommands() []MetaCmd {
 		{"/lang", "출력 언어 조회/변경"},
 		{"/readonly", "read-only 모드 조회/변경"},
 		{"/save", "현재 설정을 저장"},
+		{"/clear", "현재 대화 상태 초기화"},
+		{"/reset", "현재 대화 상태 초기화"},
+		{"/exit", "종료"},
+		{"/quit", "종료"},
 	}
 }
 
@@ -295,6 +299,7 @@ type Orchestrator struct {
 	logger           *Logger
 	rl               *readline.Instance
 	kubeconfigInfo   *k8s.KubeconfigInfo
+	runOnce          bool
 }
 
 // New는 새 Orchestrator를 생성하고 초기화합니다.
@@ -376,6 +381,7 @@ func (o *Orchestrator) Run(ctx context.Context, initialQuery string) error {
 
 	initialQuery = strings.TrimSpace(initialQuery)
 	if initialQuery != "" {
+		o.runOnce = true
 		if inputIsQuit(initialQuery) {
 			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
 			return nil
@@ -440,7 +446,10 @@ func (o *Orchestrator) readAndDispatchInput(ctx context.Context) error {
 		return nil
 	}
 	if strings.HasPrefix(input, "/") {
-		if err := o.selectMetaCommand(input); err != nil && err != io.EOF {
+		if err := o.selectMetaCommand(input); err != nil {
+			if err == io.EOF {
+				return io.EOF
+			}
 			fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
 		}
 		return nil
@@ -556,6 +565,14 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		o.incidentGuidance.RecordEvidence(masked)
 
 	case api.MessageTypeUserInputRequest:
+		if o.runOnce {
+			o.runOnce = false
+			if o.agentWrap != nil {
+				o.agentWrap.Close()
+			}
+			o.clearAgent()
+			return io.EOF
+		}
 		return o.handleAgentInputRequest()
 
 	case api.MessageTypeUserChoiceRequest:
@@ -600,8 +617,14 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 		activeAgent.SendInput(&api.UserInputResponse{Query: ""})
 		return nil
 	}
-	if strings.HasPrefix(input, "/") {
-		if err := o.selectMetaCommand(input); err != nil && err != io.EOF {
+	if strings.HasPrefix(input, "/") && !activeAgent.AcceptsRawSlashInput() {
+		if err := o.selectMetaCommand(input); err != nil {
+			if err == io.EOF {
+				if o.agentWrap == activeAgent {
+					activeAgent.SendInput(io.EOF)
+				}
+				return io.EOF
+			}
 			fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
 		}
 		if o.agentWrap == activeAgent {
@@ -853,7 +876,7 @@ func (o *Orchestrator) handleMetaCommand(input string) error {
 		return fmt.Errorf("알 수 없는 명령어")
 	}
 
-	cmd := parts[0]
+	cmd := strings.ToLower(parts[0])
 	args := parts[1:]
 
 	switch cmd {
@@ -917,9 +940,31 @@ func (o *Orchestrator) handleMetaCommand(input string) error {
 		fmt.Printf("%s✓ 설정이 저장되었습니다%s\n", colorBrightGreen, colorReset)
 		return nil
 
+	case "clear", "reset":
+		o.resetConversationState()
+		fmt.Printf("%s✓ 대화 상태를 초기화했습니다%s\n", colorBrightGreen, colorReset)
+		return nil
+
+	case "exit", "quit":
+		if o.agentWrap != nil {
+			o.agentWrap.Close()
+			o.clearAgent()
+		}
+		fmt.Println("👋 종료합니다.")
+		return io.EOF
+
 	default:
 		return fmt.Errorf("알 수 없는 명령어: /%s", cmd)
 	}
+}
+
+func (o *Orchestrator) resetConversationState() {
+	if o.agentWrap != nil {
+		o.agentWrap.Close()
+		o.clearAgent()
+	}
+	o.ctx = NewConversationContext()
+	o.incidentGuidance = NewIncidentGuidanceFlow()
 }
 
 // printHelp는 사용 가능한 메타 명령과 일반 사용법을 출력합니다.

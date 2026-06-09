@@ -275,6 +275,7 @@ func phasePlanValid(plan phasePlan) bool {
 	foundCurrent := false
 	seenIndex := make(map[int]struct{}, len(plan.PhaseSteps))
 	seenName := make(map[string]struct{}, len(plan.PhaseSteps))
+	indexByName := make(map[string]int, len(plan.PhaseSteps))
 	for _, step := range plan.PhaseSteps {
 		if step.Index == 0 || strings.TrimSpace(step.Name) == "" {
 			return false
@@ -288,6 +289,7 @@ func phasePlanValid(plan phasePlan) bool {
 			return false
 		}
 		seenName[name] = struct{}{}
+		indexByName[name] = step.Index
 		if step.Index == plan.CurrentPhaseIndex {
 			foundCurrent = true
 		}
@@ -302,6 +304,9 @@ func phasePlanValid(plan phasePlan) bool {
 				continue
 			}
 			if _, ok := seenName[nextName]; !ok {
+				return false
+			}
+			if indexByName[nextName] <= step.Index {
 				return false
 			}
 		}

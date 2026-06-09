@@ -164,6 +164,7 @@ func (fc *FileConfig) ApplyToConfig(cfg Config) Config {
 	}
 	if rag.Embedding.NormalizeEmbeddings != nil {
 		cfg.NormalizeEmbeddings = *rag.Embedding.NormalizeEmbeddings
+		cfg.NormalizeEmbeddingsSet = true
 	}
 
 	if rag.Qdrant.URL != "" {
@@ -177,12 +178,14 @@ func (fc *FileConfig) ApplyToConfig(cfg Config) Config {
 	}
 	if rag.Qdrant.WithPayload != nil {
 		cfg.QdrantWithPayload = *rag.Qdrant.WithPayload
+		cfg.QdrantWithPayloadSet = true
 	}
 	if rag.Qdrant.WithVectors != nil {
 		cfg.QdrantWithVectors = *rag.Qdrant.WithVectors
 	}
 	if rag.Qdrant.SearchParams.Exact != nil {
 		cfg.QdrantExact = *rag.Qdrant.SearchParams.Exact
+		cfg.QdrantExactSet = true
 	}
 
 	if rag.Reranker.Model != "" {
@@ -206,9 +209,11 @@ func (fc *FileConfig) ApplyToConfig(cfg Config) Config {
 	}
 	if rag.Reranker.UseFP16 != nil {
 		cfg.RerankerUseFP16 = *rag.Reranker.UseFP16
+		cfg.RerankerUseFP16Set = true
 	}
 	if rag.Reranker.Normalize != nil {
 		cfg.RerankerNormalize = *rag.Reranker.Normalize
+		cfg.RerankerNormalizeSet = true
 	}
 	return cfg
 }

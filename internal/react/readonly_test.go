@@ -82,6 +82,75 @@ func TestAnalyzeToolCallsAllowsKubectlReadOnlyWithGlobalFlagsBeforeVerb(t *testi
 	}
 }
 
+func TestKubectlVerbAndIndexFromFieldsHandlesPreVerbFlagsConservatively(t *testing.T) {
+	tests := []struct {
+		name      string
+		fields    []string
+		wantVerb  string
+		wantOK    bool
+		wantIndex int
+	}{
+		{
+			name:      "global namespace before verb",
+			fields:    []string{"kubectl", "-n", "prod", "get", "pods"},
+			wantVerb:  "get",
+			wantOK:    true,
+			wantIndex: 3,
+		},
+		{
+			name:      "global context before verb",
+			fields:    []string{"kubectl", "--context", "prod", "describe", "pod", "app"},
+			wantVerb:  "describe",
+			wantOK:    true,
+			wantIndex: 3,
+		},
+		{
+			name:      "global flag with equals before verb",
+			fields:    []string{"kubectl", "--request-timeout=5s", "get", "pods"},
+			wantVerb:  "get",
+			wantOK:    true,
+			wantIndex: 2,
+		},
+		{
+			name:      "boolean global flag before verb",
+			fields:    []string{"kubectl", "--insecure-skip-tls-verify", "get", "pods"},
+			wantVerb:  "get",
+			wantOK:    true,
+			wantIndex: 2,
+		},
+		{
+			name:   "command output flag before verb is unsupported",
+			fields: []string{"kubectl", "-o", "json", "get", "pods"},
+			wantOK: false,
+		},
+		{
+			name:   "unknown flag before verb is unsupported",
+			fields: []string{"kubectl", "--unknown", "value", "get", "pods"},
+			wantOK: false,
+		},
+		{
+			name:   "global flag missing value is unsupported",
+			fields: []string{"kubectl", "--namespace"},
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotVerb, gotIndex, gotOK := kubectlVerbAndIndexFromFields(tt.fields, 0)
+			if gotOK != tt.wantOK {
+				t.Fatalf("ok = %v, want %v (verb=%q index=%d)", gotOK, tt.wantOK, gotVerb, gotIndex)
+			}
+			if !tt.wantOK {
+				return
+			}
+			if gotVerb != tt.wantVerb || gotIndex != tt.wantIndex {
+				t.Fatalf("verb/index = %q/%d, want %q/%d", gotVerb, gotIndex, tt.wantVerb, tt.wantIndex)
+			}
+		})
+	}
+}
+
 func TestAnalyzeToolCallsBlocksKubectlMutationWithGlobalFlagsBeforeVerb(t *testing.T) {
 	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
 	if err != nil {
@@ -223,6 +292,84 @@ func TestAnalyzeToolCallsBlocksReadOnlyBashCRedirection(t *testing.T) {
 	}
 	if pending[0].ModifiesResource == "no" {
 		t.Fatalf("expected bash -c redirection to be blocked, got %q", pending[0].ModifiesResource)
+	}
+}
+
+func TestAnalyzeToolCallsBlocksReadOnlyShellEvaluation(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	tests := []string{
+		`kubectl get pods $(kubectl delete pod app -n tests)`,
+		"kubectl get pods `kubectl delete pod app -n tests`",
+		`kubectl get pods <(kubectl get pods -o name)`,
+		"kubectl get pods <<EOF\nEOF",
+	}
+	for _, command := range tests {
+		pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": command,
+			},
+		}})
+		if err != nil {
+			t.Fatalf("analyze tool calls for %q: %v", command, err)
+		}
+		if len(pending) != 1 {
+			t.Fatalf("unexpected pending count for %q: %d", command, len(pending))
+		}
+		if pending[0].ModifiesResource == "no" {
+			t.Fatalf("expected shell evaluation to be blocked for %q, got %q", command, pending[0].ModifiesResource)
+		}
+	}
+}
+
+func TestAnalyzeToolCallsAllowsOnlySafeKubectlAuthReadOnlySubcommands(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	allowed := []string{
+		"kubectl auth can-i get pods -n tests",
+		"kubectl auth whoami",
+	}
+	for _, command := range allowed {
+		pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": command,
+			},
+		}})
+		if err != nil {
+			t.Fatalf("analyze allowed auth command %q: %v", command, err)
+		}
+		if pending[0].ModifiesResource != "no" {
+			t.Fatalf("expected auth command %q to be read-only, got %q", command, pending[0].ModifiesResource)
+		}
+	}
+
+	blocked := []string{
+		"kubectl auth reconcile -f role.yaml",
+		"kubectl auth",
+	}
+	for _, command := range blocked {
+		pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": command,
+			},
+		}})
+		if err != nil {
+			t.Fatalf("analyze blocked auth command %q: %v", command, err)
+		}
+		if pending[0].ModifiesResource == "no" {
+			t.Fatalf("expected auth command %q to be blocked, got %q", command, pending[0].ModifiesResource)
+		}
 	}
 }
 

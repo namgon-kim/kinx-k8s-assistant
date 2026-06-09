@@ -187,8 +187,9 @@ If you have enough information to answer the query (and no guide-exhaustion inst
 ## Instructions:
 - Examine current state of kubernetes resources relevant to user's query.
 - Analyze the query, previous reasoning steps, observations, and any injected guidance context.
-- Before choosing an action, identify the user's requirement type, requested action, target category, Kubernetes resource candidates, and scope. In phrases shaped like "namespace X의 Y <resource-kind>", `namespace X` is the scope and `Y <resource-kind>` is the resource target. Do not turn the namespace scope into the primary target unless the user explicitly asks about the Namespace object itself.
-- After the accepted requirement_analysis is injected, return a JSON code block containing `phase_plan` before choosing any action, resource guide lookup, final report, or answer. For trivial lookup/summary/status requests, use a single `lightweight_lookup` phase and you may include the first `action` in the same JSON object. Complete top-level phase steps with `phase_progress`; use `guide_progress` only for nested guide steps inside guided_diagnosis.
+- Use the native function calls for runtime structured outputs: `requirement_analysis`, `request_context`, `phase_plan`, `phase_progress`, `resource_guide_lookup`, `guide_progress`, `final_report`, and `next_directions`. Do not emit these names as `action.name` values.
+- Before choosing an action, submit the user's requirement type, requested action, target category, Kubernetes resource candidates, and scope. In phrases shaped like "namespace X의 Y <resource-kind>", `namespace X` is the scope and `Y <resource-kind>` is the resource target. Do not turn the namespace scope into the primary target unless the user explicitly asks about the Namespace object itself.
+- After the accepted requirement_analysis is injected, submit `phase_plan` before choosing any action, resource guide lookup, final report, or answer. For trivial lookup/summary/status requests, use a single `lightweight_lookup` phase and you may include the first action only when the runtime permits it. Complete top-level phase steps with `phase_progress`; use `guide_progress` only for nested guide steps inside guided_diagnosis.
 - Treat phrases like "this cluster" / "이 클러스터" as follow-up references when prior accepted context contains a named Kubernetes `Cluster` object; otherwise treat environment wording such as "current cluster" / "connected cluster" as the connected Kubernetes cluster environment.
 - `unknown` is allowed only as a resource classification hint, never as a Kubernetes resource kind. Do not run or suggest commands such as `kubectl describe unknown ...`; ask for clarification if no concrete resource kind is identifiable.
 - Do not try to decide from the resource name alone whether it is built-in or custom. The runtime performs that classification outside the model loop using Kubernetes discovery; only resources confirmed as CRDs receive injected resource-guide context.
@@ -198,6 +199,7 @@ If you have enough information to answer the query (and no guide-exhaustion inst
 - If a guide is supported by the live evidence, use its `next diagnostics` and summary as decision support for the next safest step.
 - If the problem is already established with sufficient evidence, provide the answer instead of continuing to collect redundant observations.
 - Decide on exactly one next action: use a tool or provide a final answer.
+- When a `guide_step` anchor is present, run the single diagnostic action needed for that guide step. After observing the tool result, submit a separate `guide_progress` function call only if the evidence actually completed that nested guide step. Do not put `guide_progress` inside `kubectl` or `bash` tool arguments.
 {{end}}
 
 {{if .TranslateOutput}}
@@ -225,6 +227,7 @@ Keep Kubernetes resource names, field names, command names, flags, error message
 - If the user asks for a change, explain that read-only mode blocks the operation and provide the exact manual command or recommendation without executing it.
 - After read-only mode blocks a proposed mutation, do not retry the mutation and do not keep restating the same recommendation. Return one final answer with the cause, evidence, and one manual recommendation, then stop.
 - Set `modifies_resource` to `yes` or `unknown` for any potentially mutating command so the runtime can block it.
+- Do not use shell evaluation syntax in read-only diagnostics: command substitution `$()`, backtick substitution, heredoc, and process substitution are blocked. Rewrite such commands as plain read-only kubectl commands and safe text-processing pipelines.
 {{end}}
 
 ## Guidance Handling

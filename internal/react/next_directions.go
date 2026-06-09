@@ -25,7 +25,7 @@ func (l *Loop) consumeNextDirections(ctx context.Context, calls []gollm.Function
 		}
 		nd, ok := nextDirectionsFromFunctionCall(call)
 		if !ok {
-			if !l.appendCorrection("invalid_next_directions", "next_directions payload was invalid. Re-emit a next_directions object with 1-3 options; each option needs `kind` (another_guide|different_approach) and `summary`.") {
+			if !l.appendCorrectionWithCompaction("invalid_next_directions", "next_directions payload was invalid. Re-emit a next_directions object with 1-3 options; each option needs `kind` (another_guide|different_approach) and `summary`.") {
 				klog.Warning("next_directions remained invalid after correction; falling back to runtime continuation choices")
 				nd = l.fallbackNextDirections()
 				l.pendingNextDirections = &nd
@@ -192,6 +192,7 @@ func (l *Loop) waitForDirectionChoice(ctx context.Context) bool {
 		if state.HasFreeInput && choice == state.FreeInputIdx {
 			l.pendingDirectionPrompt = nil
 			l.state = StateWaitingDirectionText
+			l.setRawSlashInputAccepted(true)
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeUserInputRequest, "어떤 방향으로 계속할지 알려주세요")
 			return true
 		}
@@ -215,12 +216,14 @@ func (l *Loop) waitForDirectionText(ctx context.Context) bool {
 	case <-ctx.Done():
 		return false
 	case raw := <-l.input:
+		l.setRawSlashInputAccepted(false)
 		if raw == io.EOF {
 			l.state = StateExited
 			return false
 		}
 		resp, ok := raw.(*api.UserInputResponse)
 		if !ok {
+			l.setRawSlashInputAccepted(true)
 			return true
 		}
 		text := strings.TrimSpace(resp.Query)
@@ -243,6 +246,7 @@ func (l *Loop) waitForDirectionText(ctx context.Context) bool {
 		if strings.HasPrefix(text, "/") {
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "이 입력 단계에서는 /exit, /quit, /clear, /reset만 메타 명령으로 처리할 수 있습니다.")
 			l.state = StateWaitingDirectionText
+			l.setRawSlashInputAccepted(true)
 			return true
 		}
 		l.applyDirectionOption(ctx, nextDirectionOption{

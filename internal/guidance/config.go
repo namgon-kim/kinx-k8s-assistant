@@ -46,7 +46,10 @@ func ApplyDefaults(cfg Config) Config {
 	if cfg.EmbeddingMaxLength <= 0 {
 		cfg.EmbeddingMaxLength = DefaultEmbeddingMaxLen
 	}
-	cfg.NormalizeEmbeddings = true
+	if !cfg.NormalizeEmbeddingsSet {
+		cfg.NormalizeEmbeddings = true
+		cfg.NormalizeEmbeddingsSet = true
+	}
 	if cfg.QdrantURL == "" {
 		cfg.QdrantURL = DefaultQdrantURL
 	}
@@ -54,8 +57,14 @@ func ApplyDefaults(cfg Config) Config {
 	if cfg.QdrantLimit <= 0 {
 		cfg.QdrantLimit = DefaultQdrantLimit
 	}
-	cfg.QdrantWithPayload = true
-	cfg.QdrantExact = true
+	if !cfg.QdrantWithPayloadSet {
+		cfg.QdrantWithPayload = true
+		cfg.QdrantWithPayloadSet = true
+	}
+	if !cfg.QdrantExactSet {
+		cfg.QdrantExact = true
+		cfg.QdrantExactSet = true
+	}
 	if !cfg.RerankerEnabledSet {
 		cfg.RerankerEnabled = true
 		cfg.RerankerEnabledSet = true
@@ -73,8 +82,14 @@ func ApplyDefaults(cfg Config) Config {
 	if cfg.RerankerMaxLength <= 0 {
 		cfg.RerankerMaxLength = DefaultRerankerMaxLen
 	}
-	cfg.RerankerUseFP16 = true
-	cfg.RerankerNormalize = true
+	if !cfg.RerankerUseFP16Set {
+		cfg.RerankerUseFP16 = true
+		cfg.RerankerUseFP16Set = true
+	}
+	if !cfg.RerankerNormalizeSet {
+		cfg.RerankerNormalize = true
+		cfg.RerankerNormalizeSet = true
+	}
 	return cfg
 }
 

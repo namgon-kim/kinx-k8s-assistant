@@ -198,7 +198,20 @@ func TestFormatResourceGuideObservationAddsClusterAPIGuardrailsOnlyFromGuide(t *
 	}
 }
 
-func TestFormatResourceGuideObservationPreservesGuideMetadataAndCommands(t *testing.T) {
+func TestResourceGuideObservationPreservesGuideMetadataAndAnchorCarriesCommands(t *testing.T) {
+	result := &guidance.GuideSearchResult{Cases: []guidance.GuideCase{{
+		ID:               "cluster-api-metadata-guide",
+		Title:            "Cluster API Metadata Guide",
+		EvidenceKeywords: []string{"metadata.example.com/state-ready", "metadata.example.com/state-paused"},
+		DecisionHints:    []string{"The selected object is identified by metadata.example.com/primary=true."},
+		RelatedObjects:   []string{"Cluster", "MachineDeployment"},
+		Tags:             []string{"annotations", "nodegroup"},
+		DiagnosticSteps: []guidance.PlanStep{{
+			Description:     "Inspect the initial node group",
+			CommandTemplate: "kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{name}},metadata.example.com/primary=true -o yaml",
+			ExpectedOutcome: "Check guide-provided annotations and labels",
+		}},
+	}}}
 	got := formatResourceGuideObservation("cluster", &guidance.GuideSearchResult{Cases: []guidance.GuideCase{{
 		ID:               "cluster-api-metadata-guide",
 		Title:            "Cluster API Metadata Guide",
@@ -217,11 +230,27 @@ func TestFormatResourceGuideObservationPreservesGuideMetadataAndCommands(t *test
 		"tags: annotations, nodegroup",
 		"metadata cues to inspect:",
 		"metadata.example.com/primary=true",
-		"command templates exactly",
-		"kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{name}},metadata.example.com/primary=true -o yaml",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected guide observation to contain %q, got %q", want, got)
+		}
+	}
+
+	loop := &Loop{
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+			Scope:         requestScope{Namespace: "tenant-a"},
+		},
+	}
+	loop.guideStepState = loop.buildGuideStepState(result)
+	anchor := loop.guideStepAnchor()
+	for _, want := range []string{
+		"next_step_command_template: kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{name}},metadata.example.com/primary=true -o yaml",
+		"next_step_rendered_command: kubectl -n tenant-a get machinedeployment -l cluster.x-k8s.io/cluster-name=clst-a,metadata.example.com/primary=true -o yaml",
+		"next_step_expected_outcome: Check guide-provided annotations and labels",
+	} {
+		if !strings.Contains(anchor, want) {
+			t.Fatalf("expected guide anchor to contain %q, got %q", want, anchor)
 		}
 	}
 }
@@ -643,6 +672,160 @@ func TestGuideStepCompletedRejectsEvidenceNotUseful(t *testing.T) {
 		},
 	}); ok {
 		t.Fatal("guide_progress with evidence_useful=false must not complete a step")
+	}
+}
+
+func TestConsumeGuideProgressCompletesNestedGuideStep(t *testing.T) {
+	loop := &Loop{
+		guideStepState: &guideStepState{
+			TotalSteps: 2,
+			Completed:  map[int]bool{},
+			StepDetails: []guideStepDetail{
+				{Index: 1, Description: "inspect first signal"},
+				{Index: 2, Description: "inspect second signal"},
+			},
+		},
+		phaseStepState: &phaseStepState{
+			PhaseSteps: []phaseStep{{
+				Index: 1,
+				Name:  "guided_diagnosis",
+			}},
+			CurrentPhaseIndex: 1,
+			Completed:         map[int]bool{},
+		},
+	}
+
+	remaining, handled := loop.consumeGuideProgress([]gollm.FunctionCall{{
+		Name: internalGuideProgressCall,
+		Arguments: map[string]any{
+			"step_completed":  1,
+			"evidence_useful": true,
+		},
+	}})
+	if !handled {
+		t.Fatal("expected guide_progress to be handled")
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("unexpected remaining calls: %#v", remaining)
+	}
+	if !loop.guideStepState.Completed[1] {
+		t.Fatal("expected guide step 1 to be completed")
+	}
+}
+
+func TestConsumeGuideProgressLastStepRequestsGuidedPhaseProgress(t *testing.T) {
+	loop := &Loop{
+		guideStepState: &guideStepState{
+			TotalSteps: 1,
+			Completed:  map[int]bool{},
+			StepDetails: []guideStepDetail{
+				{Index: 1, Description: "inspect final signal"},
+			},
+		},
+		phaseStepState: &phaseStepState{
+			PhaseSteps: []phaseStep{{
+				Index: 1,
+				Name:  "guided_diagnosis",
+			}},
+			CurrentPhaseIndex: 1,
+			Completed:         map[int]bool{},
+		},
+	}
+
+	remaining, handled := loop.consumeGuideProgress([]gollm.FunctionCall{{
+		Name: internalGuideProgressCall,
+		Arguments: map[string]any{
+			"step_completed":  1,
+			"evidence_useful": true,
+		},
+	}})
+	if !handled {
+		t.Fatal("expected guide_progress to be handled when no trailing calls remain")
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("unexpected remaining calls: %#v", remaining)
+	}
+	if !loop.guidedPhaseProgressRequested {
+		t.Fatal("expected completed guided_diagnosis to request phase_progress")
+	}
+	if !strings.Contains(loop.pendingResponseDirective, "phase_progress") {
+		t.Fatalf("expected phase_progress directive, got %q", loop.pendingResponseDirective)
+	}
+}
+
+func TestConsumeGuideProgressPreservesTrailingCalls(t *testing.T) {
+	loop := &Loop{
+		guideStepState: &guideStepState{
+			TotalSteps: 2,
+			Completed:  map[int]bool{},
+		},
+		phaseStepState: &phaseStepState{
+			PhaseSteps: []phaseStep{{
+				Index: 1,
+				Name:  "guided_diagnosis",
+			}},
+			CurrentPhaseIndex: 1,
+			Completed:         map[int]bool{},
+		},
+	}
+	trailing := gollm.FunctionCall{
+		Name: internalPhaseProgressCall,
+		Arguments: map[string]any{
+			"phase_completed": 1,
+			"next_phase":      "final_report",
+		},
+	}
+
+	remaining, handled := loop.consumeGuideProgress([]gollm.FunctionCall{
+		{
+			Name: internalGuideProgressCall,
+			Arguments: map[string]any{
+				"step_completed":  1,
+				"evidence_useful": true,
+			},
+		},
+		trailing,
+	})
+	if handled {
+		t.Fatal("guide_progress with trailing calls should flow through to the remaining pipeline")
+	}
+	if len(remaining) != 1 || remaining[0].Name != internalPhaseProgressCall {
+		t.Fatalf("expected trailing phase_progress to be preserved, got %#v", remaining)
+	}
+	if !loop.guideStepState.Completed[1] {
+		t.Fatal("expected guide step to be recorded before trailing calls continue")
+	}
+}
+
+func TestEnforceRequestedDirectiveAllowsOnlyRequestedCall(t *testing.T) {
+	phaseOnly := &Loop{guidedPhaseProgressRequested: true}
+	if phaseOnly.enforceRequestedStructuredDirective([]gollm.FunctionCall{{
+		Name: internalPhaseProgressCall,
+	}}) {
+		t.Fatal("sole requested phase_progress should pass through")
+	}
+
+	phaseWithAction := &Loop{guidedPhaseProgressRequested: true}
+	if !phaseWithAction.enforceRequestedStructuredDirective([]gollm.FunctionCall{
+		{Name: internalPhaseProgressCall},
+		{Name: "kubectl"},
+	}) {
+		t.Fatal("phase_progress mixed with action should be corrected")
+	}
+
+	finalOnly := &Loop{finalReportRequested: true}
+	if finalOnly.enforceRequestedStructuredDirective([]gollm.FunctionCall{{
+		Name: internalFinalReportCall,
+	}}) {
+		t.Fatal("sole requested final_report should pass through")
+	}
+
+	finalWithAction := &Loop{finalReportRequested: true}
+	if !finalWithAction.enforceRequestedStructuredDirective([]gollm.FunctionCall{
+		{Name: internalFinalReportCall},
+		{Name: "kubectl"},
+	}) {
+		t.Fatal("final_report mixed with action should be corrected")
 	}
 }
 

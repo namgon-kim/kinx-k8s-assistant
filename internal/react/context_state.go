@@ -68,6 +68,9 @@ func (l *Loop) appendCorrection(code, message string) bool {
 }
 
 func (l *Loop) appendCorrectionWithCompaction(code, message string) bool {
+	if l.lastContextError != nil && l.lastContextError.Code == code && l.lastContextError.Message == message {
+		return false
+	}
 	l.lastContextError = &contextError{
 		Code:      code,
 		Message:   message,

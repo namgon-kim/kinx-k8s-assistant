@@ -65,3 +65,35 @@ func TestBuildSystemPromptIncludesTranslateOutputPolicy(t *testing.T) {
 		t.Fatalf("expected translation policy in prompt: %q", prompt)
 	}
 }
+
+func TestCollectFunctionDefinitionsIncludesInternalStructuredCalls(t *testing.T) {
+	var registry tools.Tools
+	registry.Init()
+
+	defs := collectFunctionDefinitionsForProfile(registry, ToolProfile{Name: "empty"}, true)
+	names := map[string]bool{}
+	for _, def := range defs {
+		names[def.Name] = true
+		if strings.TrimSpace(def.Description) == "" {
+			t.Fatalf("internal function %q has empty description", def.Name)
+		}
+		if def.Parameters == nil {
+			t.Fatalf("internal function %q has nil parameters", def.Name)
+		}
+	}
+
+	for _, name := range []string{
+		internalRequirementAnalysisCall,
+		internalRequestContextCall,
+		internalPhasePlanCall,
+		internalPhaseProgressCall,
+		internalGuideProgressCall,
+		internalResourceGuideLookupCall,
+		internalFinalReportCall,
+		internalNextDirectionsCall,
+	} {
+		if !names[name] {
+			t.Fatalf("expected internal function definition %q", name)
+		}
+	}
+}
