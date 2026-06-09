@@ -133,7 +133,7 @@ func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query
 	}
 	if client.KnowledgeProvider() != guidance.KnowledgeProviderQdrant {
 		l.markResourceGuideQuery(query)
-		l.injectResourceGuideUnavailable(resource, "provider="+string(client.KnowledgeProvider()))
+		l.injectResourceGuideUnavailable(resource, "provider_not_implemented_for_resource_guides="+string(client.KnowledgeProvider()))
 		return
 	}
 	searchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)

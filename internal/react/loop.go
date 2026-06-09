@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
@@ -45,6 +46,7 @@ const internalRequestContextCall = "__request_context__"
 const internalRequirementAnalysisCall = "__requirement_analysis__"
 const internalPhasePlanCall = "__phase_plan__"
 const internalPhaseProgressCall = "__phase_progress__"
+const internalGuideProgressCall = "__guide_progress__"
 const internalFinalReportCall = "__final_report__"
 const internalNextDirectionsCall = "__next_directions__"
 const internalInvalidActionCall = "__invalid_action__"
@@ -105,6 +107,8 @@ type Loop struct {
 
 	cancel context.CancelFunc
 	once   sync.Once
+
+	acceptRawSlashInput atomic.Bool
 }
 
 type guideStepState struct {
@@ -203,6 +207,7 @@ func (l *Loop) SendInput(input any) {
 
 func (l *Loop) Close() {
 	l.once.Do(func() {
+		l.setRawSlashInputAccepted(false)
 		if l.cancel != nil {
 			l.cancel()
 		}
@@ -225,6 +230,17 @@ func (l *Loop) Close() {
 			_ = os.RemoveAll(l.workDir)
 		}
 	})
+}
+
+func (l *Loop) AcceptsRawSlashInput() bool {
+	return l != nil && l.acceptRawSlashInput.Load()
+}
+
+func (l *Loop) setRawSlashInputAccepted(accepted bool) {
+	if l == nil {
+		return
+	}
+	l.acceptRawSlashInput.Store(accepted)
 }
 
 func (l *Loop) init(ctx context.Context) error {
@@ -269,7 +285,7 @@ func (l *Loop) resetChatSession() error {
 		},
 	)
 	if !l.cfg.EnableToolUseShim {
-		defs := collectFunctionDefinitionsForProfile(l.registry.Tools, l.toolProfile)
+		defs := collectFunctionDefinitionsForProfile(l.registry.Tools, l.toolProfile, true)
 		if err := l.chat.SetFunctionDefinitions(defs); err != nil {
 			return fmt.Errorf("tool function definition 주입 실패: %w", err)
 		}
@@ -381,6 +397,7 @@ func (l *Loop) waitForApproval(ctx context.Context) bool {
 }
 
 func (l *Loop) startQuery(query string) error {
+	l.setRawSlashInputAccepted(false)
 	intent := classifyRequestIntent(query)
 	l.requestIntent = intent
 	l.captureConversationMemory()
@@ -496,6 +513,7 @@ func (l *Loop) handleMetaQuery(ctx context.Context, query string) bool {
 }
 
 func (l *Loop) clearConversationState() {
+	l.setRawSlashInputAccepted(false)
 	l.currIteration = 0
 	l.currChatContent = nil
 	l.contextBlockHashes = nil
@@ -693,6 +711,12 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		return nil
 	}
 
+	var guideProgressHandled bool
+	functionCalls, guideProgressHandled = l.consumeGuideProgress(functionCalls)
+	if guideProgressHandled {
+		return nil
+	}
+
 	var phaseProgressHandled bool
 	functionCalls, phaseProgressHandled = l.consumePhaseProgress(functionCalls)
 	if phaseProgressHandled {
@@ -704,6 +728,10 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	if handled := l.rejectActionDuringGuidanceLookupWithoutGuide(functionCalls); handled {
+		return nil
+	}
+
+	if handled := l.enforceRequestedStructuredDirective(functionCalls); handled {
 		return nil
 	}
 
@@ -852,6 +880,47 @@ func (l *Loop) emitAcceptedProgressText(ctx context.Context, progressText string
 	l.emitProgressText(ctx, progressText)
 }
 
+func (l *Loop) enforceRequestedStructuredDirective(calls []gollm.FunctionCall) bool {
+	if len(calls) == 0 {
+		return false
+	}
+	if l.guidedPhaseProgressRequested && !onlyFunctionCall(calls, internalPhaseProgressCall) {
+		message := "The runtime already requested `phase_progress` for the completed guided_diagnosis phase. Do not emit another action. Return only a phase_progress object completing guided_diagnosis."
+		l.queueResponseDirective(message)
+		if !l.appendCorrectionWithCompaction("guided_phase_progress_required", message) {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "guided_diagnosis phase_progress 요청이 반복적으로 무시되어 진단을 중단합니다.")
+			l.pendingCalls = nil
+			l.currIteration = 0
+			l.state = StateDone
+			return true
+		}
+		l.pendingCalls = nil
+		l.currIteration++
+		l.state = StateRunning
+		return true
+	}
+	if l.finalReportRequested && !onlyFunctionCall(calls, internalFinalReportCall) {
+		message := "The runtime already requested `final_report` after completing the resource-guide diagnostic steps. Do not emit another action. Return only a final_report object."
+		l.queueResponseDirective(message)
+		if !l.appendCorrectionWithCompaction("final_report_required", message) {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "final_report 요청이 반복적으로 무시되어 진단을 중단합니다.")
+			l.pendingCalls = nil
+			l.currIteration = 0
+			l.state = StateDone
+			return true
+		}
+		l.pendingCalls = nil
+		l.currIteration++
+		l.state = StateRunning
+		return true
+	}
+	return false
+}
+
+func onlyFunctionCall(calls []gollm.FunctionCall, name string) bool {
+	return len(calls) == 1 && calls[0].Name == name
+}
+
 func isContextLengthError(err error) bool {
 	if err == nil {
 		return false
@@ -924,6 +993,8 @@ func internalStructuredCallName(name string) string {
 		return internalPhasePlanCall
 	case bareInternalCallName(internalPhaseProgressCall), internalPhaseProgressCall:
 		return internalPhaseProgressCall
+	case bareInternalCallName(internalGuideProgressCall), internalGuideProgressCall:
+		return internalGuideProgressCall
 	case bareInternalCallName(internalResourceGuideLookupCall), internalResourceGuideLookupCall:
 		return internalResourceGuideLookupCall
 	case bareInternalCallName(internalFinalReportCall), internalFinalReportCall:
@@ -962,10 +1033,30 @@ func (l *Loop) modifiesResource(parsed *tools.ToolCall, call gollm.FunctionCall)
 	if isObservationToolName(call.Name) {
 		return "no"
 	}
+	if hasBlockedReadOnlyFastPathFeature(call) {
+		return "unknown"
+	}
 	if isNonMutatingKubectlInvocation(call) {
 		return "no"
 	}
 	return parsed.GetTool().CheckModifiesResource(call.Arguments)
+}
+
+func hasBlockedReadOnlyFastPathFeature(call gollm.FunctionCall) bool {
+	script, ok := readonlyShellScriptFromFunctionCall(call)
+	if !ok {
+		return false
+	}
+	commands := splitShellCommandList(script)
+	if len(commands) == 0 {
+		return false
+	}
+	for _, command := range commands {
+		if containsShellEvaluation(command) || containsDisallowedReadOnlyKubectlSubcommand(command) {
+			return true
+		}
+	}
+	return false
 }
 
 func isNonMutatingKubectlInvocation(call gollm.FunctionCall) bool {
@@ -983,6 +1074,24 @@ func isNonMutatingKubectlInvocation(call gollm.FunctionCall) bool {
 		}
 	}
 	return true
+}
+
+func containsDisallowedReadOnlyKubectlSubcommand(command string) bool {
+	segments := splitShellPipeline(command)
+	for _, segment := range segments {
+		fields := strings.Fields(segment)
+		if len(fields) == 0 || fields[0] != "kubectl" {
+			continue
+		}
+		verb, verbIndex, ok := kubectlVerbAndIndexFromFields(fields, 0)
+		if !ok || strings.ToLower(verb) != "auth" {
+			continue
+		}
+		if !isReadOnlyKubectlSubcommand(fields, verbIndex) {
+			return true
+		}
+	}
+	return false
 }
 
 func readonlyShellScriptFromFunctionCall(call gollm.FunctionCall) (string, bool) {
@@ -1048,14 +1157,17 @@ func isReadOnlyKubectlPipeline(command string) bool {
 		return false
 	}
 	for _, segment := range segments {
-		if containsShellRedirection(segment) || containsMutatingKubectlVerb(segment) {
+		if containsShellEvaluation(segment) || containsShellRedirection(segment) || containsMutatingKubectlVerb(segment) {
 			return false
 		}
 	}
 
 	firstFields := strings.Fields(segments[0])
-	verb, ok := kubectlVerbFromFields(firstFields, 0)
+	verb, verbIndex, ok := kubectlVerbAndIndexFromFields(firstFields, 0)
 	if len(firstFields) < 2 || firstFields[0] != "kubectl" || !ok || !isKubectlReadOnlyVerb(verb) {
+		return false
+	}
+	if !isReadOnlyKubectlSubcommand(firstFields, verbIndex) {
 		return false
 	}
 	// Later pipeline segments are only allowed when they are local text
@@ -1068,6 +1180,73 @@ func isReadOnlyKubectlPipeline(command string) bool {
 		}
 	}
 	return true
+}
+
+func containsShellEvaluation(command string) bool {
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for i := 0; i < len(command); i++ {
+		ch := command[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && !inSingle {
+			escaped = true
+			continue
+		}
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if inSingle {
+			continue
+		}
+		if ch == '`' {
+			return true
+		}
+		if ch == '$' && i+1 < len(command) && command[i+1] == '(' {
+			return true
+		}
+		if (ch == '<' || ch == '>') && i+1 < len(command) && command[i+1] == '(' {
+			return true
+		}
+	}
+	return containsHeredocOperator(command)
+}
+
+func containsHeredocOperator(command string) bool {
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for i := 0; i < len(command)-1; i++ {
+		ch := command[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && !inSingle {
+			escaped = true
+			continue
+		}
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+			continue
+		}
+		if !inSingle && !inDouble && ch == '<' && command[i+1] == '<' {
+			return true
+		}
+	}
+	return false
 }
 
 func containsShellRedirection(command string) bool {
@@ -1296,6 +1475,51 @@ func isKubectlReadOnlyVerb(verb string) bool {
 	}
 }
 
+func isReadOnlyKubectlSubcommand(fields []string, verbIndex int) bool {
+	if verbIndex < 0 || verbIndex >= len(fields) {
+		return false
+	}
+	if strings.ToLower(strings.Trim(fields[verbIndex], "'\"")) != "auth" {
+		return true
+	}
+	for i := verbIndex + 1; i < len(fields); i++ {
+		field := strings.Trim(fields[i], "'\"")
+		if field == "" {
+			continue
+		}
+		if strings.HasPrefix(field, "--") {
+			if strings.Contains(field, "=") {
+				continue
+			}
+			if kubectlAuthFlagRequiresValue(field) && i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(field, "-") {
+			if kubectlAuthShortFlagRequiresValue(field) && len(field) == 2 && i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		switch strings.ToLower(field) {
+		case "can-i", "whoami":
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func kubectlAuthFlagRequiresValue(flag string) bool {
+	return kubectlFlagRequiresValue(flag)
+}
+
+func kubectlAuthShortFlagRequiresValue(flag string) bool {
+	return kubectlShortFlagRequiresValue(flag)
+}
+
 func isKubectlMutatingVerb(verb string) bool {
 	switch strings.ToLower(verb) {
 	case "apply", "delete", "patch", "replace", "edit", "scale", "set", "create", "annotate", "label", "cordon", "uncordon", "drain", "taint":
@@ -1440,13 +1664,7 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 
 	l.pendingCalls = nil
 	l.currIteration++
-	if l.guideStepState != nil && l.guideStepState.allCompleted() && !l.finalReportRequested {
-		if l.phaseStepState != nil && strings.EqualFold(l.phaseStepState.currentStep().Name, "guided_diagnosis") {
-			l.requestGuidedDiagnosisPhaseProgress()
-		} else {
-			l.requestFinalReportFromModel()
-		}
-	}
+	l.requestPostGuideCompletionDirective()
 	if l.shouldCompactBeforeNextSend() {
 		l.compactBeforeNextIteration("Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it.")
 	}
@@ -1488,11 +1706,67 @@ func (l *Loop) recordAction(call PendingCall, result map[string]any) {
 	}
 	if guideProgressObservationUseful(result) && l.guideProgressAllowedForCurrentPhase() {
 		if step, ok := guideStepCompletedFromFunctionCall(call.FunctionCall); ok {
-			l.markGuideStepCompleted(step)
+			if l.markGuideStepCompleted(step) {
+				l.requestPostGuideCompletionDirective()
+			}
 		} else if step, ok := l.inferGuideStepCompletedFromFunctionCall(call.FunctionCall); ok {
-			l.markGuideStepCompleted(step)
+			if l.markGuideStepCompleted(step) {
+				l.requestPostGuideCompletionDirective()
+			}
 		}
 	}
+}
+
+func (l *Loop) consumeGuideProgress(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
+	var remaining []gollm.FunctionCall
+	handled := false
+	for _, call := range calls {
+		if call.Name != internalGuideProgressCall {
+			remaining = append(remaining, call)
+			continue
+		}
+		handled = true
+		if !l.guideProgressAllowedForCurrentPhase() {
+			if !l.appendCorrectionWithCompaction("guide_progress_wrong_phase", "guide_progress is only valid while a resource guide is active inside guided_diagnosis. Continue the current phase with a valid structured output or action.") {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "잘못된 phase의 guide_progress가 반복되어 진단을 중단합니다.")
+				l.currIteration = 0
+				l.state = StateDone
+				return remaining, true
+			}
+			l.currIteration++
+			l.state = StateRunning
+			return remaining, true
+		}
+		step, ok := guideStepCompletedFromArguments(call.Arguments)
+		if !ok {
+			if !l.appendCorrectionWithCompaction("invalid_guide_progress", "guide_progress payload was invalid. Return guide_progress with step_completed as a positive 1-based guide step index and evidence_useful=true only when live evidence advanced that step.") {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "guide_progress 형식 오류가 반복되어 진단을 중단합니다.")
+				l.currIteration = 0
+				l.state = StateDone
+				return remaining, true
+			}
+			l.currIteration++
+			l.state = StateRunning
+			return remaining, true
+		}
+		if l.markGuideStepCompleted(step) {
+			l.requestPostGuideCompletionDirective()
+		}
+		l.currChatContent = append(l.currChatContent, gollm.FunctionCallResult{
+			ID:   call.ID,
+			Name: call.Name,
+			Result: map[string]any{
+				"status":         "recorded",
+				"step_completed": step,
+			},
+		})
+	}
+	if handled && len(remaining) == 0 {
+		l.currIteration++
+		l.state = StateRunning
+		return nil, true
+	}
+	return remaining, false
 }
 
 func (l *Loop) guideProgressAllowedForCurrentPhase() bool {
@@ -1526,6 +1800,10 @@ func guideStepCompletedFromFunctionCall(call gollm.FunctionCall) (int, bool) {
 	if !ok {
 		return 0, false
 	}
+	return guideStepCompletedFromArguments(raw)
+}
+
+func guideStepCompletedFromArguments(raw map[string]any) (int, bool) {
 	if useful, ok := raw["evidence_useful"]; ok && !boolFromAny(useful) {
 		return 0, false
 	}

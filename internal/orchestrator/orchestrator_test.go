@@ -219,6 +219,29 @@ func TestLooksIncidentGuidanceWorthyIgnoresInternalRuntimeErrors(t *testing.T) {
 	}
 }
 
+func TestBuildRemediationPromptDoesNotForceKorean(t *testing.T) {
+	flow := &IncidentGuidanceFlow{remediationBrief: "OOMKilled runbook"}
+	prompt := flow.buildRemediationPrompt()
+	if strings.Contains(prompt, "한국어") {
+		t.Fatalf("remediation prompt must not force Korean: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Follow the active language policy") {
+		t.Fatalf("remediation prompt should defer language policy: %s", prompt)
+	}
+}
+
+func TestExtractTargetDoesNotDefaultToPod(t *testing.T) {
+	target := extractTarget("deployment web is unavailable in namespace prod")
+	if target.Kind != "deployment" || target.Name != "web" || target.PodName != "" {
+		t.Fatalf("unexpected deployment target: %#v", target)
+	}
+
+	unknown := extractTarget("the workload is unhealthy")
+	if unknown.Kind != "" || unknown.Name != "" || unknown.PodName != "" {
+		t.Fatalf("unidentified target should stay empty, got %#v", unknown)
+	}
+}
+
 func TestIncidentGuidanceFlowTransitionsFromEvidenceToOffer(t *testing.T) {
 	flow := NewIncidentGuidanceFlow()
 	flow.ObserveUserInput("OOMKilled 원인을 분석해줘")

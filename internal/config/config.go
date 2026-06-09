@@ -181,6 +181,12 @@ func normalizeLangConfig(cfg *Config) {
 	}
 }
 
+// ApplyProviderCredentials refreshes provider-specific runtime credentials
+// after the provider has been finalized by config, env, or CLI flags.
+func ApplyProviderCredentials(cfg *Config) {
+	applyProviderCredentials(cfg)
+}
+
 // expandHome은 경로에서 ~ 를 홈 디렉토리로 확장합니다
 func expandHome(path, home string) string {
 	if strings.HasPrefix(path, "~/") {
@@ -195,6 +201,18 @@ func expandHome(path, home string) string {
 // applyEnvironmentOverrides는 환경변수 > config.yaml 필드 > 기본값 순으로 설정을 적용합니다.
 // 결과는 cfg.APIKey / cfg.Endpoint 로 집약되어 setupProviderEnv가 읽어 간다.
 func applyEnvironmentOverrides(cfg *Config) {
+	if v := os.Getenv("LLM_PROVIDER"); v != "" {
+		cfg.LLMProvider = v
+	}
+	if v := os.Getenv("MODEL"); v != "" {
+		cfg.Model = v
+	}
+	applyProviderCredentials(cfg)
+}
+
+func applyProviderCredentials(cfg *Config) {
+	cfg.APIKey = ""
+	cfg.Endpoint = ""
 	switch cfg.LLMProvider {
 	case "anthropic":
 		if v := os.Getenv("ANTHROPIC_API_KEY"); v != "" {
@@ -269,13 +287,6 @@ func applyEnvironmentOverrides(cfg *Config) {
 	case "bedrock":
 		// AWS SDK 자동 처리
 	}
-
-	if v := os.Getenv("LLM_PROVIDER"); v != "" {
-		cfg.LLMProvider = v
-	}
-	if v := os.Getenv("MODEL"); v != "" {
-		cfg.Model = v
-	}
 }
 
 // Save는 현재 설정을 ~/.k8s-assistant/config.yaml에 저장합니다.
@@ -288,7 +299,11 @@ func (c *Config) Save() error {
 		return err
 	}
 
-	data, err := yaml.Marshal(c)
+	saved := *c
+	saved.APIKey = ""
+	saved.Endpoint = ""
+
+	data, err := yaml.Marshal(&saved)
 	if err != nil {
 		return err
 	}

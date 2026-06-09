@@ -295,6 +295,7 @@ type Orchestrator struct {
 	logger           *Logger
 	rl               *readline.Instance
 	kubeconfigInfo   *k8s.KubeconfigInfo
+	runOnce          bool
 }
 
 // New는 새 Orchestrator를 생성하고 초기화합니다.
@@ -376,6 +377,7 @@ func (o *Orchestrator) Run(ctx context.Context, initialQuery string) error {
 
 	initialQuery = strings.TrimSpace(initialQuery)
 	if initialQuery != "" {
+		o.runOnce = true
 		if inputIsQuit(initialQuery) {
 			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
 			return nil
@@ -556,6 +558,14 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 		o.incidentGuidance.RecordEvidence(masked)
 
 	case api.MessageTypeUserInputRequest:
+		if o.runOnce {
+			o.runOnce = false
+			if o.agentWrap != nil {
+				o.agentWrap.Close()
+			}
+			o.clearAgent()
+			return io.EOF
+		}
 		return o.handleAgentInputRequest()
 
 	case api.MessageTypeUserChoiceRequest:
@@ -600,7 +610,7 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 		activeAgent.SendInput(&api.UserInputResponse{Query: ""})
 		return nil
 	}
-	if strings.HasPrefix(input, "/") {
+	if strings.HasPrefix(input, "/") && !activeAgent.AcceptsRawSlashInput() {
 		if err := o.selectMetaCommand(input); err != nil && err != io.EOF {
 			fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
 		}

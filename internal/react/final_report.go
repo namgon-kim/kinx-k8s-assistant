@@ -28,6 +28,17 @@ func (l *Loop) markGuideStepCompleted(stepIndex int) bool {
 	return state.allCompleted()
 }
 
+func (l *Loop) requestPostGuideCompletionDirective() {
+	if l.guideStepState == nil || !l.guideStepState.allCompleted() {
+		return
+	}
+	if l.phaseStepState != nil && strings.EqualFold(l.phaseStepState.currentStep().Name, "guided_diagnosis") {
+		l.requestGuidedDiagnosisPhaseProgress()
+		return
+	}
+	l.requestFinalReportFromModel()
+}
+
 // requestFinalReportFromModel prompts the model to emit a final_report. Used
 // when all diagnostic_steps have been completed (or are no longer useful).
 // The instruction is appended to currChatContent so it goes out in the next

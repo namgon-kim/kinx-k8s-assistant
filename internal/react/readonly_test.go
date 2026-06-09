@@ -226,6 +226,84 @@ func TestAnalyzeToolCallsBlocksReadOnlyBashCRedirection(t *testing.T) {
 	}
 }
 
+func TestAnalyzeToolCallsBlocksReadOnlyShellEvaluation(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	tests := []string{
+		`kubectl get pods $(kubectl delete pod app -n tests)`,
+		"kubectl get pods `kubectl delete pod app -n tests`",
+		`kubectl get pods <(kubectl get pods -o name)`,
+		"kubectl get pods <<EOF\nEOF",
+	}
+	for _, command := range tests {
+		pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": command,
+			},
+		}})
+		if err != nil {
+			t.Fatalf("analyze tool calls for %q: %v", command, err)
+		}
+		if len(pending) != 1 {
+			t.Fatalf("unexpected pending count for %q: %d", command, len(pending))
+		}
+		if pending[0].ModifiesResource == "no" {
+			t.Fatalf("expected shell evaluation to be blocked for %q, got %q", command, pending[0].ModifiesResource)
+		}
+	}
+}
+
+func TestAnalyzeToolCallsAllowsOnlySafeKubectlAuthReadOnlySubcommands(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	allowed := []string{
+		"kubectl auth can-i get pods -n tests",
+		"kubectl auth whoami",
+	}
+	for _, command := range allowed {
+		pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": command,
+			},
+		}})
+		if err != nil {
+			t.Fatalf("analyze allowed auth command %q: %v", command, err)
+		}
+		if pending[0].ModifiesResource != "no" {
+			t.Fatalf("expected auth command %q to be read-only, got %q", command, pending[0].ModifiesResource)
+		}
+	}
+
+	blocked := []string{
+		"kubectl auth reconcile -f role.yaml",
+		"kubectl auth",
+	}
+	for _, command := range blocked {
+		pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": command,
+			},
+		}})
+		if err != nil {
+			t.Fatalf("analyze blocked auth command %q: %v", command, err)
+		}
+		if pending[0].ModifiesResource == "no" {
+			t.Fatalf("expected auth command %q to be blocked, got %q", command, pending[0].ModifiesResource)
+		}
+	}
+}
+
 func TestExtractShellScriptDoesNotTreatLongFlagAsDashC(t *testing.T) {
 	if script, ok := extractShellScript(`bash --rcfile "kubectl get pods"`); ok {
 		t.Fatalf("did not expect --rcfile to be treated as -c, got %q", script)

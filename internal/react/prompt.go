@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -106,7 +107,7 @@ func buildSystemPromptWithOptions(templateFile string, registry tools.Tools, opt
 	}
 	promptCache.Unlock()
 
-	defs := collectFunctionDefinitionsForProfile(registry, opts.ToolProfile)
+	defs := collectFunctionDefinitionsForProfile(registry, opts.ToolProfile, false)
 	rawDefs, err := json.MarshalIndent(defs, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("tool definition 직렬화 실패: %w", err)
@@ -178,8 +179,8 @@ func selectToolProfile(registry tools.Tools, _ RequestIntent, _ string) ToolProf
 	}
 }
 
-func collectFunctionDefinitionsForProfile(registry tools.Tools, profile ToolProfile) []*gollm.FunctionDefinition {
-	defs := make([]*gollm.FunctionDefinition, 0, len(profile.ToolNames))
+func collectFunctionDefinitionsForProfile(registry tools.Tools, profile ToolProfile, includeInternal bool) []*gollm.FunctionDefinition {
+	defs := make([]*gollm.FunctionDefinition, 0, len(profile.ToolNames)+8)
 	for _, name := range profile.ToolNames {
 		tool := registry.Lookup(name)
 		if tool == nil {
@@ -187,10 +188,129 @@ func collectFunctionDefinitionsForProfile(registry tools.Tools, profile ToolProf
 		}
 		defs = append(defs, tool.FunctionDefinition())
 	}
+	if includeInternal {
+		defs = append(defs, internalStructuredFunctionDefinitions()...)
+	}
 	sort.Slice(defs, func(i, j int) bool {
 		return defs[i].Name < defs[j].Name
 	})
 	return defs
+}
+
+func internalStructuredFunctionDefinitions() []*gollm.FunctionDefinition {
+	return []*gollm.FunctionDefinition{
+		internalStructuredFunctionDefinition(
+			internalRequirementAnalysisCall,
+			"Submit the required first-pass classification of the user's request before choosing any tool action.",
+			requirementAnalysis{},
+		),
+		internalStructuredFunctionDefinition(
+			internalRequestContextCall,
+			"Submit the accepted runtime request context derived from requirement_analysis.",
+			requestContext{},
+		),
+		internalStructuredFunctionDefinition(
+			internalPhasePlanCall,
+			"Submit the ordered forward-only phase plan before choosing actions for the accepted request.",
+			phasePlan{},
+		),
+		internalStructuredFunctionDefinition(
+			internalPhaseProgressCall,
+			"Complete or advance the active top-level phase_step when its completion condition is satisfied.",
+			phaseProgress{},
+		),
+		internalStructuredFunctionDefinition(
+			internalGuideProgressCall,
+			"Record completion of a nested resource-guide diagnostic step while guided_diagnosis is active.",
+			guideProgress{},
+		),
+		internalStructuredFunctionDefinition(
+			internalResourceGuideLookupCall,
+			"Request a runtime-managed resource-guide lookup from the guidance_lookup phase for a CRD-backed resource family and operational problem focus.",
+			resourceGuideLookup{},
+		),
+		internalStructuredFunctionDefinition(
+			internalFinalReportCall,
+			"Submit the structured final diagnostic report when enough evidence has been collected or blockers are known.",
+			finalReport{},
+		),
+		internalStructuredFunctionDefinition(
+			internalNextDirectionsCall,
+			"Submit 1-3 continuation options after an inconclusive final_report.",
+			nextDirections{},
+		),
+	}
+}
+
+func internalStructuredFunctionDefinition(name, description string, value any) *gollm.FunctionDefinition {
+	return &gollm.FunctionDefinition{
+		Name:        name,
+		Description: description,
+		Parameters:  buildFunctionSchema(reflect.TypeOf(value)),
+	}
+}
+
+func buildFunctionSchema(t reflect.Type) *gollm.Schema {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return &gollm.Schema{Type: gollm.TypeString}
+	case reflect.Bool:
+		return &gollm.Schema{Type: gollm.TypeBoolean}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return &gollm.Schema{Type: gollm.TypeInteger}
+	case reflect.Slice, reflect.Array:
+		return &gollm.Schema{Type: gollm.TypeArray, Items: buildFunctionSchema(t.Elem())}
+	case reflect.Map:
+		return &gollm.Schema{Type: gollm.TypeObject}
+	case reflect.Struct:
+		schema := &gollm.Schema{
+			Type:       gollm.TypeObject,
+			Properties: map[string]*gollm.Schema{},
+		}
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			if field.PkgPath != "" {
+				continue
+			}
+			name, required, ok := jsonFieldName(field)
+			if !ok {
+				continue
+			}
+			schema.Properties[name] = buildFunctionSchema(field.Type)
+			if required {
+				schema.Required = append(schema.Required, name)
+			}
+		}
+		return schema
+	default:
+		return &gollm.Schema{Type: gollm.TypeString}
+	}
+}
+
+func jsonFieldName(field reflect.StructField) (string, bool, bool) {
+	tag := field.Tag.Get("json")
+	if tag == "-" {
+		return "", false, false
+	}
+	if tag == "" {
+		return field.Name, true, true
+	}
+	parts := strings.Split(tag, ",")
+	name := parts[0]
+	if name == "" {
+		name = field.Name
+	}
+	required := true
+	for _, opt := range parts[1:] {
+		if opt == "omitempty" {
+			required = false
+			break
+		}
+	}
+	return name, required, true
 }
 
 func shortHash(content string) string {

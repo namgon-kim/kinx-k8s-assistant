@@ -165,6 +165,7 @@ func main() {
 		Long:  "자연어로 Kubernetes 클러스터를 조작하고 트러블슈팅하는 AI 어시스턴트입니다.",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			config.ApplyProviderCredentials(cfg)
 			closeLog, err := setupKlog(cfg)
 			if err != nil {
 				return err
