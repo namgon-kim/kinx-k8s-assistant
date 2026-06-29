@@ -12,6 +12,9 @@ func (l *Loop) rejectInconsistentActionTargets(calls []gollm.FunctionCall) bool 
 	for _, call := range calls {
 		message, invalid := inconsistentActionTargetMessage(call)
 		if !invalid {
+			message, invalid = l.requestNamespaceInvariantMessage(call)
+		}
+		if !invalid {
 			continue
 		}
 		if !l.appendCorrectionWithCompaction("inconsistent_action_target", message) {
@@ -27,6 +30,53 @@ func (l *Loop) rejectInconsistentActionTargets(calls []gollm.FunctionCall) bool 
 		return true
 	}
 	return false
+}
+
+func (l *Loop) requestNamespaceInvariantMessage(call gollm.FunctionCall) (string, bool) {
+	requestNamespace := l.requestScopeNamespace()
+	if requestNamespace == "" {
+		return "", false
+	}
+	command, ok := kubectlCommandFromFunctionCall(call)
+	if !ok || !containsMutatingKubectlVerb(command) {
+		return "", false
+	}
+	target, hasTarget := actionTargetFromFunctionCall(call)
+	targetResource := ""
+	if hasTarget {
+		targetResource = normalizeKubectlResource(strings.ToLower(strings.TrimSpace(target.Resource)))
+		if target.Namespace != "" && !isAllNamespacesValue(target.Namespace) && target.Namespace != requestNamespace && kubectlResourceUsuallyNamespaced(targetResource) {
+			return fmt.Sprintf("Request namespace is %q, but action target namespace is %q. Preserve the request namespace for namespaced resource mutations and return one corrected action with target.namespace=%q and `-n %s` or `--namespace=%s` in the command.", requestNamespace, target.Namespace, requestNamespace, requestNamespace, requestNamespace), true
+		}
+	}
+	resource := targetResource
+	if resource == "" {
+		resource, _ = primaryMutatingKubectlResource(command)
+	}
+	if resource == "" || !kubectlResourceUsuallyNamespaced(resource) {
+		return "", false
+	}
+	if commandUsesAllNamespaces(command) {
+		return fmt.Sprintf("Request namespace is %q, but command %q uses all-namespaces scope for a namespaced resource mutation. Mutating actions must target one resolved namespace. Return one corrected action with `-n %s` or `--namespace=%s`.", requestNamespace, command, requestNamespace, requestNamespace), true
+	}
+	if namespace, ok := commandNamespaceValue(command); ok {
+		if namespace != requestNamespace {
+			return fmt.Sprintf("Request namespace is %q, but command %q targets namespace %q. Mutating actions must preserve the resolved request namespace. Return one corrected action with `-n %s` or `--namespace=%s`.", requestNamespace, command, namespace, requestNamespace, requestNamespace), true
+		}
+		return "", false
+	}
+	return fmt.Sprintf("Request namespace is %q, but mutating command %q omits namespace for namespaced resource %q. Do not rely on kubectl's implicit default namespace. Return one corrected action with `-n %s` or `--namespace=%s`.", requestNamespace, command, resource, requestNamespace, requestNamespace), true
+}
+
+func (l *Loop) requestScopeNamespace() string {
+	if l == nil || l.requestContext == nil {
+		return ""
+	}
+	namespace := cleanNamespaceValue(l.requestContext.Scope.Namespace)
+	if namespace == "" || isAllNamespacesValue(namespace) {
+		return ""
+	}
+	return namespace
 }
 
 func (l *Loop) rejectInvalidKubectlResources(calls []gollm.FunctionCall) bool {
@@ -433,17 +483,24 @@ func commandUsesNamespace(command, namespace string) bool {
 	if isAllNamespacesValue(namespace) {
 		return commandUsesAllNamespaces(command)
 	}
+	if actual, ok := commandNamespaceValue(command); ok && actual == namespace {
+		return true
+	}
+	return false
+}
+
+func commandNamespaceValue(command string) (string, bool) {
 	fields := strings.Fields(command)
 	for i, field := range fields {
 		trimmed := strings.Trim(field, "'\"")
-		if (trimmed == "-n" || trimmed == "--namespace") && i+1 < len(fields) && strings.Trim(fields[i+1], "'\"") == namespace {
-			return true
+		if (trimmed == "-n" || trimmed == "--namespace") && i+1 < len(fields) {
+			return strings.Trim(fields[i+1], "'\""), true
 		}
-		if strings.HasPrefix(trimmed, "--namespace=") && strings.TrimPrefix(trimmed, "--namespace=") == namespace {
-			return true
+		if strings.HasPrefix(trimmed, "--namespace=") {
+			return strings.TrimPrefix(trimmed, "--namespace="), true
 		}
 	}
-	return false
+	return "", false
 }
 
 func commandUsesAllNamespaces(command string) bool {
@@ -462,6 +519,64 @@ func isAllNamespacesValue(value string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func primaryMutatingKubectlResource(command string) (string, bool) {
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(command)))
+	for i := 0; i < len(fields); i++ {
+		if strings.Trim(fields[i], "'\"") != "kubectl" {
+			continue
+		}
+		verb, verbIndex, ok := kubectlVerbAndIndexFromFields(fields, i)
+		if !ok || !isKubectlMutatingVerb(verb) {
+			continue
+		}
+		resource, ok := firstKubectlResourceArg(fields, verbIndex+1)
+		if !ok {
+			continue
+		}
+		resource = normalizeKubectlResource(strings.ToLower(strings.TrimSpace(resource)))
+		if resource != "" {
+			return resource, true
+		}
+	}
+	return "", false
+}
+
+func kubectlResourceUsuallyNamespaced(resource string) bool {
+	resource = normalizeKubectlResource(strings.ToLower(strings.TrimSpace(resource)))
+	if resource == "" || resource == "unknown" {
+		return false
+	}
+	switch resource {
+	case "apiservice",
+		"certificatesigningrequest",
+		"clusterrole",
+		"clusterrolebinding",
+		"componentstatus",
+		"csidriver",
+		"csinode",
+		"customresourcedefinition",
+		"flowschema",
+		"ingressclass",
+		"mutatingwebhookconfiguration",
+		"namespace",
+		"node",
+		"persistentvolume",
+		"priorityclass",
+		"prioritylevelconfiguration",
+		"runtimeclass",
+		"selfsubjectaccessreview",
+		"selfsubjectrulesreview",
+		"storageclass",
+		"subjectaccessreview",
+		"tokenreview",
+		"validatingwebhookconfiguration",
+		"volumeattachment":
+		return false
+	default:
+		return true
 	}
 }
 

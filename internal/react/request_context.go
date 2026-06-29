@@ -85,6 +85,14 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 }
 
 func (l *Loop) applyPriorContextToFollowUpRequirementAnalysis(analysis requirementAnalysis) requirementAnalysis {
+	if l.shouldRetryPreviousRequest(analysis) {
+		if prior := cloneRequirementAnalysis(l.lastRequirementAnalysis); prior != nil {
+			prior.OperationalFocus = retryPreviousOperationalFocus(prior.OperationalFocus)
+			prior.Evidence = append([]string{"Recompute the previous answer accurately from live evidence; do not rely on the prior assistant text."}, prior.Evidence...)
+			prior.Ambiguities = nil
+			return *prior
+		}
+	}
 	if !l.shouldDefaultRequirementAnalysisFromPriorContext(analysis) {
 		return analysis
 	}
@@ -130,6 +138,52 @@ func (l *Loop) applyPriorContextToFollowUpRequirementAnalysis(analysis requireme
 		analysis.Resources = fillPreviousContextPrimaryResource(analysis.Resources, prior)
 	}
 	return analysis
+}
+
+func (l *Loop) shouldRetryPreviousRequest(analysis requirementAnalysis) bool {
+	if l.lastRequestContext == nil {
+		return false
+	}
+	query := strings.ToLower(strings.TrimSpace(l.originalQuery))
+	if query == "" {
+		return false
+	}
+	retryText := strings.Contains(query, "다시") ||
+		strings.Contains(query, "정확") ||
+		strings.Contains(query, "아닌") ||
+		strings.Contains(query, "틀렸") ||
+		strings.Contains(query, "재계산") ||
+		strings.Contains(query, "recalculate") ||
+		strings.Contains(query, "again") ||
+		strings.Contains(query, "not right") ||
+		strings.Contains(query, "incorrect") ||
+		strings.Contains(query, "wrong")
+	if !retryText {
+		return false
+	}
+	if strings.EqualFold(analysis.Target.Category, "conversation") ||
+		strings.EqualFold(analysis.Target.Category, "unknown") ||
+		strings.Contains(strings.ToLower(analysis.Action), "clarify") {
+		return true
+	}
+	return len(analysis.Resources) == 0 && strings.TrimSpace(analysis.Scope.Namespace) == ""
+}
+
+func retryPreviousOperationalFocus(focus *requirementOperationalFocus) *requirementOperationalFocus {
+	var out requirementOperationalFocus
+	if focus != nil {
+		out = *focus
+		out.RelatedResourceHints = append([]requirementRelatedResource(nil), focus.RelatedResourceHints...)
+		out.EvidenceNeeds = append([]string(nil), focus.EvidenceNeeds...)
+	}
+	out.RelationshipToPrimary = "same_primary"
+	out.ChangedFromPrevious = false
+	out.Reason = "The user rejected the previous answer and asked to recompute it accurately."
+	if strings.TrimSpace(out.Summary) == "" {
+		out.Summary = "Recompute previous answer accurately"
+	}
+	out.EvidenceNeeds = append([]string{"Fresh live evidence and deterministic aggregation for the previous request"}, out.EvidenceNeeds...)
+	return &out
 }
 
 func (l *Loop) shouldDefaultRequirementAnalysisFromPriorContext(analysis requirementAnalysis) bool {

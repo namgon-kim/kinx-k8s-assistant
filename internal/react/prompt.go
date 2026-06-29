@@ -239,6 +239,11 @@ func internalStructuredFunctionDefinitions() []*gollm.FunctionDefinition {
 			"Submit 1-3 continuation options after an inconclusive final_report.",
 			nextDirections{},
 		),
+		internalStructuredFunctionDefinition(
+			internalMutationVerificationResultCall,
+			"Interpret collected mutation verification evidence before final reporting or further remediation.",
+			mutationVerificationResult{},
+		),
 	}
 }
 

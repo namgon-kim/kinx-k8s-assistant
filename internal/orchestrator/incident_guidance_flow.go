@@ -4,15 +4,12 @@ import (
 	"context"
 	"crypto/sha1"
 	"fmt"
-	"io"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/diagnostic"
 	guidance "github.com/namgon-kim/kinx-k8s-assistant/internal/guidance"
-	"github.com/namgon-kim/kinx-k8s-assistant/internal/react"
 )
 
 type incidentGuidancePhase int
@@ -20,18 +17,14 @@ type incidentGuidancePhase int
 const (
 	incidentGuidanceIdle incidentGuidancePhase = iota
 	incidentGuidanceOfferPending
-	incidentGuidanceSearchRequested
-	incidentGuidanceRemediationRequested
 )
 
 type IncidentGuidanceFlow struct {
-	phase            incidentGuidancePhase
-	lastHash         string
-	lastUserQuery    string
-	problemText      string
-	evidence         []string
-	searchBrief      []string
-	remediationBrief string
+	phase         incidentGuidancePhase
+	lastHash      string
+	lastUserQuery string
+	problemText   string
+	evidence      []string
 }
 
 func NewIncidentGuidanceFlow() *IncidentGuidanceFlow {
@@ -39,10 +32,6 @@ func NewIncidentGuidanceFlow() *IncidentGuidanceFlow {
 }
 
 func (f *IncidentGuidanceFlow) AfterAgentText(o *Orchestrator, text string) error {
-	if f.phase == incidentGuidanceSearchRequested {
-		f.searchBrief = appendBounded(f.searchBrief, text, 4)
-		return nil
-	}
 	if f.phase != incidentGuidanceIdle {
 		return nil
 	}
@@ -72,10 +61,6 @@ func (f *IncidentGuidanceFlow) AfterAgentText(o *Orchestrator, text string) erro
 }
 
 func (f *IncidentGuidanceFlow) RecordEvidence(text string) {
-	if f.phase == incidentGuidanceSearchRequested {
-		f.searchBrief = appendBounded(f.searchBrief, text, 4)
-		return
-	}
 	if isInternalRuntimeErrorText(text) {
 		return
 	}
@@ -92,99 +77,45 @@ func (f *IncidentGuidanceFlow) ObserveUserInput(query string) {
 	f.lastUserQuery = query
 }
 
-func (f *IncidentGuidanceFlow) BeforeUserInput(o *Orchestrator, activeAgent *react.Loop) (bool, error) {
-	if f.phase == incidentGuidanceRemediationRequested {
-		f.reset()
-		return false, nil
-	}
-	if f.phase == incidentGuidanceOfferPending {
-		return f.handleOffer(o, activeAgent)
-	}
-	if f.phase == incidentGuidanceSearchRequested {
-		return f.handleRemediationApproval(o, activeAgent)
-	}
-	return false, nil
+func (f *IncidentGuidanceFlow) hasPendingOffer() bool {
+	return f != nil && f.phase == incidentGuidanceOfferPending
 }
 
-func (f *IncidentGuidanceFlow) handleOffer(o *Orchestrator, activeAgent *react.Loop) (bool, error) {
-	input, err := getInputWithUIEchoNoHistory("감지된 문제에 대해 해결 방법을 찾아볼까요? (y/n): ", o.cfg.HistoryFile)
-	if err != nil {
-		if err == io.EOF {
-			f.reset()
-			activeAgent.SendInput(&api.UserInputResponse{Query: ""})
-			return true, nil
-		}
-		return true, err
+func (f *IncidentGuidanceFlow) deferOffer() {
+	if f != nil && f.phase == incidentGuidanceOfferPending {
+		f.phase = incidentGuidanceIdle
 	}
-	if !isYes(input) {
-		o.logEntry("incident_guidance_offer", "declined")
-		f.reset()
-		activeAgent.SendInput(&api.UserInputResponse{Query: ""})
-		return true, nil
-	}
+}
 
-	summary, err := f.runIncidentGuidance(o)
+func (f *IncidentGuidanceFlow) handleChoiceRunbookSearch(o *Orchestrator) error {
+	message := "관련 runbook을 검색하고 있습니다. 잠시만 기다려 주세요."
+	PrintMessage(o.formatter.FormatText(message))
+	o.logEntry("incident_guidance_search_started", message)
+
+	summary, found, err := f.runIncidentGuidance(o)
 	if err != nil {
-		fmt.Println(colorBrightMagenta + "❌ incident guidance 조회 실패: " + err.Error() + colorReset)
+		fmt.Println(colorBrightMagenta + "❌ runbook 검색 실패: " + err.Error() + colorReset)
 		o.logEntry("incident_guidance_search_error", err.Error())
 		f.reset()
-		activeAgent.SendInput(&api.UserInputResponse{Query: ""})
-		return true, nil
+		return nil
 	}
-
+	if !found {
+		message := "검색된 runbook이 없어 incident guidance를 종료합니다."
+		PrintMessage(o.formatter.FormatText(message))
+		o.logEntry("incident_guidance_search", "no_runbook_match")
+		f.reset()
+		return nil
+	}
 	PrintMessage(o.formatter.FormatText(summary))
 	o.logEntry("incident_guidance_search", summary)
-	f.phase = incidentGuidanceSearchRequested
-	f.searchBrief = []string{summary}
-	f.remediationBrief = summary
-	activeAgent.SendInput(&api.UserInputResponse{Query: ""})
-	return true, nil
+	f.reset()
+	return nil
 }
 
-func (f *IncidentGuidanceFlow) handleRemediationApproval(o *Orchestrator, activeAgent *react.Loop) (bool, error) {
-	input, err := getInputWithUIEchoNoHistory("해결을 진행할까요? (y/n): ", o.cfg.HistoryFile)
-	if err != nil {
-		if err == io.EOF {
-			f.reset()
-			activeAgent.SendInput(&api.UserInputResponse{Query: ""})
-			return true, nil
-		}
-		return true, err
-	}
-	if !isYes(input) {
-		o.logEntry("incident_guidance_remediation", "declined")
-		f.reset()
-		activeAgent.SendInput(&api.UserInputResponse{Query: ""})
-		return true, nil
-	}
-
-	prompt := f.buildRemediationPrompt()
-	o.logEntry("incident_guidance_remediation", prompt)
-	f.phase = incidentGuidanceRemediationRequested
-	activeAgent.SendInput(&api.UserInputResponse{Query: prompt})
-	return true, nil
-}
-
-func (f *IncidentGuidanceFlow) buildRemediationPrompt() string {
-	return fmt.Sprintf(`The user approved continuing from the incident guidance remediation plan.
-
-Use the incident guidance result below as planning context and continue the diagnosis in the ReAct/tool loop.
-
-Rules:
-1. Re-check the current cluster state first.
-2. Diagnostic commands are allowed.
-3. Before any resource change, deletion, restart, scale, patch, apply, or set resources operation, request explicit user approval with concrete change details.
-4. Treat the incident guidance result as planning evidence. Do not repeatedly call incident guidance or log-analyzer tools for the same plan.
-5. Follow the active language policy from the system prompt for user-facing output.
-
-Incident guidance result summary:
-%s`, f.remediationBrief)
-}
-
-func (f *IncidentGuidanceFlow) runIncidentGuidance(o *Orchestrator) (string, error) {
+func (f *IncidentGuidanceFlow) runIncidentGuidance(o *Orchestrator) (string, bool, error) {
 	client, err := guidance.NewIncidentClient(o.cfg)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	signal := f.buildProblemSignal(o)
@@ -193,10 +124,13 @@ func (f *IncidentGuidanceFlow) runIncidentGuidance(o *Orchestrator) (string, err
 
 	result, err := client.Analyze(ctx, signal)
 	if err != nil {
-		return "", err
+		return "", false, err
+	}
+	if !incidentGuidanceResultUsable(result) {
+		return "", false, nil
 	}
 
-	return formatIncidentGuidanceSummary(result), nil
+	return formatIncidentGuidanceSummary(result), true, nil
 }
 
 func (f *IncidentGuidanceFlow) buildProblemSignal(o *Orchestrator) diagnostic.ProblemSignal {
@@ -317,8 +251,38 @@ func detectTypes(text string) []diagnostic.DetectionType {
 	if strings.Contains(lower, "imagepullbackoff") {
 		types = append(types, diagnostic.DetectionImagePullBackOff)
 	}
+	if strings.Contains(lower, "errimagepull") {
+		types = append(types, diagnostic.DetectionErrImagePull)
+	}
 	if strings.Contains(lower, "pending") {
 		types = append(types, diagnostic.DetectionPending)
+	}
+	if strings.Contains(lower, "failedscheduling") {
+		types = append(types, diagnostic.DetectionFailedScheduling)
+	}
+	if strings.Contains(lower, "probe failed") || strings.Contains(lower, "readiness probe") || strings.Contains(lower, "liveness probe") {
+		types = append(types, diagnostic.DetectionProbeFailed)
+	}
+	if strings.Contains(lower, "no endpoints") {
+		types = append(types, diagnostic.DetectionServiceNoEndpoint)
+	}
+	if strings.Contains(lower, "connection refused") {
+		types = append(types, diagnostic.DetectionNetworkFailure)
+	}
+	if strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded") {
+		types = append(types, diagnostic.DetectionTimeout)
+	}
+	if strings.Contains(lower, "no space left") {
+		types = append(types, diagnostic.DetectionDiskFull)
+	}
+	if strings.Contains(lower, "permission denied") || strings.Contains(lower, "forbidden") {
+		types = append(types, diagnostic.DetectionPermissionDenied)
+	}
+	if strings.Contains(lower, "createcontainerconfigerror") {
+		types = append(types, diagnostic.DetectionConfigError)
+	}
+	if strings.Contains(lower, "nodenotready") || strings.Contains(lower, "notready") {
+		types = append(types, diagnostic.DetectionType("NodeNotReady"))
 	}
 	if len(types) == 0 {
 		types = append(types, diagnostic.DetectionUnknown)
@@ -344,7 +308,11 @@ func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 	if result.Knowledge != nil && len(result.Knowledge.Cases) > 0 {
 		b.WriteString("- 유사 사례: " + result.Knowledge.Cases[0].Title + "\n")
 	}
-	b.WriteString("- 권장 방향: 현재 Pod/이벤트/이전 로그로 OOMKilled 여부를 재확인한 뒤, 컨트롤러가 있는 워크로드라면 memory request/limit을 조정하고 rollout 상태를 검증합니다.\n")
+	if summary := strings.TrimSpace(result.Plan.Summary); summary != "" {
+		b.WriteString("- 권장 방향: " + summary + "\n")
+	} else if len(result.Runbook.Cases) > 0 {
+		b.WriteString("- 권장 방향: " + firstNonEmptyIncidentText(result.Runbook.Cases[0].Resolution, result.Runbook.Cases[0].Cause, result.Runbook.Cases[0].Title) + "\n")
+	}
 	b.WriteString(fmt.Sprintf("- 위험도: %s\n", result.Plan.RiskLevel))
 	if result.Validation != nil && !result.Validation.Valid {
 		b.WriteString("- 주의: 일부 runbook 명령은 대상 정보가 부족해 자동 실행 후보에서 제외했습니다.\n")
@@ -371,6 +339,93 @@ func formatIncidentGuidanceSummary(result *guidance.ClientResult) string {
 		}
 	}
 	return b.String()
+}
+
+func incidentGuidanceResultUsable(result *guidance.ClientResult) bool {
+	if result == nil || result.Runbook == nil || len(result.Runbook.Cases) == 0 || result.Plan == nil {
+		return false
+	}
+	if detectionTypesUnknown(result.Signal.DetectionTypes) {
+		return false
+	}
+	if result.Validation != nil && !result.Validation.Valid {
+		return false
+	}
+	if !incidentRunbookMatchesSignal(result.Runbook.Cases[0], result.Signal) {
+		return false
+	}
+	if !incidentRunbookTargetCompatible(result.Runbook.Cases[0], result.Signal.Target) {
+		return false
+	}
+	if len(result.Plan.Steps) == 0 && len(result.Plan.Verification) == 0 {
+		return false
+	}
+	return true
+}
+
+func incidentRunbookMatchesSignal(c guidance.GuideCase, signal diagnostic.ProblemSignal) bool {
+	signalTypes := nonUnknownDetectionTypes(signal.DetectionTypes)
+	if len(signalTypes) == 0 {
+		return false
+	}
+	if len(c.MatchTypes) == 0 {
+		return false
+	}
+	for _, signalType := range signalTypes {
+		for _, matchType := range c.MatchTypes {
+			if strings.EqualFold(strings.TrimSpace(string(signalType)), strings.TrimSpace(string(matchType))) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func nonUnknownDetectionTypes(types []diagnostic.DetectionType) []diagnostic.DetectionType {
+	var result []diagnostic.DetectionType
+	for _, t := range types {
+		if t != diagnostic.DetectionUnknown {
+			result = append(result, t)
+		}
+	}
+	return result
+}
+
+func incidentRunbookTargetCompatible(c guidance.GuideCase, target diagnostic.KubernetesTarget) bool {
+	kind := normalizeTargetKind(target.Kind)
+	if kind == "" {
+		return true
+	}
+	if len(c.RelatedObjects) == 0 {
+		return true
+	}
+	for _, related := range c.RelatedObjects {
+		if normalizeTargetKind(related) == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func detectionTypesUnknown(types []diagnostic.DetectionType) bool {
+	if len(types) == 0 {
+		return true
+	}
+	for _, t := range types {
+		if t != diagnostic.DetectionUnknown {
+			return false
+		}
+	}
+	return true
+}
+
+func firstNonEmptyIncidentText(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func executableIncidentSummarySteps(steps []guidance.PlanStep, limit int) []guidance.PlanStep {
@@ -498,8 +553,6 @@ func (f *IncidentGuidanceFlow) reset() {
 	f.phase = incidentGuidanceIdle
 	f.problemText = ""
 	f.evidence = nil
-	f.searchBrief = nil
-	f.remediationBrief = ""
 }
 
 func looksIncidentGuidanceWorthy(text string) bool {
@@ -592,11 +645,6 @@ func isKubernetesLookupOrSummaryQuery(query string) bool {
 		}
 	}
 	return false
-}
-
-func isYes(input string) bool {
-	normalized := strings.TrimSpace(strings.ToLower(input))
-	return normalized == "y" || normalized == "yes" || normalized == "예" || normalized == "네"
 }
 
 func stableTextHash(text string) string {

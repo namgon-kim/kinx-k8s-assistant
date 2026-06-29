@@ -276,7 +276,7 @@ The exact path depends on request type. Not every request needs every phase.
 | Diagnosis | `requirement_analysis -> context_resolution -> observation_planning -> observation_execution -> observation_completion -> guidance_decision(optional) -> final_report` |
 | Follow-up diagnosis | `requirement_analysis -> context_resolution -> observation_planning -> observation_execution -> observation_completion -> guidance_decision(optional) -> final_report` |
 | Explanation | `requirement_analysis -> response_synthesis`, unless live state is required. |
-| Mutation/remediation | `requirement_analysis -> safety_policy -> approval(if needed) -> execution -> final_report` |
+| Mutation/remediation | `requirement_analysis -> safety_policy -> approval(if needed) -> execution -> verification_observation -> mutation_verification_result -> phase_progress/final_report` |
 | Configuration/meta request | Runtime-specific handler when possible; otherwise `requirement_analysis -> response_synthesis`. |
 
 ## Observation Roles
@@ -292,6 +292,25 @@ Observation is a first-class phase before RAG. The model declares the intended o
 | `log_observation` | Reads logs only when logs are the explicit user target or a concrete log-bearing Pod/container/controller has already been identified. | `kubectl logs <pod> -n ns -c <container>` | No for ordinary resource observation; yes only for explicit log analysis or identified log-bearing targets. |
 | `broad_scan` | Scans a wide scope for clues or inventory. | `kubectl get pods -A`, `kubectl get events -A` | Usually no by itself; can become useful evidence if concrete signals are extracted. |
 | `verification_observation` | Checks whether a suspected condition still holds after prior evidence or remediation. | `kubectl -n ns get machine md-... -o yaml`, `kubectl rollout status ...` | Yes for verification-focused requests. |
+
+## Mutation Verification Contract
+
+Mutation/remediation requests have an additional runtime contract after successful execution. Approval only authorizes the change; it does not prove the user's goal was achieved.
+
+After a successful mutating tool observation, runtime creates goal-level verification requirements from the action target and the accepted request context. The model must satisfy those requirements with read-only observations before it can close the phase or emit a final report.
+
+The contract is:
+
+1. The mutating action runs through normal read-only and approval gates.
+2. Runtime records one or more `mutationEvidenceRequirement` entries for the user goal.
+3. The model may issue one or more read-only verification observations that match the remaining requirements.
+4. When all requirements are satisfied, runtime asks for exactly one `mutation_verification_result`.
+5. `mutation_verification_result.status=resolved` permits `phase_progress` or `final_report`.
+6. `status=progressing` or `status=unresolved` requires another ReAct action before phase completion or final report.
+
+This is intentionally goal-level, not line-level. If several mutating commands are required to complete one remediation, runtime accumulates verification requirements across the sequence instead of treating each command as independently done.
+
+`kubectl apply -f ...` has one special policy: when runtime cannot extract a concrete target and the apply output reports success for all applied objects, that output is accepted as the apply evidence and no generic follow-up verification is invented. If the command provides a concrete target, normal verification can still be required for that target.
 
 ## Observation Completion
 

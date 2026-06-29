@@ -202,6 +202,32 @@ func TestShouldOfferIncidentGuidanceForQueryAllowsDiagnosticRequests(t *testing.
 	}
 }
 
+func TestDetectTypesMapsConcreteIncidentSignals(t *testing.T) {
+	cases := []struct {
+		text string
+		want diagnostic.DetectionType
+	}{
+		{text: "0/3 nodes are available: FailedScheduling", want: diagnostic.DetectionFailedScheduling},
+		{text: "Node node-a is NotReady", want: diagnostic.DetectionType("NodeNotReady")},
+		{text: "CreateContainerConfigError because ConfigMap is missing", want: diagnostic.DetectionConfigError},
+		{text: "Error from server (Forbidden)", want: diagnostic.DetectionPermissionDenied},
+	}
+	for _, tc := range cases {
+		if !detectionTypesContain(detectTypes(tc.text), tc.want) {
+			t.Fatalf("detectTypes(%q) missing %q", tc.text, tc.want)
+		}
+	}
+}
+
+func detectionTypesContain(types []diagnostic.DetectionType, want diagnostic.DetectionType) bool {
+	for _, got := range types {
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestLooksIncidentGuidanceWorthyIgnoresNoErrorSummary(t *testing.T) {
 	if looksIncidentGuidanceWorthy("제공된 로그에는 오류 이벤트가 없어 클러스터가 안정적으로 작동했습니다.") {
 		t.Fatal("no-error summary should not trigger incident guidance")
@@ -218,17 +244,6 @@ func TestLooksIncidentGuidanceWorthyIgnoresInternalRuntimeErrors(t *testing.T) {
 		if looksIncidentGuidanceWorthy(tc) {
 			t.Fatalf("internal runtime error should not trigger incident guidance: %q", tc)
 		}
-	}
-}
-
-func TestBuildRemediationPromptDoesNotForceKorean(t *testing.T) {
-	flow := &IncidentGuidanceFlow{remediationBrief: "OOMKilled runbook"}
-	prompt := flow.buildRemediationPrompt()
-	if strings.Contains(prompt, "한국어") {
-		t.Fatalf("remediation prompt must not force Korean: %s", prompt)
-	}
-	if !strings.Contains(prompt, "Follow the active language policy") {
-		t.Fatalf("remediation prompt should defer language policy: %s", prompt)
 	}
 }
 
@@ -300,10 +315,44 @@ func TestIncidentGuidanceFlowTransitionsFromEvidenceToOffer(t *testing.T) {
 		t.Fatalf("unexpected captured state: problem=%q evidence=%#v", flow.problemText, flow.evidence)
 	}
 
-	flow.phase = incidentGuidanceSearchRequested
+	flow.deferOffer()
 	flow.RecordEvidence("pod logs show OOMKilled")
-	if len(flow.searchBrief) != 1 {
-		t.Fatalf("search brief = %#v, want one item", flow.searchBrief)
+	if flow.phase != incidentGuidanceIdle {
+		t.Fatalf("deferred offer should stay idle, got phase=%v", flow.phase)
+	}
+}
+
+func TestIncidentGuidanceResultUsableRequiresRunbookMatchAndTargetCompatibility(t *testing.T) {
+	base := &guidance.ClientResult{
+		Signal: diagnostic.ProblemSignal{
+			DetectionTypes: []diagnostic.DetectionType{diagnostic.DetectionPending},
+			Target:         diagnostic.KubernetesTarget{Kind: "deployment", Name: "web"},
+		},
+		Runbook: &guidance.GuideSearchResult{Cases: []guidance.GuideCase{{
+			Title:          "Node NotReady",
+			MatchTypes:     []diagnostic.DetectionType{"NodeNotReady"},
+			RelatedObjects: []string{"Node", "Pod"},
+		}}},
+		Plan: &guidance.RemediationPlan{
+			Steps: []guidance.PlanStep{{Description: "check node"}},
+		},
+	}
+	if incidentGuidanceResultUsable(base) {
+		t.Fatal("mismatched detection and target should not produce a usable incident runbook")
+	}
+
+	base.Runbook.Cases[0] = guidance.GuideCase{
+		Title:          "Pending / FailedScheduling",
+		MatchTypes:     []diagnostic.DetectionType{diagnostic.DetectionPending},
+		RelatedObjects: []string{"Pod", "Node"},
+	}
+	if incidentGuidanceResultUsable(base) {
+		t.Fatal("deployment target should not use a pod/node-only runbook without validation compatibility")
+	}
+
+	base.Signal.Target.Kind = "pod"
+	if !incidentGuidanceResultUsable(base) {
+		t.Fatal("matching detection and compatible target should be usable")
 	}
 }
 

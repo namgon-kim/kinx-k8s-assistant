@@ -33,6 +33,15 @@ const (
 	StateExited
 )
 
+type InputOwner string
+
+const (
+	InputOwnerOrchestrator InputOwner = "orchestrator"
+	InputOwnerReactChoice  InputOwner = "react_choice"
+	InputOwnerReactText    InputOwner = "react_text"
+	InputOwnerApproval     InputOwner = "approval"
+)
+
 type PendingCall struct {
 	FunctionCall     gollm.FunctionCall
 	ParsedToolCall   *tools.ToolCall
@@ -49,6 +58,7 @@ const internalPhaseProgressCall = "__phase_progress__"
 const internalGuideProgressCall = "__guide_progress__"
 const internalFinalReportCall = "__final_report__"
 const internalNextDirectionsCall = "__next_directions__"
+const internalMutationVerificationResultCall = "__mutation_verification_result__"
 const internalInvalidActionCall = "__invalid_action__"
 const internalInvalidStructuredOutputCall = "__invalid_structured_output__"
 
@@ -104,11 +114,13 @@ type Loop struct {
 	pendingFinalReport           *finalReport
 	pendingNextDirections        *nextDirections
 	pendingDirectionPrompt       *directionPromptState
+	pendingMutationVerification  *pendingMutationVerification
+	mutationContinuationRequired bool
 
 	cancel context.CancelFunc
 	once   sync.Once
 
-	acceptRawSlashInput atomic.Bool
+	inputOwner atomic.Int32
 }
 
 type guideStepState struct {
@@ -207,7 +219,6 @@ func (l *Loop) SendInput(input any) {
 
 func (l *Loop) Close() {
 	l.once.Do(func() {
-		l.setRawSlashInputAccepted(false)
 		if l.cancel != nil {
 			l.cancel()
 		}
@@ -232,15 +243,38 @@ func (l *Loop) Close() {
 	})
 }
 
-func (l *Loop) AcceptsRawSlashInput() bool {
-	return l != nil && l.acceptRawSlashInput.Load()
+func (l *Loop) InputOwner() InputOwner {
+	if l == nil {
+		return InputOwnerOrchestrator
+	}
+	switch l.inputOwner.Load() {
+	case 1:
+		return InputOwnerReactChoice
+	case 2:
+		return InputOwnerReactText
+	case 3:
+		return InputOwnerApproval
+	default:
+		return InputOwnerOrchestrator
+	}
 }
 
-func (l *Loop) setRawSlashInputAccepted(accepted bool) {
+func (l *Loop) setInputOwner(owner InputOwner) {
 	if l == nil {
 		return
 	}
-	l.acceptRawSlashInput.Store(accepted)
+	var value int32
+	switch owner {
+	case InputOwnerReactChoice:
+		value = 1
+	case InputOwnerReactText:
+		value = 2
+	case InputOwnerApproval:
+		value = 3
+	default:
+		value = 0
+	}
+	l.inputOwner.Store(value)
 }
 
 func (l *Loop) init(ctx context.Context) error {
@@ -314,23 +348,28 @@ func (l *Loop) run(ctx context.Context, initialQuery string) {
 
 		switch l.state {
 		case StateIdle, StateDone:
+			l.setInputOwner(InputOwnerOrchestrator)
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeUserInputRequest, ">>>")
 			if !l.waitForInput(ctx) {
 				return
 			}
 		case StateWaitingApproval:
+			l.setInputOwner(InputOwnerApproval)
 			if !l.waitForApproval(ctx) {
 				return
 			}
 		case StateWaitingDirectionChoice:
+			l.setInputOwner(InputOwnerReactChoice)
 			if !l.waitForDirectionChoice(ctx) {
 				return
 			}
 		case StateWaitingDirectionText:
+			l.setInputOwner(InputOwnerReactText)
 			if !l.waitForDirectionText(ctx) {
 				return
 			}
 		case StateRunning:
+			l.setInputOwner(InputOwnerOrchestrator)
 			if err := l.runIteration(ctx); err != nil {
 				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 				l.pendingCalls = nil
@@ -397,7 +436,6 @@ func (l *Loop) waitForApproval(ctx context.Context) bool {
 }
 
 func (l *Loop) startQuery(query string) error {
-	l.setRawSlashInputAccepted(false)
 	intent := classifyRequestIntent(query)
 	l.requestIntent = intent
 	l.captureConversationMemory()
@@ -440,6 +478,8 @@ func (l *Loop) startQuery(query string) error {
 	l.pendingFinalReport = nil
 	l.pendingNextDirections = nil
 	l.pendingDirectionPrompt = nil
+	l.pendingMutationVerification = nil
+	l.mutationContinuationRequired = false
 	l.state = StateRunning
 	return nil
 }
@@ -513,7 +553,6 @@ func (l *Loop) handleMetaQuery(ctx context.Context, query string) bool {
 }
 
 func (l *Loop) clearConversationState() {
-	l.setRawSlashInputAccepted(false)
 	l.currIteration = 0
 	l.currChatContent = nil
 	l.contextBlockHashes = nil
@@ -545,6 +584,8 @@ func (l *Loop) clearConversationState() {
 	l.pendingFinalReport = nil
 	l.pendingNextDirections = nil
 	l.pendingDirectionPrompt = nil
+	l.pendingMutationVerification = nil
+	l.mutationContinuationRequired = false
 }
 
 func (l *Loop) noteContextContent(contents ...any) {
@@ -671,6 +712,12 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	if len(functionCalls) == 0 {
+		if handled := l.rejectPlainAnswerDuringMutationVerification(streamedText); handled {
+			return nil
+		}
+		if handled := l.rejectPlainAnswerDuringMutationContinuation(streamedText); handled {
+			return nil
+		}
 		if l.phaseStepState != nil && strings.TrimSpace(streamedText) != "" && !l.phaseAllowsPlainAnswer() {
 			if handled := l.rejectPlainAnswerOutsideResponsePhase(); handled {
 				return nil
@@ -715,6 +762,20 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		return nil
 	}
 
+	if handled := l.enforcePendingMutationVerification(functionCalls); handled {
+		return nil
+	}
+
+	if handled := l.enforceMutationContinuation(functionCalls); handled {
+		return nil
+	}
+
+	var mutationVerificationResultHandled bool
+	functionCalls, mutationVerificationResultHandled = l.consumeMutationVerificationResult(functionCalls)
+	if mutationVerificationResultHandled {
+		return nil
+	}
+
 	var guideProgressHandled bool
 	functionCalls, guideProgressHandled = l.consumeGuideProgress(functionCalls)
 	if guideProgressHandled {
@@ -732,6 +793,10 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	if handled := l.rejectActionDuringGuidanceLookupWithoutGuide(functionCalls); handled {
+		return nil
+	}
+
+	if handled := l.rejectConversationalToolCalls(functionCalls); handled {
 		return nil
 	}
 
@@ -793,7 +858,6 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	if !l.skipPermissions && l.hasModifyingCalls() {
 		l.emitAcceptedProgressText(ctx, deferredProgressText)
 		l.requestApproval()
-		l.state = StateWaitingApproval
 		return nil
 	}
 
@@ -802,17 +866,14 @@ func (l *Loop) runIteration(ctx context.Context) error {
 }
 
 // buildIterationSendContent assembles the message list that will be sent to
-// the LLM for the current iteration. It prepends two compact anchors so the
-// model keeps the originally determined request and the active guide step in
-// active attention across many iterations of tool observations:
-//   - requirement_analysis anchor (the user's classified request)
-//   - guide-step anchor (the resource guide's diagnostic-step progress)
-//
-// Order is: [requirement_analysis] → [guide_step] → currChatContent (latest
-// observations). The guide anchor is closer to the latest observation on
-// purpose; the model should consult it just before deciding the next action.
+// the LLM for the current iteration. It prepends compact anchors so the model
+// keeps the active request, phase, nested guide/mutation state, and required
+// next output in active attention across many iterations of tool observations.
 func (l *Loop) buildIterationSendContent() []any {
 	sentContent := append([]any(nil), l.currChatContent...)
+	if anchor := l.mutationVerificationAnchor(); anchor != "" {
+		sentContent = append([]any{anchor}, sentContent...)
+	}
 	if anchor := l.guideStepAnchor(); anchor != "" {
 		sentContent = append([]any{anchor}, sentContent...)
 	}
@@ -820,6 +881,9 @@ func (l *Loop) buildIterationSendContent() []any {
 		sentContent = append([]any{anchor}, sentContent...)
 	}
 	if anchor := l.requirementAnalysisAnchor(); anchor != "" {
+		sentContent = append([]any{anchor}, sentContent...)
+	}
+	if anchor := l.runtimeStateAnchor(); anchor != "" {
 		sentContent = append([]any{anchor}, sentContent...)
 	}
 	return sentContent
@@ -925,6 +989,50 @@ func onlyFunctionCall(calls []gollm.FunctionCall, name string) bool {
 	return len(calls) == 1 && calls[0].Name == name
 }
 
+func (l *Loop) rejectConversationalToolCalls(calls []gollm.FunctionCall) bool {
+	if len(calls) == 0 || l.requirementAnalysis == nil {
+		return false
+	}
+	if !l.requirementAnalysisNeedsDirectConversation() {
+		return false
+	}
+	for _, call := range calls {
+		if isRuntimeInternalCall(call.Name) {
+			continue
+		}
+		message := "The accepted requirement_analysis is a conversation/clarification request. Do not call shell, bash, kubectl, echo, or any other tool to ask the user a question. Return a plain assistant answer/question directly, or complete the clarification phase with phase_progress when the user's intent is already clear."
+		if !l.appendCorrectionWithCompaction("conversation_tool_call", message) {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "대화/확인 요청에서 tool call이 반복되어 진단을 중단합니다.")
+			l.pendingCalls = nil
+			l.currIteration = 0
+			l.state = StateDone
+			return true
+		}
+		l.pendingCalls = nil
+		l.currIteration++
+		l.state = StateRunning
+		return true
+	}
+	return false
+}
+
+func (l *Loop) requirementAnalysisNeedsDirectConversation() bool {
+	analysis := l.requirementAnalysis
+	if analysis == nil {
+		return false
+	}
+	category := strings.ToLower(strings.TrimSpace(analysis.Target.Category))
+	action := strings.ToLower(strings.TrimSpace(analysis.Action))
+	requestType := strings.ToLower(strings.TrimSpace(analysis.RequestType))
+	return category == "conversation" ||
+		requestType == "explanation" && strings.Contains(action, "clarify") ||
+		strings.Contains(action, "clarify_request")
+}
+
+func isRuntimeInternalCall(name string) bool {
+	return internalStructuredCallName(name) != ""
+}
+
 func isContextLengthError(err error) bool {
 	if err == nil {
 		return false
@@ -1005,6 +1113,8 @@ func internalStructuredCallName(name string) string {
 		return internalFinalReportCall
 	case bareInternalCallName(internalNextDirectionsCall), internalNextDirectionsCall:
 		return internalNextDirectionsCall
+	case bareInternalCallName(internalMutationVerificationResultCall), internalMutationVerificationResultCall:
+		return internalMutationVerificationResultCall
 	default:
 		return ""
 	}
@@ -1600,13 +1710,21 @@ func (l *Loop) hasModifyingCalls() bool {
 
 func (l *Loop) rejectReadOnlyModifyingCalls() {
 	var descriptions []string
+	hasUnknown := false
 	for _, call := range l.pendingCalls {
 		if call.ModifiesResource == "no" {
 			continue
 		}
+		if call.ModifiesResource == "unknown" {
+			hasUnknown = true
+		}
 		descriptions = append(descriptions, call.ParsedToolCall.Description())
+		errorMessage := "read-only mode is enabled; commands that modify Kubernetes resources are blocked."
+		if call.ModifiesResource == "unknown" {
+			errorMessage = "read-only mode is enabled; command safety could not be verified, so the command was blocked."
+		}
 		l.appendToolObservation(call, map[string]any{
-			"error":              "read-only mode is enabled; commands that modify Kubernetes resources are blocked.",
+			"error":              errorMessage,
 			"status":             "blocked",
 			"retryable":          false,
 			"modifies_resource":  call.ModifiesResource,
@@ -1617,9 +1735,13 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 		})
 	}
 	if len(descriptions) == 0 {
-		descriptions = append(descriptions, "리소스 변경 명령")
+		descriptions = append(descriptions, "안전성이 확인되지 않은 명령")
 	}
-	l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "read-only 모드가 활성화되어 리소스 변경 명령을 차단했습니다:\n* "+strings.Join(descriptions, "\n* "))
+	headline := "read-only 모드가 활성화되어 리소스 변경 명령을 차단했습니다"
+	if hasUnknown {
+		headline = "read-only 모드가 활성화되어 안전성이 확인되지 않은 명령을 차단했습니다"
+	}
+	l.addMessage(api.MessageSourceAgent, api.MessageTypeError, headline+":\n* "+strings.Join(descriptions, "\n* "))
 	if !l.appendCorrection("readonly_mutation_blocked", "Read-only mode blocked the proposed mutation. Do not repeat the same action or restate the same recommendation in another loop. Your next response must be a single final answer with the cause, evidence, and one manual recommendation.") {
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "read-only 차단 correction이 반복되어 진단을 중단합니다.")
 		l.pendingCalls = nil
@@ -1639,6 +1761,8 @@ func (l *Loop) requestApproval() {
 	}
 	prompt := "다음 명령은 실행 전 승인이 필요합니다:\n* " + strings.Join(descriptions, "\n* ")
 	prompt += "\n\n진행할까요?"
+	l.state = StateWaitingApproval
+	l.setInputOwner(InputOwnerApproval)
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
 		Prompt: prompt,
 		Options: []api.UserChoiceOption{
@@ -1713,6 +1837,7 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 
 func (l *Loop) appendToolObservation(call PendingCall, result map[string]any) {
 	l.recordAction(call, result)
+	l.trackMutationVerification(call, result)
 	if l.cfg.EnableToolUseShim {
 		l.currChatContent = append(l.currChatContent, fmt.Sprintf("Result of running %q:\n%v", call.FunctionCall.Name, result))
 		return
@@ -1816,19 +1941,7 @@ func (l *Loop) guideProgressAllowedForCurrentPhase() bool {
 }
 
 func guideProgressObservationUseful(result map[string]any) bool {
-	if result == nil {
-		return false
-	}
-	if err, ok := result["error"].(string); ok && strings.TrimSpace(err) != "" {
-		return false
-	}
-	status, _ := result["status"].(string)
-	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "blocked", "declined", "failed", "failure", "error":
-		return false
-	default:
-		return true
-	}
+	return toolResultSucceeded(result)
 }
 
 func guideStepCompletedFromFunctionCall(call gollm.FunctionCall) (int, bool) {
