@@ -384,6 +384,13 @@ shim parser는 `requirement_analysis`, `phase_plan`, `phase_progress`, `resource
 - `allowed_next`는 forward-only edge여야 한다. 같은 index 또는 이전 index의 phase로 되돌아가는 back-edge/cycle은 validation에서 거부된다.
 - 뒤에 더 큰 index의 step이 있는 non-terminal step은 적어도 하나의 `allowed_next`가 필요하다.
 
+schema/graph validation 이후에는 `validatePhasePlanForRequest`가 request-aware runtime contract를 검증한다.
+
+- mutation request 또는 mutation/remediation execution phase가 있는 plan은 `mutation_verification`, `verification_observation`, `post_mutation_verification` 같은 verification phase가 필요하다.
+- `guidance_lookup`/`guided_diagnosis`는 runtime discovery가 primary target을 CRD로 확인한 뒤에만 허용된다.
+- `guided_diagnosis`는 `guidance_lookup` 없이 선언할 수 없다.
+- 이 gate에 막힌 plan은 `phaseStepState`로 수용되지 않으므로 action dispatch로 내려가지 않는다.
+
 예외적으로 single-step `lightweight_lookup` phase는 `phase_plan`과 첫 `action`을 같은 응답에 포함할 수 있다. 그 외에는 `phase_plan`만 먼저 받아들인다.
 
 `guide_progress`는 `phase_progress`보다 먼저 소비된다. 따라서 native model이 같은 응답에 `guide_progress`와 `phase_progress`를 함께 내면 guide step completion을 먼저 기록한 뒤 parent phase completion을 검증할 수 있다. `guide_progress` 뒤에 trailing call이 있으면 silently drop하지 않고 남은 pipeline으로 넘긴다.

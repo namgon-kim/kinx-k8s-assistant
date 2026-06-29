@@ -866,15 +866,9 @@ func (l *Loop) runIteration(ctx context.Context) error {
 }
 
 // buildIterationSendContent assembles the message list that will be sent to
-// the LLM for the current iteration. It prepends two compact anchors so the
-// model keeps the originally determined request and the active guide step in
-// active attention across many iterations of tool observations:
-//   - requirement_analysis anchor (the user's classified request)
-//   - guide-step anchor (the resource guide's diagnostic-step progress)
-//
-// Order is: [requirement_analysis] → [guide_step] → currChatContent (latest
-// observations). The guide anchor is closer to the latest observation on
-// purpose; the model should consult it just before deciding the next action.
+// the LLM for the current iteration. It prepends compact anchors so the model
+// keeps the active request, phase, nested guide/mutation state, and required
+// next output in active attention across many iterations of tool observations.
 func (l *Loop) buildIterationSendContent() []any {
 	sentContent := append([]any(nil), l.currChatContent...)
 	if anchor := l.mutationVerificationAnchor(); anchor != "" {
@@ -887,6 +881,9 @@ func (l *Loop) buildIterationSendContent() []any {
 		sentContent = append([]any{anchor}, sentContent...)
 	}
 	if anchor := l.requirementAnalysisAnchor(); anchor != "" {
+		sentContent = append([]any{anchor}, sentContent...)
+	}
+	if anchor := l.runtimeStateAnchor(); anchor != "" {
 		sentContent = append([]any{anchor}, sentContent...)
 	}
 	return sentContent

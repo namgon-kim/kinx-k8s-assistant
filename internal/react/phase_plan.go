@@ -19,6 +19,12 @@ type phaseStepState struct {
 
 const lightweightLookupPhase = "lightweight_lookup"
 
+type phasePlanValidationResult struct {
+	Valid   bool
+	Code    string
+	Message string
+}
+
 func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
 	var remaining []gollm.FunctionCall
 	var accepted *phasePlan
@@ -44,6 +50,11 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 			l.currIteration++
 			l.state = StateRunning
 			return nil, true
+		}
+		if result := l.validatePhasePlanForRequest(plan); !result.Valid {
+			if l.applyGateDecision(result.gateDecision()) {
+				return nil, true
+			}
 		}
 		accepted = &plan
 		l.phaseStepState = newPhaseStepState(plan)
@@ -72,6 +83,55 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 		}
 	}
 	return remaining, false
+}
+
+func (r phasePlanValidationResult) gateDecision() GateDecision {
+	if r.Valid {
+		return allowGateDecision()
+	}
+	code := strings.TrimSpace(r.Code)
+	if code == "" {
+		code = "phase_plan_request_contract"
+	}
+	message := strings.TrimSpace(r.Message)
+	if message == "" {
+		message = "The phase_plan violates the runtime request contract. Return one corrected phase_plan object before choosing an action."
+	}
+	return GateDecision{
+		Allow:           false,
+		Code:            code,
+		UserMessage:     "phase plan이 현재 요청의 runtime contract와 맞지 않아 차단했습니다.",
+		ModelCorrection: message,
+		NextState:       StateRunning,
+	}
+}
+
+func (l *Loop) validatePhasePlanForRequest(plan phasePlan) phasePlanValidationResult {
+	if !phasePlanValid(plan) {
+		return phasePlanValidationResult{
+			Code:    "invalid_phase_plan",
+			Message: "Phase plan was invalid. Return only one corrected phase_plan object before choosing any action. Include request_goal, current_phase_index, and ordered phase_steps with index, name, goal, completion_condition, and allowed_next.",
+		}
+	}
+	if l.phasePlanRequiresMutationVerification(plan) && !phasePlanHasVerificationPhase(plan) {
+		return phasePlanValidationResult{
+			Code:    "phase_plan_missing_mutation_verification",
+			Message: "The accepted request can change Kubernetes resources or the proposed plan contains a mutation/remediation execution phase. Return one corrected phase_plan that includes an explicit mutation_verification or verification_observation phase after mutation execution and before response_synthesis/final_report. Approval alone is not completion evidence.",
+		}
+	}
+	if phasePlanHasGuidedDiagnosis(plan) && !phasePlanHasPhase(plan, "guidance_lookup") {
+		return phasePlanValidationResult{
+			Code:    "phase_plan_guided_diagnosis_without_lookup",
+			Message: "guided_diagnosis is valid only after a declared guidance_lookup phase obtains or records resource-guide context. Return one corrected phase_plan that declares guidance_lookup before guided_diagnosis, or remove guided_diagnosis.",
+		}
+	}
+	if phasePlanHasResourceGuidePhase(plan) && !l.phasePlanAllowsResourceGuidance() {
+		return phasePlanValidationResult{
+			Code:    "phase_plan_guidance_without_crd",
+			Message: "resource guide phases are allowed only after runtime discovery confirms the accepted primary target is a CRD. For built-in, unknown, or unresolved targets, return one corrected phase_plan without guidance_lookup or guided_diagnosis and continue with ordinary kubectl diagnostics.",
+		}
+	}
+	return phasePlanValidationResult{Valid: true}
 }
 
 func (l *Loop) consumePhaseProgress(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
@@ -236,6 +296,89 @@ func singleLightweightPhase(plan phasePlan) bool {
 	}
 	step := plan.PhaseSteps[0]
 	return strings.EqualFold(strings.TrimSpace(step.Name), lightweightLookupPhase)
+}
+
+func (l *Loop) phasePlanRequiresMutationVerification(plan phasePlan) bool {
+	if l != nil && l.requirementAnalysis != nil {
+		requestType := strings.ToLower(strings.TrimSpace(l.requirementAnalysis.RequestType))
+		action := strings.ToLower(strings.TrimSpace(l.requirementAnalysis.Action))
+		if requestType == "mutation" || actionRequiresMutationVerification(action) {
+			return true
+		}
+	}
+	return phasePlanHasMutationExecutionPhase(plan)
+}
+
+func actionRequiresMutationVerification(action string) bool {
+	if action == "" || strings.Contains(action, "manifest") {
+		return false
+	}
+	tokens := []string{
+		"create", "update", "patch", "delete", "scale", "restart", "apply",
+		"replace", "annotate", "label", "cordon", "uncordon", "drain", "taint",
+	}
+	for _, token := range tokens {
+		if action == token || strings.HasPrefix(action, token+"_") || strings.Contains(action, "_"+token+"_") || strings.HasSuffix(action, "_"+token) {
+			return true
+		}
+	}
+	return false
+}
+
+func phasePlanHasMutationExecutionPhase(plan phasePlan) bool {
+	for _, step := range plan.PhaseSteps {
+		name := normalizedPhaseName(step.Name)
+		switch name {
+		case "mutation_execution", "mutation_planning", "remediation_execution", "change_execution", "fix_execution", "apply_change", "execute_change":
+			return true
+		}
+		if strings.Contains(name, "mutation") && !strings.Contains(name, "verification") {
+			return true
+		}
+	}
+	return false
+}
+
+func phasePlanHasVerificationPhase(plan phasePlan) bool {
+	for _, step := range plan.PhaseSteps {
+		name := normalizedPhaseName(step.Name)
+		switch name {
+		case "mutation_verification", "verification_observation", "post_mutation_verification":
+			return true
+		}
+		if strings.Contains(name, "verification") || strings.Contains(name, "verify") {
+			return true
+		}
+	}
+	return false
+}
+
+func phasePlanHasResourceGuidePhase(plan phasePlan) bool {
+	return phasePlanHasPhase(plan, "guidance_lookup") || phasePlanHasGuidedDiagnosis(plan)
+}
+
+func phasePlanHasGuidedDiagnosis(plan phasePlan) bool {
+	return phasePlanHasPhase(plan, "guided_diagnosis")
+}
+
+func phasePlanHasPhase(plan phasePlan, name string) bool {
+	normalized := normalizedPhaseName(name)
+	for _, step := range plan.PhaseSteps {
+		if normalizedPhaseName(step.Name) == normalized {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizedPhaseName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
+func (l *Loop) phasePlanAllowsResourceGuidance() bool {
+	return l != nil &&
+		l.resourceClassification != nil &&
+		l.resourceClassification.Kind == resourceClassificationCRD
 }
 
 func isInternalReactCall(name string) bool {

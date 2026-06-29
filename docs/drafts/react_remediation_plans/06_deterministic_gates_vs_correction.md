@@ -15,6 +15,15 @@
 - requested final report ignored
 - action target mismatch
 
+현재 반영된 deterministic gate:
+
+- `internal/react/gate_decision.go`
+  - `GateDecision`과 `Loop.applyGateDecision`을 추가했다.
+  - gate는 먼저 allow/block을 결정하고, correction은 block 이후 모델을 재유도하는 보조 수단으로만 사용한다.
+- `internal/react/phase_plan.go`
+  - `validatePhasePlanForRequest`가 phase plan을 수용하기 전에 mutation verification/guidance eligibility를 결정한다.
+  - gate에 막힌 phase plan은 `phaseStepState`로 수용되지 않으므로 이후 action dispatch로 내려가지 않는다.
+
 Correction 자체는 필요하지만, 안전 정책의 최종 보증 수단이 되어서는 안 된다.
 
 ## Desired Contract
@@ -52,9 +61,9 @@ type GateDecision struct {
 - block and finish
 - require verification
 
-## Proposed Changes
+## Implemented First Step
 
-1. gate 함수를 pure decision과 side effect로 분리한다.
+1. gate 함수를 pure decision과 side effect로 분리하는 구조를 도입했다.
 
 현재:
 
@@ -71,11 +80,34 @@ decision := l.namespaceGate.Decide(context, calls)
 l.applyGateDecision(decision)
 ```
 
-2. safety-critical gate는 correction 실패와 무관하게 실행 차단을 보장한다.
+이번 구현:
 
-3. model correction 반복 한도는 gate별로 관리한다.
+```go
+result := l.validatePhasePlanForRequest(plan)
+if !result.Valid {
+    l.applyGateDecision(result.gateDecision())
+}
+```
 
-4. correction이 반복되면 "실행"이 아니라 "중단" 또는 "사용자 확인"으로 간다.
+2. phase-plan safety-critical gate는 correction 실패와 무관하게 실행 차단을 보장한다.
+
+3. model correction 반복 한도는 기존 correction dedup/compaction 경로를 재사용한다.
+
+4. correction이 반복되면 plan을 수용하거나 실행하지 않고 `StateDone`으로 중단한다.
+
+## Current Deterministic Phase Plan Gates
+
+- mutation request 또는 mutation execution phase가 있는데 verification phase가 없으면 block.
+- `guidance_lookup`/`guided_diagnosis`가 있는데 runtime discovery가 CRD를 확인하지 않았으면 block.
+- `guided_diagnosis`가 `guidance_lookup` 없이 등장하면 block.
+- `lightweight_lookup` single phase는 기존대로 allow.
+
+## Remaining Work
+
+- namespace/scope mismatch gate는 이미 dispatch 전 block이지만 아직 `GateDecision` 타입으로 통일되지 않았다.
+- read-only mutation block, interactive command block, final-report-requested gate도 deterministic하게 동작하지만 `GateDecision` 타입으로 통합되지는 않았다.
+- gate별 correction 반복 한도는 아직 공통 dedup/compaction 기반이다. `GateDecision`의 code별 counter로 분리하는 작업은 남아 있다.
+- action target mismatch와 resource-guide wrong-phase gate를 pure decision 함수로 분리하는 작업은 후속이다.
 
 ## Example
 
