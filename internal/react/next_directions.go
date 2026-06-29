@@ -152,13 +152,14 @@ func (l *Loop) promptDirectionChoice(nd nextDirections) {
 	state.FinalizeIdx = len(options) + 1
 	options = append(options, api.UserChoiceOption{Value: "finalize", Label: "여기서 진단 종료"})
 	l.pendingDirectionPrompt = state
+	l.state = StateWaitingDirectionChoice
+	l.setInputOwner(InputOwnerReactChoice)
 
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
 		Prompt:  prompt.String(),
 		Options: options,
 	})
 	l.pendingCalls = nil
-	l.state = StateWaitingDirectionChoice
 }
 
 // waitForDirectionChoice is invoked when the loop is in
@@ -192,7 +193,7 @@ func (l *Loop) waitForDirectionChoice(ctx context.Context) bool {
 		if state.HasFreeInput && choice == state.FreeInputIdx {
 			l.pendingDirectionPrompt = nil
 			l.state = StateWaitingDirectionText
-			l.setRawSlashInputAccepted(true)
+			l.setInputOwner(InputOwnerReactText)
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeUserInputRequest, "어떤 방향으로 계속할지 알려주세요")
 			return true
 		}
@@ -216,37 +217,18 @@ func (l *Loop) waitForDirectionText(ctx context.Context) bool {
 	case <-ctx.Done():
 		return false
 	case raw := <-l.input:
-		l.setRawSlashInputAccepted(false)
 		if raw == io.EOF {
 			l.state = StateExited
 			return false
 		}
 		resp, ok := raw.(*api.UserInputResponse)
 		if !ok {
-			l.setRawSlashInputAccepted(true)
 			return true
 		}
 		text := strings.TrimSpace(resp.Query)
 		if text == "" {
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "입력이 비어 있어 진단을 종료합니다.")
 			l.state = StateDone
-			return true
-		}
-		normalized := strings.TrimPrefix(strings.ToLower(text), "/")
-		switch normalized {
-		case "exit", "quit":
-			l.state = StateExited
-			return false
-		case "clear", "reset":
-			l.clearConversationState()
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "대화 상태를 초기화했습니다.")
-			l.state = StateDone
-			return true
-		}
-		if strings.HasPrefix(text, "/") {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "이 입력 단계에서는 /exit, /quit, /clear, /reset만 메타 명령으로 처리할 수 있습니다.")
-			l.state = StateWaitingDirectionText
-			l.setRawSlashInputAccepted(true)
 			return true
 		}
 		l.applyDirectionOption(ctx, nextDirectionOption{
@@ -351,12 +333,13 @@ func (l *Loop) promptProblematicResourceInvestigation(report finalReport) bool {
 	state.FinalizeIdx = len(choices) + 1
 	choices = append(choices, api.UserChoiceOption{Value: "no", Label: "여기서 종료"})
 	l.pendingDirectionPrompt = state
+	l.state = StateWaitingDirectionChoice
+	l.setInputOwner(InputOwnerReactChoice)
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
 		Prompt:  "문제가 있는 관련 리소스가 확인되었습니다. 추가 조사할까요? (y/n)",
 		Options: choices,
 	})
 	l.pendingCalls = nil
-	l.state = StateWaitingDirectionChoice
 	return true
 }
 

@@ -264,20 +264,22 @@ New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirec
 
 | File | Role |
 |---|---|
-| `internal/react/loop.go` | State enum, `phaseStepState`, `guideStepState`, anchor wiring (`buildIterationSendContent`), phase and guide step completion bookkeeping. |
+| `internal/react/loop.go` | State enum, `phaseStepState`, `guideStepState`, mutation verification state, anchor wiring (`buildIterationSendContent`), phase and guide step completion bookkeeping. |
 | `internal/react/request_context.go`, `internal/react/phase_plan.go` | `requirementAnalysisAnchor()`, `phaseStepAnchor()`, `guideStepAnchor()`. |
+| `internal/react/mutation_lifecycle.go` | Goal-level mutation verification requirements, verification result consumption, and continuation enforcement after unresolved/progressing remediation. |
 | `internal/react/resource_guidance.go` | `buildGuideStepState` builds nested guide progress from `GuideCase.DiagnosticSteps` and persists the full step details to `step_store` when the guide is injected under `guided_diagnosis`. |
 | `internal/react/final_report.go` | `requestFinalReportFromModel`, `consumeFinalReport`, `renderFinalReport`, `requestNextDirectionsFromModel`. |
 | `internal/react/next_directions.go` | `consumeNextDirections`, `promptDirectionChoice`, `waitForDirectionChoice`, `waitForDirectionText`, `applyDirectionOption`. |
-| `internal/react/shim.go` | Target top-level shim fields: `phase_plan`, `phase_progress`, `action.guide_progress`, `final_report`, `next_directions`. |
+| `internal/react/shim.go` | Target top-level shim fields: `phase_plan`, `phase_progress`, `action.guide_progress`, `mutation_verification_result`, `final_report`, `next_directions`. |
 | `prompts/default.tmpl`, `prompts/system_ko.tmpl` | Output schemas and model rules for phase planning, phase progress, nested guide progress, and final reporting. |
 
 ## Design constraints honored
 
-- **No forced output filtering.** The model can ignore the final_report instruction and emit `action` again; the anchor will re-emit on the next iteration. Drift is mitigated by per-iteration anchors and clear positive rules, not by post-hoc string filtering.
+- **Directive gates for critical transitions.** When runtime has requested guide completion, final report, or mutation verification result, conflicting structured outputs are rejected instead of being silently executed or dropped. Anchors still provide context, but lifecycle safety no longer depends only on the model following a soft instruction.
 - **Single-case tracking.** Only the top guide case's `DiagnosticSteps` populates `guideStepState`. Multi-case progress is not tracked because the runtime only injects one case at a time.
 - **No MaxIteration coupling.** `MaxIterations` still ends the loop with the existing "Maximum number of iterations reached" message. Guide-exhaustion via `final_report` is independent and can fire well before `MaxIterations`.
 - **Phase owns guide.** `guideStepState` is subordinate to the active `guided_diagnosis` `phase_step`; guide completion should lead to parent `phase_progress`, not directly replace the phase workflow.
+- **Mutation needs verification.** A successful mutating command creates goal-level read-only evidence requirements unless the only available evidence is a successful target-unmapped `kubectl apply -f ...` output. Final report and phase completion are blocked until the model returns `mutation_verification_result` after the required observations.
 
 ## Invariants
 
@@ -285,6 +287,9 @@ New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirec
 - `guideStepState` is non-nil only while the active `phase_step` is `guided_diagnosis`; it is cleared when that parent phase completes, when a different guide is selected, or on `startQuery`/`clearConversationState`.
 - `another_guide` never bypasses `phase_step`: it clears prior guide progress and resumes the top-level phase workflow so that a new guide can be requested only through `guidance_lookup` and consumed only under `guided_diagnosis`.
 - `finalReportRequested` is set when `requestFinalReportFromModel` queues its instruction. It prevents duplicate instruction text from being re-appended on every dispatch. It is cleared on `applyDirectionOption`, `startQuery`, `clearConversationState`, and at every `injectResourceGuide*` entry.
+- `pendingMutationVerification` is non-nil after a successful mutating action that requires goal-level verification. It stores multiple `mutationEvidenceRequirement` entries and per-requirement satisfaction state.
+- `pendingMutationVerification.AwaitingResult` means the required read-only evidence has been collected and the next accepted structured output must be `mutation_verification_result`.
+- `mutationContinuationRequired` is set after `mutation_verification_result.status=progressing` or `unresolved`. It prevents `final_report`, `phase_progress`, and `next_directions` until at least one further ReAct action is taken.
 - `pendingDirectionPrompt` is non-nil only while in `StateWaitingDirectionChoice`. The user's `Choice` index is mapped back to a concrete `nextDirectionOption` (or the synthetic finalize / free-input rows) using `FreeInputIdx` and `FinalizeIdx`.
 - `phase_progress.phase_completed` is the model's self-report for the top-level phase. It is ignored when the corresponding observation is blocked, declined, failed, errored, or structurally unrelated to the active phase goal.
 - `action.guide_progress.step_completed` is the model's self-report, not enforced by command matching. It is ignored when the corresponding observation is blocked, declined, failed, or errored. Misreported indices on successful observations are accepted (the worst case is premature `final_report` instruction or a step staying open).
@@ -343,28 +348,32 @@ Acceptance criteria:
 - An implementer does not have to guess whether `kubectl get cluster <name>` completes a step whose template queried `cluster/openstackcluster/kamajicontrolplane`.
 - Premature `final_report` requests cannot be caused by loose verb/resource matching.
 
-### TODO: Separate Runtime Fallbacks From Output Filtering
+### TODO: Fully Catalog Runtime Fallbacks and Directive Gates
 
-The design says "No forced output filtering", while later sections describe schema recovery and fallback choices. Clarify the exception boundary.
+The current design uses prompt-level guidance for ordinary reasoning, but runtime gates for schema, safety, and lifecycle transitions. Keep the boundary explicit so future changes do not reintroduce soft-only control for critical transitions.
 
 Define three categories:
 
 - Model output guidance: prompt-level instructions only.
 - Runtime correction: invalid schema or unsafe output is corrected by asking the model to re-emit.
 - Runtime UX fallback: after repeated schema failure, the runtime may bypass the model output and show safe user choices.
+- Runtime directive gate: when runtime has requested a specific internal structured output, conflicting calls are rejected until the requested transition is satisfied or explicitly cleared.
 
 Explicitly include:
 
 - invalid `next_directions`
 - invalid `final_report`
 - invalid/missing `requirement_analysis`
+- requested `phase_progress`/`final_report` after guide completion
+- requested `mutation_verification_result` after mutation verification evidence is collected
+- `mutationContinuationRequired` after `progressing` or `unresolved`
 - action target mismatch
 - read-only mutation block
 - approval decline
 
 Acceptance criteria:
 
-- "No forced output filtering" does not prevent schema/safety recovery.
+- Directive gates are limited to schema, safety, and lifecycle-critical transitions.
 - Runtime fallback behavior is predictable and documented for every internal structured output.
 
 ### TODO: Bound `next_directions` Fallback Directives
@@ -401,5 +410,5 @@ Add a table of error classes:
 
 Acceptance criteria:
 
-- Internal runtime failures do not trigger "감지된 문제에 대해 해결 방법을 찾아볼까요?".
-- Kubernetes evidence still can trigger incident guidance when the user asked for diagnosis/remediation.
+- Internal runtime failures do not create incident runbook continuation options.
+- Kubernetes evidence can create an incident runbook continuation option only when the user asked for diagnosis/remediation and the ReAct continuation choice UI is already being shown.

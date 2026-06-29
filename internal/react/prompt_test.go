@@ -91,6 +91,7 @@ func TestCollectFunctionDefinitionsIncludesInternalStructuredCalls(t *testing.T)
 		internalResourceGuideLookupCall,
 		internalFinalReportCall,
 		internalNextDirectionsCall,
+		internalMutationVerificationResultCall,
 	} {
 		if !names[name] {
 			t.Fatalf("expected internal function definition %q", name)

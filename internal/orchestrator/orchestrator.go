@@ -591,52 +591,53 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 	if activeAgent == nil {
 		return nil
 	}
-	if handled, err := o.incidentGuidance.BeforeUserInput(o, activeAgent); handled || err != nil {
-		return err
+	if o.incidentGuidance.hasPendingOffer() {
+		o.incidentGuidance.deferOffer()
 	}
 
-	o.printStatusWarnings(true)
-	input, err := getInputWithUIEcho(o.buildPrompt(true), o.cfg.HistoryFile)
-	if err != nil {
-		if err == io.EOF {
+	for {
+		o.printStatusWarnings(true)
+		input, err := getInputWithUIEcho(o.buildPrompt(true), o.cfg.HistoryFile)
+		if err != nil {
+			if err == io.EOF {
+				activeAgent.SendInput(io.EOF)
+				fmt.Println("👋 종료합니다.")
+				return io.EOF
+			}
+			return fmt.Errorf("입력 오류: %w", err)
+		}
+
+		input = strings.TrimSpace(input)
+		if input == "exit" {
 			activeAgent.SendInput(io.EOF)
 			fmt.Println("👋 종료합니다.")
 			return io.EOF
 		}
-		return fmt.Errorf("입력 오류: %w", err)
-	}
-
-	input = strings.TrimSpace(input)
-	if input == "exit" {
-		activeAgent.SendInput(io.EOF)
-		fmt.Println("👋 종료합니다.")
-		return io.EOF
-	}
-	if inputIsQuit(input) {
-		fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
-		activeAgent.SendInput(&api.UserInputResponse{Query: ""})
-		return nil
-	}
-	if strings.HasPrefix(input, "/") && !activeAgent.AcceptsRawSlashInput() {
-		if err := o.selectMetaCommand(input); err != nil {
-			if err == io.EOF {
-				if o.agentWrap == activeAgent {
-					activeAgent.SendInput(io.EOF)
+		if inputIsQuit(input) {
+			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
+			continue
+		}
+		if strings.HasPrefix(input, "/") {
+			if err := o.selectMetaCommand(input); err != nil {
+				if err == io.EOF {
+					if o.agentWrap == activeAgent {
+						activeAgent.SendInput(io.EOF)
+					}
+					return io.EOF
 				}
-				return io.EOF
+				fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
 			}
-			fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
+			if o.agentWrap != activeAgent {
+				return nil
+			}
+			continue
 		}
-		if o.agentWrap == activeAgent {
-			activeAgent.SendInput(&api.UserInputResponse{Query: ""})
-		}
+
+		o.logEntry("user_input", input)
+		o.incidentGuidance.ObserveUserInput(input)
+		activeAgent.SendInput(&api.UserInputResponse{Query: input})
 		return nil
 	}
-
-	o.logEntry("user_input", input)
-	o.incidentGuidance.ObserveUserInput(input)
-	activeAgent.SendInput(&api.UserInputResponse{Query: input})
-	return nil
 }
 
 func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest) error {
@@ -646,7 +647,13 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 	}
 
 	PrintMessage(o.formatter.FormatPropose(choiceReq.Prompt))
-	for i, opt := range choiceReq.Options {
+	options := append([]api.UserChoiceOption(nil), choiceReq.Options...)
+	incidentChoice := 0
+	if activeAgent.InputOwner() == react.InputOwnerReactChoice && o.incidentGuidance.hasPendingOffer() && choiceOptionsAllowRunbookSearch(choiceReq.Options) {
+		incidentChoice = len(options) + 1
+		options = append(options, api.UserChoiceOption{Value: "incident-runbook", Label: "[runbook 검색] 감지된 문제의 해결 방법 검색"})
+	}
+	for i, opt := range options {
 		fmt.Printf("  %d. %s\n", i+1, opt.Label)
 	}
 
@@ -679,8 +686,19 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 		}
 
 		choice, err := strconv.Atoi(input)
+		if err == nil && choice == incidentChoice && incidentChoice > 0 {
+			o.logEntry("user_choice", "incident-runbook")
+			if err := o.incidentGuidance.handleChoiceRunbookSearch(o); err != nil {
+				return err
+			}
+			activeAgent.SendInput(&api.UserChoiceResponse{Choice: findChoiceIndex(choiceReq.Options, "finalize", len(choiceReq.Options))})
+			return nil
+		}
 		if err == nil && choice >= 1 && choice <= len(choiceReq.Options) {
 			o.logEntry("user_choice", input)
+			if incidentChoice > 0 {
+				o.incidentGuidance.deferOffer()
+			}
 			activeAgent.SendInput(&api.UserChoiceResponse{Choice: choice})
 			return nil
 		}
@@ -699,6 +717,19 @@ func findChoiceIndex(options []api.UserChoiceOption, value string, fallback int)
 		return fallback
 	}
 	return 1
+}
+
+func choiceOptionsAllowRunbookSearch(options []api.UserChoiceOption) bool {
+	return choiceHasValue(options, "free-input") && choiceHasValue(options, "finalize")
+}
+
+func choiceHasValue(options []api.UserChoiceOption, value string) bool {
+	for _, opt := range options {
+		if strings.EqualFold(opt.Value, value) {
+			return true
+		}
+	}
+	return false
 }
 
 func inputIsQuit(input string) bool {

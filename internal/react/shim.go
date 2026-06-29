@@ -9,23 +9,24 @@ import (
 )
 
 type reActResponse struct {
-	Thought                    string               `json:"thought"`
-	Answer                     string               `json:"answer,omitempty"`
-	RequirementAnalysis        *requirementAnalysis `json:"requirement_analysis,omitempty"`
-	RequestContext             *requestContext      `json:"request_context,omitempty"`
-	PhasePlan                  *phasePlan           `json:"phase_plan,omitempty"`
-	PhaseProgress              *phaseProgress       `json:"phase_progress,omitempty"`
-	Action                     *action              `json:"action,omitempty"`
-	GuideProgress              *guideProgress       `json:"guide_progress,omitempty"`
-	ResourceGuideLookup        *resourceGuideLookup `json:"resource_guide_lookup,omitempty"`
-	FinalReport                *finalReport         `json:"final_report,omitempty"`
-	NextDirections             *nextDirections      `json:"next_directions,omitempty"`
-	InvalidPhaseProgress       bool                 `json:"-"`
-	InvalidAction              bool                 `json:"-"`
-	InvalidResourceGuideLookup bool                 `json:"-"`
-	InvalidFinalReport         bool                 `json:"-"`
-	InvalidDirections          bool                 `json:"-"`
-	InvalidStructuredAnswer    bool                 `json:"-"`
+	Thought                    string                      `json:"thought"`
+	Answer                     string                      `json:"answer,omitempty"`
+	RequirementAnalysis        *requirementAnalysis        `json:"requirement_analysis,omitempty"`
+	RequestContext             *requestContext             `json:"request_context,omitempty"`
+	PhasePlan                  *phasePlan                  `json:"phase_plan,omitempty"`
+	PhaseProgress              *phaseProgress              `json:"phase_progress,omitempty"`
+	Action                     *action                     `json:"action,omitempty"`
+	GuideProgress              *guideProgress              `json:"guide_progress,omitempty"`
+	ResourceGuideLookup        *resourceGuideLookup        `json:"resource_guide_lookup,omitempty"`
+	FinalReport                *finalReport                `json:"final_report,omitempty"`
+	NextDirections             *nextDirections             `json:"next_directions,omitempty"`
+	MutationVerificationResult *mutationVerificationResult `json:"mutation_verification_result,omitempty"`
+	InvalidPhaseProgress       bool                        `json:"-"`
+	InvalidAction              bool                        `json:"-"`
+	InvalidResourceGuideLookup bool                        `json:"-"`
+	InvalidFinalReport         bool                        `json:"-"`
+	InvalidDirections          bool                        `json:"-"`
+	InvalidStructuredAnswer    bool                        `json:"-"`
 }
 
 type requirementAnalysis struct {
@@ -178,6 +179,13 @@ type nextDirectionOption struct {
 	Namespace      string `json:"namespace,omitempty"`
 }
 
+type mutationVerificationResult struct {
+	Status          string   `json:"status"`
+	EvidenceSummary []string `json:"evidence_summary,omitempty"`
+	Reason          string   `json:"reason,omitempty"`
+	NextAction      string   `json:"next_action,omitempty"`
+}
+
 func candidateToShimCandidate(iterator gollm.ChatResponseIterator) (gollm.ChatResponseIterator, error) {
 	return func(yield func(gollm.ChatResponse, error) bool) {
 		var buffer strings.Builder
@@ -280,6 +288,9 @@ func unmarshalReActResponse(data []byte) (*reActResponse, error) {
 		} else {
 			parsed.NextDirections = &directions
 		}
+	}
+	if err := unmarshalOptionalPointer(raw, "mutation_verification_result", &parsed.MutationVerificationResult); err != nil {
+		return nil, err
 	}
 	if parsed.Answer != "" && parsed.hasStructuredOutput() {
 		parsed.InvalidStructuredAnswer = true
@@ -491,6 +502,9 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	} else if c.candidate.InvalidDirections {
 		parts = append(parts, &shimPart{invalidDirections: true})
 	}
+	if c.candidate.MutationVerificationResult != nil {
+		parts = append(parts, &shimPart{mutationVerificationResult: c.candidate.MutationVerificationResult})
+	}
 	if c.candidate.InvalidStructuredAnswer {
 		parts = append(parts, &shimPart{invalidStructuredAnswer: true})
 	}
@@ -514,7 +528,8 @@ func (c *reActResponse) hasStructuredOutput() bool {
 		c.FinalReport != nil ||
 		c.InvalidFinalReport ||
 		c.NextDirections != nil ||
-		c.InvalidDirections
+		c.InvalidDirections ||
+		c.MutationVerificationResult != nil
 }
 
 type shimPart struct {
@@ -532,6 +547,7 @@ type shimPart struct {
 	invalidFinalReport         bool
 	nextDirections             *nextDirections
 	invalidDirections          bool
+	mutationVerificationResult *mutationVerificationResult
 	invalidStructuredAnswer    bool
 }
 
@@ -625,6 +641,16 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 		}
 		return []gollm.FunctionCall{{
 			Name:      internalNextDirectionsCall,
+			Arguments: args,
+		}}, true
+	}
+	if p.mutationVerificationResult != nil {
+		args, err := toMap(p.mutationVerificationResult)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      internalMutationVerificationResultCall,
 			Arguments: args,
 		}}, true
 	}

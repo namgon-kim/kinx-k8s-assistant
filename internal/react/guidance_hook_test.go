@@ -7,6 +7,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/guidance"
 )
 
@@ -403,6 +404,425 @@ func TestInconsistentActionTargetMessageRejectsUnknownActionTargetResource(t *te
 	got, invalid := inconsistentActionTargetMessage(call)
 	if !invalid || !strings.Contains(got, "`unknown` is not a Kubernetes resource kind") {
 		t.Fatalf("expected unknown action target to be rejected, got invalid=%v message=%q", invalid, got)
+	}
+}
+
+func TestRequestNamespaceInvariantRejectsMutatingCommandWithoutNamespace(t *testing.T) {
+	loop := &Loop{
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
+			Scope:         requestScope{Namespace: "web"},
+			ResourceClass: "built_in",
+		},
+	}
+	got, invalid := loop.requestNamespaceInvariantMessage(gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl create configmap app-config --from-literal=key=value",
+			"target": map[string]any{
+				"resource": "configmap",
+				"name":     "app-config",
+			},
+		},
+	})
+	if !invalid || !strings.Contains(got, `Request namespace is "web"`) || !strings.Contains(got, "omits namespace") {
+		t.Fatalf("expected missing namespace to be rejected, got invalid=%v message=%q", invalid, got)
+	}
+}
+
+func TestRequestNamespaceInvariantRejectsDifferentMutationNamespace(t *testing.T) {
+	loop := &Loop{
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
+			Scope:         requestScope{Namespace: "web"},
+			ResourceClass: "built_in",
+		},
+	}
+	got, invalid := loop.requestNamespaceInvariantMessage(gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl -n default create configmap app-config --from-literal=key=value",
+			"target": map[string]any{
+				"resource":  "configmap",
+				"namespace": "default",
+				"name":      "app-config",
+			},
+		},
+	})
+	if !invalid || !strings.Contains(got, `action target namespace is "default"`) {
+		t.Fatalf("expected different namespace to be rejected, got invalid=%v message=%q", invalid, got)
+	}
+}
+
+func TestRequestNamespaceInvariantAllowsMatchingMutationNamespace(t *testing.T) {
+	loop := &Loop{
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
+			Scope:         requestScope{Namespace: "web"},
+			ResourceClass: "built_in",
+		},
+	}
+	got, invalid := loop.requestNamespaceInvariantMessage(gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl -n web create configmap app-config --from-literal=key=value",
+			"target": map[string]any{
+				"resource": "configmap",
+				"name":     "app-config",
+			},
+		},
+	})
+	if invalid {
+		t.Fatalf("expected matching namespace to pass, got %q", got)
+	}
+}
+
+func TestRequestNamespaceInvariantAllowsClusterScopedMutation(t *testing.T) {
+	loop := &Loop{
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "node", Name: "node-a"},
+			Scope:         requestScope{Namespace: "web"},
+			ResourceClass: "built_in",
+		},
+	}
+	got, invalid := loop.requestNamespaceInvariantMessage(gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl label node node-a maintenance=true",
+			"target": map[string]any{
+				"resource": "node",
+				"name":     "node-a",
+			},
+		},
+	})
+	if invalid {
+		t.Fatalf("expected cluster-scoped mutation to pass namespace invariant, got %q", got)
+	}
+}
+
+func TestMutationLifecycleCreatesPendingVerificationAfterMutation(t *testing.T) {
+	loop := &Loop{
+		cfg: &config.Config{},
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
+			Scope:         requestScope{Namespace: "web"},
+			ResourceClass: "built_in",
+		},
+		actionSeq: 3,
+	}
+	loop.trackMutationVerification(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl -n web create configmap app-config --from-literal=key=value",
+				"target": map[string]any{
+					"resource":  "configmap",
+					"namespace": "web",
+					"name":      "app-config",
+				},
+				"expected_observation": "configmap exists",
+			},
+		},
+		ModifiesResource: "yes",
+	}, map[string]any{"status": "ok"})
+
+	if loop.pendingMutationVerification == nil {
+		t.Fatal("expected pending mutation verification")
+	}
+	got := loop.pendingMutationVerification
+	if len(got.Requirements) != 1 {
+		t.Fatalf("expected one direct evidence requirement, got %#v", got.Requirements)
+	}
+	direct := got.Requirements[0]
+	if direct.Kind != "direct_effect" || direct.Target.Resource != "configmap" || direct.Target.Namespace != "web" || direct.Target.Name != "app-config" {
+		t.Fatalf("unexpected direct evidence target: %#v", direct)
+	}
+	if !strings.Contains(direct.SuggestedCommand, "kubectl get configmap app-config -n web -o yaml") {
+		t.Fatalf("unexpected verification command hint: %q", direct.SuggestedCommand)
+	}
+}
+
+func TestMutationLifecycleDoesNotStartInReadOnlyMode(t *testing.T) {
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}}
+	loop.trackMutationVerification(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl -n web create configmap app-config --from-literal=key=value",
+			},
+		},
+		ModifiesResource: "yes",
+	}, map[string]any{"status": "ok"})
+
+	if loop.pendingMutationVerification != nil {
+		t.Fatalf("read-only mode must not start mutation verification, got %#v", loop.pendingMutationVerification)
+	}
+}
+
+func TestMutationLifecycleSkipsGenericVerificationForUnmappedSuccessfulMutation(t *testing.T) {
+	loop := &Loop{cfg: &config.Config{}}
+	loop.trackMutationVerification(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name: "bash",
+			Arguments: map[string]any{
+				"command": "kubectl apply -f /tmp/rendered.yaml",
+			},
+		},
+		ModifiesResource: "unknown",
+	}, map[string]any{"status": "ok"})
+
+	if loop.pendingMutationVerification != nil {
+		t.Fatalf("successful unmapped mutation must not create generic verification, got %#v", loop.pendingMutationVerification)
+	}
+}
+
+func TestMutationLifecycleRejectsFinalReportBeforeVerification(t *testing.T) {
+	loop := &Loop{
+		pendingMutationVerification: &pendingMutationVerification{
+			Requirements: []mutationEvidenceRequirement{{
+				ID:     "direct_effect",
+				Kind:   "direct_effect",
+				Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+			}},
+		},
+	}
+	if !loop.enforcePendingMutationVerification([]gollm.FunctionCall{{
+		Name: internalFinalReportCall,
+		Arguments: map[string]any{
+			"conclusive":        true,
+			"attempted":         []any{"created configmap"},
+			"evidence_known":    []any{"create returned ok"},
+			"most_likely_cause": "missing configmap",
+			"conclusion":        "fixed",
+		},
+	}}) {
+		t.Fatal("expected final_report to be rejected while verification is pending")
+	}
+	if loop.state != StateRunning {
+		t.Fatalf("state = %v, want StateRunning", loop.state)
+	}
+}
+
+func TestMutationLifecycleRequiresExactReadOnlyVerification(t *testing.T) {
+	loop := &Loop{
+		pendingMutationVerification: &pendingMutationVerification{
+			Requirements: []mutationEvidenceRequirement{{
+				ID:     "direct_effect",
+				Kind:   "direct_effect",
+				Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+			}},
+		},
+	}
+	if loop.mutationVerificationCallMatches(gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl get configmap app-config -n default -o yaml",
+		},
+	}) {
+		t.Fatal("verification with different namespace must not match")
+	}
+	if !loop.mutationVerificationCallMatches(gollm.FunctionCall{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl get configmap app-config -n web -o yaml",
+		},
+	}) {
+		t.Fatal("expected exact read-only verification to match")
+	}
+}
+
+func TestMutationLifecycleAwaitsResultAfterSuccessfulVerification(t *testing.T) {
+	loop := &Loop{
+		pendingMutationVerification: &pendingMutationVerification{
+			Requirements: []mutationEvidenceRequirement{{
+				ID:     "direct_effect",
+				Kind:   "direct_effect",
+				Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+			}},
+			Satisfied: map[string]bool{},
+		},
+	}
+	loop.trackMutationVerification(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl get configmap app-config -n web -o yaml",
+			},
+		},
+		ModifiesResource: "no",
+	}, map[string]any{"status": "ok"})
+	if loop.pendingMutationVerification == nil || !loop.pendingMutationVerification.AwaitingResult {
+		t.Fatalf("expected verification to await interpretation result, got %#v", loop.pendingMutationVerification)
+	}
+}
+
+func TestMutationLifecycleKeepsPendingUntilOutcomeEvidenceSatisfied(t *testing.T) {
+	loop := &Loop{
+		cfg: &config.Config{},
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "deployment", Name: "web-app"},
+			Scope:         requestScope{Namespace: "web"},
+			ResourceClass: "built_in",
+		},
+	}
+	loop.trackMutationVerification(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl -n web create configmap app-config --from-literal=key=value",
+				"target": map[string]any{
+					"resource":  "configmap",
+					"namespace": "web",
+					"name":      "app-config",
+				},
+			},
+		},
+		ModifiesResource: "yes",
+	}, map[string]any{"status": "ok"})
+	if loop.pendingMutationVerification == nil || len(loop.pendingMutationVerification.Requirements) != 2 {
+		t.Fatalf("expected direct and outcome evidence requirements, got %#v", loop.pendingMutationVerification)
+	}
+
+	loop.trackMutationVerification(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl get configmap app-config -n web -o yaml",
+			},
+		},
+		ModifiesResource: "no",
+	}, map[string]any{"status": "ok"})
+	if loop.pendingMutationVerification == nil {
+		t.Fatal("direct evidence alone must not clear pending verification while outcome evidence remains")
+	}
+	directID := loop.pendingMutationVerification.Requirements[0].ID
+	if !loop.pendingMutationVerification.Satisfied[directID] {
+		t.Fatalf("expected direct evidence to be marked satisfied, got %#v", loop.pendingMutationVerification.Satisfied)
+	}
+
+	loop.trackMutationVerification(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl get deployment web-app -n web -o yaml",
+			},
+		},
+		ModifiesResource: "no",
+	}, map[string]any{"status": "ok"})
+	if loop.pendingMutationVerification == nil || !loop.pendingMutationVerification.AwaitingResult {
+		t.Fatalf("expected pending verification to await interpretation after outcome evidence, got %#v", loop.pendingMutationVerification)
+	}
+}
+
+func TestMutationLifecycleConsumesResolvedVerificationResult(t *testing.T) {
+	loop := &Loop{
+		pendingMutationVerification: &pendingMutationVerification{
+			AwaitingResult: true,
+			Requirements: []mutationEvidenceRequirement{{
+				ID:     "mutation_1_direct_effect",
+				Kind:   "direct_effect",
+				Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+			}},
+			Satisfied: map[string]bool{"mutation_1_direct_effect": true},
+		},
+	}
+	_, handled := loop.consumeMutationVerificationResult([]gollm.FunctionCall{{
+		Name: internalMutationVerificationResultCall,
+		Arguments: map[string]any{
+			"status":           "resolved",
+			"evidence_summary": []any{"configmap exists and deployment is available"},
+			"reason":           "verification evidence shows the requested state is healthy",
+		},
+	}})
+	if !handled {
+		t.Fatal("expected mutation_verification_result to be handled")
+	}
+	if loop.pendingMutationVerification != nil {
+		t.Fatalf("expected pending verification to clear after resolved interpretation, got %#v", loop.pendingMutationVerification)
+	}
+}
+
+func TestMutationLifecycleAllowsMultipleVerificationActions(t *testing.T) {
+	loop := &Loop{
+		pendingMutationVerification: &pendingMutationVerification{
+			Requirements: []mutationEvidenceRequirement{
+				{
+					ID:     "mutation_1_direct_effect",
+					Kind:   "direct_effect",
+					Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+				},
+				{
+					ID:     "mutation_1_outcome_primary_target",
+					Kind:   "outcome_evidence",
+					Target: actionTarget{Resource: "deployment", Namespace: "web", Name: "web-app"},
+				},
+			},
+			Satisfied: map[string]bool{},
+		},
+	}
+	if !loop.mutationVerificationCallsMatch([]gollm.FunctionCall{
+		{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl get configmap app-config -n web -o yaml",
+			},
+		},
+		{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl get deployment web-app -n web -o yaml",
+			},
+		},
+	}) {
+		t.Fatal("expected multiple read-only verification actions to be allowed")
+	}
+}
+
+func TestMutationLifecycleAccumulatesSequentialMutationsForSameGoal(t *testing.T) {
+	loop := &Loop{
+		cfg: &config.Config{},
+		requestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "deployment", Name: "web-app"},
+			Scope:         requestScope{Namespace: "web"},
+			ResourceClass: "built_in",
+		},
+	}
+	loop.actionSeq = 1
+	loop.trackMutationVerification(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl -n web create configmap app-config --from-literal=key=value",
+				"target": map[string]any{
+					"resource":  "configmap",
+					"namespace": "web",
+					"name":      "app-config",
+				},
+			},
+		},
+		ModifiesResource: "yes",
+	}, map[string]any{"status": "ok"})
+	loop.actionSeq = 2
+	loop.trackMutationVerification(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl -n web rollout restart deployment/web-app",
+				"target": map[string]any{
+					"resource":  "deployment",
+					"namespace": "web",
+					"name":      "web-app",
+				},
+			},
+		},
+		ModifiesResource: "yes",
+	}, map[string]any{"status": "ok"})
+
+	if loop.pendingMutationVerification == nil {
+		t.Fatal("expected pending verification")
+	}
+	if len(loop.pendingMutationVerification.Requirements) != 3 {
+		t.Fatalf("expected direct configmap, outcome deployment, and direct deployment requirements, got %#v", loop.pendingMutationVerification.Requirements)
 	}
 }
 
@@ -930,6 +1350,50 @@ func TestRequirementAnalysisDefaultsFollowUpToPriorRequestContext(t *testing.T) 
 	}
 }
 
+func TestRequirementAnalysisRetriesPreviousAnswerInsteadOfClarification(t *testing.T) {
+	loop := &Loop{
+		originalQuery: "아닌 것 같아. 다시 정확하게.",
+		lastRequirementAnalysis: &requirementAnalysis{
+			RequestType: "inspection",
+			Action:      "summarize_pods",
+			Target:      requirementAnalysisTarget{Category: "kubernetes_resource", Description: "Pods in the cluster"},
+			Scope:       requirementScope{Type: "cluster_scoped"},
+			Resources: []requirementResource{{
+				Kind:   "pod",
+				Role:   "primary",
+				Source: "user_request",
+			}},
+			Evidence: []string{"Pod distribution across nodes and namespaces"},
+		},
+		lastRequestContext: &requestContext{
+			PrimaryTarget: requestPrimaryTarget{Resource: "pod"},
+			ResourceClass: "built_in",
+		},
+	}
+
+	got := loop.applyPriorContextToFollowUpRequirementAnalysis(requirementAnalysis{
+		RequestType: "explanation",
+		Action:      "clarify_request",
+		Target:      requirementAnalysisTarget{Category: "conversation", Description: "User request clarification"},
+		Scope:       requirementScope{Type: "unknown"},
+		OperationalFocus: &requirementOperationalFocus{
+			Summary:               "Request clarification",
+			RelationshipToPrimary: "unclear",
+			ChangedFromPrevious:   true,
+		},
+	})
+	resource := primaryRequirementResource(got.Resources)
+	if got.RequestType != "inspection" || got.Action != "summarize_pods" {
+		t.Fatalf("expected previous inspection request to be reused, got %#v", got)
+	}
+	if resource.Kind != "pod" {
+		t.Fatalf("expected previous pod target, got %#v", resource)
+	}
+	if got.OperationalFocus == nil || got.OperationalFocus.RelationshipToPrimary != "same_primary" || got.OperationalFocus.ChangedFromPrevious {
+		t.Fatalf("expected retry focus on same primary, got %#v", got.OperationalFocus)
+	}
+}
+
 func TestRequirementAnalysisDemotesModelInferredPrimaryToOperationalFocusHint(t *testing.T) {
 	loop := &Loop{
 		lastRequestContext: &requestContext{
@@ -995,6 +1459,28 @@ func TestRequirementAnalysisKeepsUserRequestPrimary(t *testing.T) {
 	resource := primaryRequirementResource(got.Resources)
 	if resource.Kind != "machinedeployment" || resource.Name != "md-a" || resource.Source != "user_request" {
 		t.Fatalf("expected explicit user primary to be preserved, got %#v", resource)
+	}
+}
+
+func TestRejectConversationalToolCallsBeforeDispatch(t *testing.T) {
+	loop := &Loop{
+		requirementAnalysis: &requirementAnalysis{
+			RequestType: "explanation",
+			Action:      "clarify_request",
+			Target:      requirementAnalysisTarget{Category: "conversation"},
+		},
+	}
+
+	if !loop.rejectConversationalToolCalls([]gollm.FunctionCall{{
+		Name: "bash",
+		Arguments: map[string]any{
+			"command": "echo 'Could you please rephrase?'",
+		},
+	}}) {
+		t.Fatal("expected conversational tool call to be rejected before dispatch")
+	}
+	if loop.state != StateRunning {
+		t.Fatalf("state = %v, want StateRunning", loop.state)
 	}
 }
 
