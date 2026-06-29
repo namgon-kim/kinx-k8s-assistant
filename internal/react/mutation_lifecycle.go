@@ -109,6 +109,9 @@ func (l *Loop) rejectMissingMutationVerification(kind string) bool {
 }
 
 func (l *Loop) consumeMutationVerificationResult(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
+	if l.pendingMutationVerification != nil && l.pendingMutationVerification.AwaitingResult && !onlyFunctionCall(calls, internalMutationVerificationResultCall) {
+		return nil, l.rejectMissingMutationVerification("mutation_verification_result_required")
+	}
 	var remaining []gollm.FunctionCall
 	for _, call := range calls {
 		if call.Name != internalMutationVerificationResultCall {
@@ -145,10 +148,10 @@ func (l *Loop) consumeMutationVerificationResult(calls []gollm.FunctionCall) ([]
 			l.queueResponseDirective("Mutation verification result is resolved. You may now complete the active phase or emit a final_report grounded in the verification evidence. Do not claim more than the evidence supports.")
 		case "progressing":
 			l.mutationContinuationRequired = true
-			l.queueResponseDirective("Mutation verification result is progressing. Continue the ReAct loop with the next best read-only observation after an appropriate wait/recheck interval. Do not emit a conclusive final_report yet.")
+			l.queueResponseDirective(mutationContinuationDirective(result))
 		case "unresolved":
 			l.mutationContinuationRequired = true
-			l.queueResponseDirective("Mutation verification result is unresolved. Continue the ReAct loop with a different diagnostic or remediation approach based on the observed evidence. Do not emit a conclusive final_report yet.")
+			l.queueResponseDirective(mutationContinuationDirective(result))
 		}
 		l.currChatContent = append(l.currChatContent, gollm.FunctionCallResult{
 			ID:   call.ID,
@@ -167,6 +170,22 @@ func (l *Loop) consumeMutationVerificationResult(calls []gollm.FunctionCall) ([]
 		return nil, true
 	}
 	return remaining, false
+}
+
+func mutationContinuationDirective(result mutationVerificationResult) string {
+	var b strings.Builder
+	switch result.Status {
+	case "progressing":
+		b.WriteString("Mutation verification result is progressing. Continue the ReAct loop with the next best read-only observation after an appropriate wait/recheck interval. Do not emit a conclusive final_report yet.")
+	case "unresolved":
+		b.WriteString("Mutation verification result is unresolved. Continue the ReAct loop with a different diagnostic or remediation approach based on the observed evidence. Do not emit a conclusive final_report yet.")
+	default:
+		return ""
+	}
+	if next := strings.TrimSpace(result.NextAction); next != "" {
+		fmt.Fprintf(&b, "\nmodel_proposed_next_action: %s", next)
+	}
+	return b.String()
 }
 
 func mutationVerificationResultFromFunctionCall(call gollm.FunctionCall) (mutationVerificationResult, bool) {
@@ -249,7 +268,6 @@ func (l *Loop) trackMutationVerification(call PendingCall, result map[string]any
 		if l.shouldStartMutationVerification(call, result) {
 			if verification, ok := l.mutationVerificationFromCall(call); ok {
 				l.mergeMutationVerification(verification)
-				l.queueResponseDirective(l.pendingMutationVerification.requiredMessage())
 			}
 			return
 		}
@@ -261,9 +279,6 @@ func (l *Loop) trackMutationVerification(call PendingCall, result map[string]any
 		}
 		if l.pendingMutationVerification.allSatisfied() {
 			l.pendingMutationVerification.AwaitingResult = true
-			l.queueResponseDirective(l.pendingMutationVerification.requiredMessage())
-		} else if l.pendingMutationVerification != nil {
-			l.queueResponseDirective(l.pendingMutationVerification.requiredMessage())
 		}
 		return
 	}
@@ -275,7 +290,6 @@ func (l *Loop) trackMutationVerification(call PendingCall, result map[string]any
 		return
 	}
 	l.pendingMutationVerification = &verification
-	l.queueResponseDirective(verification.requiredMessage())
 }
 
 func (l *Loop) mergeMutationVerification(next pendingMutationVerification) {

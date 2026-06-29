@@ -299,6 +299,9 @@ func singleLightweightPhase(plan phasePlan) bool {
 }
 
 func (l *Loop) phasePlanRequiresMutationVerification(plan phasePlan) bool {
+	if l != nil && l.cfg != nil && l.cfg.ReadOnly {
+		return false
+	}
 	if l != nil && l.requirementAnalysis != nil {
 		requestType := strings.ToLower(strings.TrimSpace(l.requirementAnalysis.RequestType))
 		action := strings.ToLower(strings.TrimSpace(l.requirementAnalysis.Action))
@@ -505,6 +508,9 @@ func (s *phaseStepState) acceptProgress(progress phaseProgress) bool {
 	current := s.currentStep()
 	if current.Index == 0 || progress.PhaseCompleted != current.Index {
 		return false
+	}
+	if s.Completed == nil {
+		s.Completed = make(map[int]bool)
 	}
 	s.Completed[progress.PhaseCompleted] = true
 	if strings.TrimSpace(progress.NextPhase) != "" {

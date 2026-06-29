@@ -88,6 +88,10 @@ func (f *IncidentGuidanceFlow) deferOffer() {
 }
 
 func (f *IncidentGuidanceFlow) handleChoiceRunbookSearch(o *Orchestrator) error {
+	message := "관련 runbook을 검색하고 있습니다. 잠시만 기다려 주세요."
+	PrintMessage(o.formatter.FormatText(message))
+	o.logEntry("incident_guidance_search_started", message)
+
 	summary, found, err := f.runIncidentGuidance(o)
 	if err != nil {
 		fmt.Println(colorBrightMagenta + "❌ runbook 검색 실패: " + err.Error() + colorReset)

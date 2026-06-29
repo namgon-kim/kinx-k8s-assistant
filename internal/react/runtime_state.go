@@ -26,6 +26,9 @@ const (
 	ControlExited                               ControlState = "exited"
 )
 
+// RuntimeSnapshot is a shallow, same-goroutine projection of Loop control
+// state. It centralizes state interpretation for prompts and diagnostics; it
+// is not an immutable deep copy for cross-goroutine use.
 type RuntimeSnapshot struct {
 	LoopState State
 	Control   ControlState

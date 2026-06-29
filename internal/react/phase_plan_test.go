@@ -1,6 +1,10 @@
 package react
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
+)
 
 func TestPhasePlanValidRejectsBackEdge(t *testing.T) {
 	plan := phasePlan{
@@ -53,6 +57,26 @@ func TestValidatePhasePlanForRequestRequiresMutationVerification(t *testing.T) {
 	plan.PhaseSteps = append(plan.PhaseSteps, phaseStep{Index: 3, Name: "response_synthesis", Goal: "report", CompletionCondition: "reported"})
 	if result := loop.validatePhasePlanForRequest(plan); !result.Valid {
 		t.Fatalf("expected mutation verification phase to satisfy contract, got %#v", result)
+	}
+}
+
+func TestValidatePhasePlanForReadOnlyRequestDoesNotRequireMutationVerification(t *testing.T) {
+	loop := &Loop{
+		cfg: &config.Config{ReadOnly: true},
+		requirementAnalysis: &requirementAnalysis{
+			RequestType: "mutation",
+			Action:      "create_configmap",
+		},
+	}
+	plan := phasePlan{
+		RequestGoal:       "explain read-only limitation",
+		CurrentPhaseIndex: 1,
+		PhaseSteps: []phaseStep{
+			{Index: 1, Name: "response_synthesis", Goal: "explain blocked mutation", CompletionCondition: "reported"},
+		},
+	}
+	if result := loop.validatePhasePlanForRequest(plan); !result.Valid {
+		t.Fatalf("read-only mutation request should not require mutation verification phase, got %#v", result)
 	}
 }
 

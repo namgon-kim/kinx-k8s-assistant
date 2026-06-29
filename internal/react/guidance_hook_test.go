@@ -742,6 +742,73 @@ func TestMutationLifecycleConsumesResolvedVerificationResult(t *testing.T) {
 	}
 }
 
+func TestMutationLifecycleProgressingDirectiveKeepsNextAction(t *testing.T) {
+	loop := &Loop{
+		pendingMutationVerification: &pendingMutationVerification{
+			AwaitingResult: true,
+			Requirements: []mutationEvidenceRequirement{{
+				ID:     "mutation_1_outcome_primary_target",
+				Kind:   "outcome_evidence",
+				Target: actionTarget{Resource: "deployment", Namespace: "web", Name: "web-app"},
+			}},
+			Satisfied: map[string]bool{"mutation_1_outcome_primary_target": true},
+		},
+	}
+	_, handled := loop.consumeMutationVerificationResult([]gollm.FunctionCall{{
+		Name: internalMutationVerificationResultCall,
+		Arguments: map[string]any{
+			"status":           "progressing",
+			"evidence_summary": []any{"deployment rollout is still progressing"},
+			"reason":           "new replicaset is not fully available yet",
+			"next_action":      "wait briefly, then run kubectl -n web rollout status deployment/web-app",
+		},
+	}})
+	if !handled {
+		t.Fatal("expected progressing mutation_verification_result to be handled")
+	}
+	if !loop.mutationContinuationRequired {
+		t.Fatal("expected progressing result to require mutation continuation")
+	}
+	if !strings.Contains(loop.pendingResponseDirective, "rollout status deployment/web-app") {
+		t.Fatalf("expected next_action to be preserved in directive, got %q", loop.pendingResponseDirective)
+	}
+}
+
+func TestMutationVerificationResultRequiresNextActionForUnresolved(t *testing.T) {
+	_, ok := mutationVerificationResultFromFunctionCall(gollm.FunctionCall{
+		Name: internalMutationVerificationResultCall,
+		Arguments: map[string]any{
+			"status":           "unresolved",
+			"evidence_summary": []any{"deployment remains unavailable"},
+			"reason":           "config is still missing",
+		},
+	})
+	if ok {
+		t.Fatal("unresolved mutation_verification_result without next_action must be invalid")
+	}
+}
+
+func TestMutationContinuationBlocksReportAndClearsAfterUsefulObservation(t *testing.T) {
+	loop := &Loop{mutationContinuationRequired: true}
+	if !loop.enforceMutationContinuation([]gollm.FunctionCall{{Name: internalFinalReportCall}}) {
+		t.Fatal("final_report must be blocked while mutation continuation is required")
+	}
+
+	loop.mutationContinuationRequired = true
+	loop.trackMutationVerification(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": "kubectl -n web rollout status deployment/web-app",
+			},
+		},
+		ModifiesResource: "no",
+	}, map[string]any{"status": "ok"})
+	if loop.mutationContinuationRequired {
+		t.Fatal("successful observation should clear mutation continuation requirement")
+	}
+}
+
 func TestMutationLifecycleAllowsMultipleVerificationActions(t *testing.T) {
 	loop := &Loop{
 		pendingMutationVerification: &pendingMutationVerification{
