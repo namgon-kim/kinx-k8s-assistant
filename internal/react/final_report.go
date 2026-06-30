@@ -47,6 +47,7 @@ func (l *Loop) requestFinalReportFromModel() {
 	if l.finalReportRequested {
 		return
 	}
+	l.guidedPhaseProgressRequested = false
 	l.finalReportRequested = true
 	var b strings.Builder
 	b.WriteString("All resource-guide diagnostic_steps have been completed (see guide_step anchor).\n")
@@ -304,6 +305,9 @@ func (l *Loop) requestNextDirectionsFromModel(report finalReport) {
 func (l *Loop) queueResponseDirective(directive string) {
 	directive = strings.TrimSpace(directive)
 	if directive == "" {
+		return
+	}
+	if directive == strings.TrimSpace(l.pendingResponseDirective) {
 		return
 	}
 	l.pendingResponseDirective = directive

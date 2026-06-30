@@ -286,7 +286,7 @@ const (
 - `ControlAwaitingGuidedDiagnosisStep`는 top-level phase가 아니다. `guided_diagnosis` phase 내부 nested state다. 이 상태는 `guide_progress` object만 기다린다는 뜻이 아니라, 다음 guide step을 진행하는 `action` 또는 관찰 후 `guide_progress`를 기다린다는 뜻이다.
 - `ControlAwaitingMutationVerificationEvidence`도 top-level phase가 아니다. mutation lifecycle gate다.
 - `ControlAwaitingMutationContinuation`은 `progressing`/`unresolved` result 이후 계속 진단해야 하는 상태다.
-- `ControlExecutingTool`은 현재 코드에는 지속 state로 존재하지 않는다. `dispatchToolCalls`가 동기 실행 중인 순간을 명시하려는 미래 상태이며, snapshot projection에서는 별도 instrumentation 없이는 관측하기 어렵다.
+- `ControlExecutingTool`은 `dispatchToolCalls` 동기 실행 구간에서 published snapshot에 표시된다.
 - `ControlComplete`는 "요청이 막 끝났다"는 전이 이벤트에 가깝다. 현재 코드의 안정 상태로는 `StateDone`이 곧 `ControlAwaitingUserQuery`로 해석된다.
 
 ## 제안 RuntimeState
@@ -331,21 +331,22 @@ type RuntimeState struct {
 제안 우선순위:
 
 1. `StateExited` -> `ControlExited`
-2. `StateWaitingApproval` -> `ControlAwaitingApproval`
-3. `StateWaitingDirectionChoice` -> `ControlAwaitingContinuationChoice`
-4. `StateWaitingDirectionText` -> `ControlAwaitingContinuationText`
-5. `StateIdle || StateDone` -> `ControlAwaitingUserQuery`
-6. `pendingMutationVerification != nil && AwaitingResult` -> `ControlAwaitingMutationVerificationResult`
-7. `pendingMutationVerification != nil` -> `ControlAwaitingMutationVerificationEvidence`
-8. `mutationContinuationRequired` -> `ControlAwaitingMutationContinuation`
-9. `guidedPhaseProgressRequested` -> `ControlAwaitingGuidedPhaseProgress`
-10. `finalReportRequested` -> `ControlAwaitingFinalReport`
-11. `pendingFinalReport != nil && pendingNextDirections == nil && pendingDirectionPrompt == nil` -> `ControlAwaitingNextDirections`
-12. `requirementAnalysis == nil` -> `ControlAwaitingRequirementAnalysis`
-13. `phaseStepState == nil` -> `ControlAwaitingPhasePlan`
-14. `guidance_lookup phase && resourceGuideInjected == false && CRD` -> `ControlAwaitingResourceGuideLookup`
-15. `guideStepState != nil && remaining guide steps exist` -> `ControlAwaitingGuidedDiagnosisStep`
-16. default -> `ControlAwaitingModelStep`
+2. `toolDispatchInProgress` -> `ControlExecutingTool`
+3. `StateWaitingApproval` -> `ControlAwaitingApproval`
+4. `StateWaitingDirectionChoice` -> `ControlAwaitingContinuationChoice`
+5. `StateWaitingDirectionText` -> `ControlAwaitingContinuationText`
+6. `StateIdle || StateDone` -> `ControlAwaitingUserQuery`
+7. `pendingMutationVerification != nil && AwaitingResult` -> `ControlAwaitingMutationVerificationResult`
+8. `pendingMutationVerification != nil` -> `ControlAwaitingMutationVerificationEvidence`
+9. `mutationContinuationRequired` -> `ControlAwaitingMutationContinuation`
+10. `guidedPhaseProgressRequested` -> `ControlAwaitingGuidedPhaseProgress`
+11. `finalReportRequested` -> `ControlAwaitingFinalReport`
+12. `pendingFinalReport != nil && pendingNextDirections == nil && pendingDirectionPrompt == nil` -> `ControlAwaitingNextDirections`
+13. `requirementAnalysis == nil` -> `ControlAwaitingRequirementAnalysis`
+14. `phaseStepState == nil` -> `ControlAwaitingPhasePlan`
+15. `guidance_lookup phase && resourceGuideInjected == false && CRD` -> `ControlAwaitingResourceGuideLookup`
+16. `guideStepState != nil && remaining guide steps exist` -> `ControlAwaitingGuidedDiagnosisStep`
+17. default -> `ControlAwaitingModelStep`
 
 이 우선순위는 현재 runtime enforcement 순서와 맞아야 한다.
 
@@ -582,14 +583,20 @@ anchor := snapshot.AnchorText()
 - `RuntimeSnapshot()`은 현재 `Loop` 필드 조합을 읽어 문서의 우선순위에 맞는 `ControlState`를 계산한다.
 - `runtimeStateAnchor`는 더 이상 자체적으로 active gate를 추론하지 않고 `RuntimeSnapshot`의 `ActiveGate`, `RequiredNextOutput`, `ForbiddenNextOutputs`, `NestedStateName`을 사용한다.
 - `ControlAwaitingUserQuery`, `ControlAwaitingNextDirections`, `ControlAwaitingGuidedDiagnosisStep`를 현재 코드 전이에 맞게 projection에 반영했다.
-- `DerivedInputOwner()`를 snapshot에 추가했다.
+- `DerivedInputOwner()`를 snapshot에 추가했고, `InputOwner()`는 published `RuntimeSnapshot`을 우선 읽는다.
+- `addMessage()` 직전에 snapshot을 publish해 orchestrator goroutine이 `Loop` 내부 state를 직접 읽지 않게 했다.
+- raw input을 `choice_number`, `approval`, `slash_meta`, `free_text`, `empty`로 분류하고, `ControlState + input kind`를 `DecideInputDispatch`로 판단한다.
+- continuation choice는 slash meta를 받지 않고, continuation free-text에서만 slash meta를 orchestrator가 처리한다.
+- `next_directions_required`는 structured output과 plain answer 양쪽에서 deterministic gate로 강제한다.
+- impossible state audit hook을 추가해 mutation verification과 final/phase requested flags 충돌, direction prompt 불일치, approval pending call 누락을 내부 invariant 위반으로 드러낸다.
+- `ControlExecutingTool`은 `dispatchToolCalls` 동기 실행 구간에서 snapshot에 표시된다.
+- requested structured output gate는 raw requested flag가 아니라 `RuntimeSnapshot.Control`을 기준으로 판단한다.
 
 아직 의도적으로 남긴 범위:
 
-- 실제 `InputOwner()`는 아직 atomic compatibility layer를 사용한다. orchestrator goroutine에서 호출되는 경로가 있어, lock/transition owner 정리 없이 `l.state` 직접 읽기로 바꾸면 race 위험이 있다.
+- `inputOwner` atomic field는 fallback compatibility로 남아 있다. source of truth는 published snapshot으로 이동했지만, 완전 제거는 후속 cleanup이다.
 - `finalReportRequested`, `guidedPhaseProgressRequested`, `pendingMutationVerification`, `mutationContinuationRequired`, `pendingResponseDirective`는 아직 source field로 남아 있다.
-- `ControlExecutingTool`은 아직 관측 가능한 지속 상태가 아니다. `dispatchToolCalls` 동기 실행 구간을 상태로 승격하려면 transition audit hook이 먼저 필요하다.
-- `next_directions_required`는 anchor/projection에는 표시되지만, 별도 deterministic enforcement gate는 아직 없다.
+- `pendingResponseDirective`는 중복 append를 막지만, 아직 완전히 `ControlState -> directive` 파생 구조로 바뀐 것은 아니다.
 
 ### Step 1. Snapshot만 추가
 

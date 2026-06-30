@@ -617,7 +617,14 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
 			continue
 		}
-		if strings.HasPrefix(input, "/") {
+		snapshot := activeRuntimeSnapshot(activeAgent)
+		inputKind := react.ClassifyUserInput(input)
+		decision := react.DecideInputDispatch(snapshot.Control, inputKind)
+		if !decision.Accepted {
+			fmt.Println(colorBrightMagenta + "❌ 현재 입력 단계에서 사용할 수 없는 입력입니다" + colorReset)
+			continue
+		}
+		if decision.Handler == react.InputHandlerOrchestratorMeta {
 			if err := o.selectMetaCommand(input); err != nil {
 				if err == io.EOF {
 					if o.agentWrap == activeAgent {
@@ -630,6 +637,10 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 			if o.agentWrap != activeAgent {
 				return nil
 			}
+			continue
+		}
+		if decision.Handler != react.InputHandlerReactText && decision.Handler != react.InputHandlerUserQuery {
+			fmt.Println(colorBrightMagenta + "❌ 현재 입력 단계에서 사용할 수 없는 입력입니다" + colorReset)
 			continue
 		}
 
@@ -649,7 +660,8 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 	PrintMessage(o.formatter.FormatPropose(choiceReq.Prompt))
 	options := append([]api.UserChoiceOption(nil), choiceReq.Options...)
 	incidentChoice := 0
-	if activeAgent.InputOwner() == react.InputOwnerReactChoice && o.incidentGuidance.hasPendingOffer() && choiceOptionsAllowRunbookSearch(choiceReq.Options) {
+	initialSnapshot := activeRuntimeSnapshot(activeAgent)
+	if initialSnapshot.Control == react.ControlAwaitingContinuationChoice && o.incidentGuidance.hasPendingOffer() && choiceOptionsAllowRunbookSearch(choiceReq.Options) {
 		incidentChoice = len(options) + 1
 		options = append(options, api.UserChoiceOption{Value: "incident-runbook", Label: "[runbook 검색] 감지된 문제의 해결 방법 검색"})
 	}
@@ -676,6 +688,13 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 		}
 		if inputIsQuit(input) {
 			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
+			continue
+		}
+		snapshot := activeRuntimeSnapshot(activeAgent)
+		inputKind := react.ClassifyUserInput(input)
+		decision := react.DecideInputDispatch(snapshot.Control, inputKind)
+		if !decision.Accepted {
+			fmt.Println(colorBrightMagenta + "❌ 유효하지 않은 선택입니다" + colorReset)
 			continue
 		}
 		if input == "y" || input == "yes" || input == "예" {
@@ -705,6 +724,16 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 
 		fmt.Println(colorBrightMagenta + "❌ 유효하지 않은 선택입니다" + colorReset)
 	}
+}
+
+func activeRuntimeSnapshot(agent *react.Loop) react.RuntimeSnapshot {
+	if agent == nil {
+		return react.RuntimeSnapshot{Control: react.ControlIdle, InputOwner: react.InputOwnerOrchestrator}
+	}
+	if snapshot, ok := agent.PublishedRuntimeSnapshot(); ok {
+		return snapshot
+	}
+	return react.RuntimeSnapshot{Control: react.ControlAwaitingUserQuery, InputOwner: react.InputOwnerOrchestrator}
 }
 
 func findChoiceIndex(options []api.UserChoiceOption, value string, fallback int) int {

@@ -658,6 +658,7 @@ func (l *Loop) requestGuidedDiagnosisPhaseProgress() {
 	if l.guidedPhaseProgressRequested {
 		return
 	}
+	l.finalReportRequested = false
 	l.guidedPhaseProgressRequested = true
 	var b strings.Builder
 	b.WriteString("All nested resource-guide guidance_step entries have been completed for the active guided_diagnosis phase.\n")

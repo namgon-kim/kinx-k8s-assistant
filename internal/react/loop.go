@@ -116,11 +116,13 @@ type Loop struct {
 	pendingDirectionPrompt       *directionPromptState
 	pendingMutationVerification  *pendingMutationVerification
 	mutationContinuationRequired bool
+	toolDispatchInProgress       bool
 
 	cancel context.CancelFunc
 	once   sync.Once
 
-	inputOwner atomic.Int32
+	inputOwner      atomic.Int32
+	runtimeSnapshot atomic.Value
 }
 
 type guideStepState struct {
@@ -247,6 +249,9 @@ func (l *Loop) InputOwner() InputOwner {
 	if l == nil {
 		return InputOwnerOrchestrator
 	}
+	if snapshot, ok := l.PublishedRuntimeSnapshot(); ok {
+		return snapshot.InputOwner
+	}
 	switch l.inputOwner.Load() {
 	case 1:
 		return InputOwnerReactChoice
@@ -263,6 +268,9 @@ func (l *Loop) setInputOwner(owner InputOwner) {
 	if l == nil {
 		return
 	}
+	snapshot := l.RuntimeSnapshot()
+	owner = snapshot.DerivedInputOwner()
+	snapshot.InputOwner = owner
 	var value int32
 	switch owner {
 	case InputOwnerReactChoice:
@@ -275,6 +283,7 @@ func (l *Loop) setInputOwner(owner InputOwner) {
 		value = 0
 	}
 	l.inputOwner.Store(value)
+	l.runtimeSnapshot.Store(snapshot)
 }
 
 func (l *Loop) init(ctx context.Context) error {
@@ -333,8 +342,8 @@ func (l *Loop) run(ctx context.Context, initialQuery string) {
 
 	if initialQuery != "" {
 		if err := l.startQuery(initialQuery); err != nil {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			l.state = StateDone
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 		}
 	}
 
@@ -371,11 +380,11 @@ func (l *Loop) run(ctx context.Context, initialQuery string) {
 		case StateRunning:
 			l.setInputOwner(InputOwnerOrchestrator)
 			if err := l.runIteration(ctx); err != nil {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 				l.pendingCalls = nil
 				l.currChatContent = nil
 				l.currIteration = 0
 				l.state = StateDone
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			}
 		case StateExited:
 			return
@@ -406,8 +415,8 @@ func (l *Loop) waitForInput(ctx context.Context) bool {
 			return true
 		}
 		if err := l.startQuery(query); err != nil {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			l.state = StateDone
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			return true
 		}
 		return true
@@ -428,8 +437,8 @@ func (l *Loop) waitForApproval(ctx context.Context) bool {
 			return true
 		}
 		if err := l.handleApproval(ctx, choice.Choice); err != nil {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			l.state = StateDone
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 		}
 		return true
 	}
@@ -518,34 +527,34 @@ func (l *Loop) handleMetaQuery(ctx context.Context, query string) bool {
 		l.toolProfile = selectToolProfile(l.registry.Tools, l.requestIntent, "")
 		l.promptOptions = l.newPromptOptions(l.requestIntent, false, false)
 		if err := l.resetChatSession(); err != nil {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			l.state = StateDone
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
 			return true
 		}
 		l.clearConversationState()
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "대화 컨텍스트를 초기화했습니다.")
 		l.state = StateDone
+		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "대화 컨텍스트를 초기화했습니다.")
 		return true
 	case "exit", "quit":
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "종료합니다.")
 		l.state = StateExited
+		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "종료합니다.")
 		return true
 	case "model":
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Current model is `"+l.cfg.Model+"`")
 		l.state = StateDone
+		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Current model is `"+l.cfg.Model+"`")
 		return true
 	case "models":
+		l.state = StateDone
 		models, err := l.llm.ListModels(ctx)
 		if err != nil {
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, err.Error())
 		} else {
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Available models:\n\n  - "+strings.Join(models, "\n  - "))
 		}
-		l.state = StateDone
 		return true
 	case "tools":
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Available tools:\n\n  - "+strings.Join(l.registry.Tools.Names(), "\n  - "))
 		l.state = StateDone
+		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Available tools:\n\n  - "+strings.Join(l.registry.Tools.Names(), "\n  - "))
 		return true
 	default:
 		return false
@@ -640,6 +649,9 @@ func estimateTextTokens(text string) int {
 }
 
 func (l *Loop) runIteration(ctx context.Context) error {
+	if handled := l.auditRuntimeState(); handled {
+		return nil
+	}
 	if l.currIteration >= l.cfg.MaxIterations {
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Maximum number of iterations reached.")
 		l.currIteration = 0
@@ -716,6 +728,9 @@ func (l *Loop) runIteration(ctx context.Context) error {
 			return nil
 		}
 		if handled := l.rejectPlainAnswerDuringMutationContinuation(streamedText); handled {
+			return nil
+		}
+		if handled := l.rejectPlainAnswerDuringNextDirections(streamedText); handled {
 			return nil
 		}
 		if l.phaseStepState != nil && strings.TrimSpace(streamedText) != "" && !l.phaseAllowsPlainAnswer() {
@@ -865,6 +880,38 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	return l.dispatchToolCalls(ctx)
 }
 
+func (l *Loop) rejectPlainAnswerDuringNextDirections(text string) bool {
+	if l.RuntimeSnapshot().Control != ControlAwaitingNextDirections || strings.TrimSpace(text) == "" {
+		return false
+	}
+	message := "The previous final_report was inconclusive and the runtime requested `next_directions`. Return only a next_directions object with concrete continuation options; do not emit a plain answer yet."
+	l.queueResponseDirective(message)
+	if !l.appendCorrectionWithCompaction("next_directions_required_plain_answer", message) {
+		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "next_directions 요청이 반복적으로 무시되어 진단을 중단합니다.")
+		l.pendingCalls = nil
+		l.currIteration = 0
+		l.state = StateDone
+		return true
+	}
+	l.pendingCalls = nil
+	l.currIteration++
+	l.state = StateRunning
+	return true
+}
+
+func (l *Loop) auditRuntimeState() bool {
+	snapshot := l.RuntimeSnapshot()
+	if message := snapshot.AuditError(); message != "" {
+		l.pendingCalls = nil
+		l.currIteration = 0
+		l.state = StateDone
+		l.setInputOwner(InputOwnerOrchestrator)
+		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime state invariant violation: "+message)
+		return true
+	}
+	return false
+}
+
 // buildIterationSendContent assembles the message list that will be sent to
 // the LLM for the current iteration. It prepends compact anchors so the model
 // keeps the active request, phase, nested guide/mutation state, and required
@@ -952,7 +999,23 @@ func (l *Loop) enforceRequestedStructuredDirective(calls []gollm.FunctionCall) b
 	if len(calls) == 0 {
 		return false
 	}
-	if l.guidedPhaseProgressRequested && !onlyFunctionCall(calls, internalPhaseProgressCall) {
+	snapshot := l.RuntimeSnapshot()
+	switch {
+	case snapshot.Control == ControlAwaitingNextDirections && !onlyFunctionCall(calls, internalNextDirectionsCall):
+		message := "The previous final_report was inconclusive and the runtime requested `next_directions`. Return only a next_directions object with concrete continuation options; do not emit action, final_report, phase_progress, or a plain answer yet."
+		l.queueResponseDirective(message)
+		if !l.appendCorrectionWithCompaction("next_directions_required", message) {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "next_directions 요청이 반복적으로 무시되어 진단을 중단합니다.")
+			l.pendingCalls = nil
+			l.currIteration = 0
+			l.state = StateDone
+			return true
+		}
+		l.pendingCalls = nil
+		l.currIteration++
+		l.state = StateRunning
+		return true
+	case snapshot.Control == ControlAwaitingGuidedPhaseProgress && !onlyFunctionCall(calls, internalPhaseProgressCall):
 		message := "The runtime already requested `phase_progress` for the completed guided_diagnosis phase. Do not emit another action. Return only a phase_progress object completing guided_diagnosis."
 		l.queueResponseDirective(message)
 		if !l.appendCorrectionWithCompaction("guided_phase_progress_required", message) {
@@ -966,8 +1029,7 @@ func (l *Loop) enforceRequestedStructuredDirective(calls []gollm.FunctionCall) b
 		l.currIteration++
 		l.state = StateRunning
 		return true
-	}
-	if l.finalReportRequested && !onlyFunctionCall(calls, internalFinalReportCall) {
+	case snapshot.Control == ControlAwaitingFinalReport && !onlyFunctionCall(calls, internalFinalReportCall):
 		message := "The runtime already requested `final_report` after completing the resource-guide diagnostic steps. Do not emit another action. Return only a final_report object."
 		l.queueResponseDirective(message)
 		if !l.appendCorrectionWithCompaction("final_report_required", message) {
@@ -1803,6 +1865,12 @@ func (l *Loop) handleApproval(ctx context.Context, choice int) error {
 }
 
 func (l *Loop) dispatchToolCalls(ctx context.Context) error {
+	l.toolDispatchInProgress = true
+	l.setInputOwner(InputOwnerOrchestrator)
+	defer func() {
+		l.toolDispatchInProgress = false
+		l.setInputOwner(InputOwnerOrchestrator)
+	}()
 	for _, call := range l.pendingCalls {
 		description := call.ParsedToolCall.Description()
 		l.addMessage(api.MessageSourceModel, api.MessageTypeToolCallRequest, description)
@@ -2015,6 +2083,7 @@ func (l *Loop) translateModelText(ctx context.Context, text string) string {
 }
 
 func (l *Loop) addMessage(source api.MessageSource, messageType api.MessageType, payload any) {
+	l.publishRuntimeSnapshot()
 	l.output <- &api.Message{
 		ID:        uuid.NewString(),
 		Source:    source,
