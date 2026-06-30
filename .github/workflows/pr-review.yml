@@ -1,0 +1,82 @@
+name: PR Review
+
+on:
+  pull_request:
+    types:
+      - labeled
+
+permissions:
+  contents: read
+
+jobs:
+  pr-agent:
+    if: >
+      github.event.pull_request.draft == false &&
+      github.event.label.name == 'review:pr-agent'
+    runs-on: [self-hosted, linux, pr-review]
+
+    env:
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      PR_REPOSITORY: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: PR-Agent
+        run: sudo -n /opt/pr-review-tools/run-pr-agent-review
+
+  claude:
+    if: >
+      github.event.pull_request.draft == false &&
+      github.event.label.name == 'review:claude'
+    runs-on: [self-hosted, linux, pr-review]
+
+    env:
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      PR_REPOSITORY: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Claude
+        run: sudo -n /opt/pr-review-tools/run-claude-review
+
+  codex:
+    if: >
+      github.event.pull_request.draft == false &&
+      github.event.label.name == 'review:codex'
+    runs-on: [self-hosted, linux, pr-review]
+
+    env:
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      PR_REPOSITORY: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Codex
+        run: sudo -n /opt/pr-review-tools/run-codex-review
