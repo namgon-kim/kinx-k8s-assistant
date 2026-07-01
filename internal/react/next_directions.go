@@ -153,7 +153,7 @@ func (l *Loop) promptDirectionChoice(nd nextDirections) {
 	options = append(options, api.UserChoiceOption{Value: "finalize", Label: "여기서 진단 종료"})
 	l.pendingDirectionPrompt = state
 	l.state = StateWaitingDirectionChoice
-	l.setInputOwner(InputOwnerReactChoice)
+	l.refreshInputOwner()
 
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
 		Prompt:  prompt.String(),
@@ -193,7 +193,7 @@ func (l *Loop) waitForDirectionChoice(ctx context.Context) bool {
 		if state.HasFreeInput && choice == state.FreeInputIdx {
 			l.pendingDirectionPrompt = nil
 			l.state = StateWaitingDirectionText
-			l.setInputOwner(InputOwnerReactText)
+			l.refreshInputOwner()
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeUserInputRequest, "어떤 방향으로 계속할지 알려주세요")
 			return true
 		}
@@ -334,7 +334,7 @@ func (l *Loop) promptProblematicResourceInvestigation(report finalReport) bool {
 	choices = append(choices, api.UserChoiceOption{Value: "no", Label: "여기서 종료"})
 	l.pendingDirectionPrompt = state
 	l.state = StateWaitingDirectionChoice
-	l.setInputOwner(InputOwnerReactChoice)
+	l.refreshInputOwner()
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
 		Prompt:  "문제가 있는 관련 리소스가 확인되었습니다. 추가 조사할까요? (y/n)",
 		Options: choices,

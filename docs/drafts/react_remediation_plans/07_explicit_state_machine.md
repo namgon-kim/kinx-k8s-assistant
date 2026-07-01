@@ -584,13 +584,15 @@ anchor := snapshot.AnchorText()
 - `runtimeStateAnchor`는 더 이상 자체적으로 active gate를 추론하지 않고 `RuntimeSnapshot`의 `ActiveGate`, `RequiredNextOutput`, `ForbiddenNextOutputs`, `NestedStateName`을 사용한다.
 - `ControlAwaitingUserQuery`, `ControlAwaitingNextDirections`, `ControlAwaitingGuidedDiagnosisStep`를 현재 코드 전이에 맞게 projection에 반영했다.
 - `DerivedInputOwner()`를 snapshot에 추가했고, `InputOwner()`는 published `RuntimeSnapshot`을 우선 읽는다.
+- `setInputOwner(owner)`는 인자를 받지 않는 `refreshInputOwner()`로 정리했다. owner는 항상 `RuntimeSnapshot.Control`에서 파생한다.
 - `addMessage()` 직전에 snapshot을 publish해 orchestrator goroutine이 `Loop` 내부 state를 직접 읽지 않게 했다.
 - raw input을 `choice_number`, `approval`, `slash_meta`, `free_text`, `empty`로 분류하고, `ControlState + input kind`를 `DecideInputDispatch`로 판단한다.
 - continuation choice는 slash meta를 받지 않고, continuation free-text에서만 slash meta를 orchestrator가 처리한다.
 - `next_directions_required`는 structured output과 plain answer 양쪽에서 deterministic gate로 강제한다.
-- impossible state audit hook을 추가해 mutation verification과 final/phase requested flags 충돌, direction prompt 불일치, approval pending call 누락을 내부 invariant 위반으로 드러낸다.
-- `ControlExecutingTool`은 `dispatchToolCalls` 동기 실행 구간에서 snapshot에 표시된다.
+- impossible state audit hook을 run loop 공통 경로에 추가해 mutation verification과 final/phase requested flags 충돌, direction prompt 불일치, approval pending call 누락을 내부 invariant 위반으로 드러낸다.
+- `ControlExecutingTool`은 `dispatchToolCalls` 동기 실행 구간에서 snapshot에 표시되며, 진입/종료 시 명시적으로 snapshot을 publish한다.
 - requested structured output gate는 raw requested flag가 아니라 `RuntimeSnapshot.Control`을 기준으로 판단한다.
+- orchestrator input dispatch, waiting-state audit, `next_directions` plain-answer gate 회귀 테스트를 추가했다.
 
 아직 의도적으로 남긴 범위:
 

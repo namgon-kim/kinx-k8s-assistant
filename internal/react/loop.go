@@ -264,12 +264,12 @@ func (l *Loop) InputOwner() InputOwner {
 	}
 }
 
-func (l *Loop) setInputOwner(owner InputOwner) {
+func (l *Loop) refreshInputOwner() {
 	if l == nil {
 		return
 	}
 	snapshot := l.RuntimeSnapshot()
-	owner = snapshot.DerivedInputOwner()
+	owner := snapshot.DerivedInputOwner()
 	snapshot.InputOwner = owner
 	var value int32
 	switch owner {
@@ -355,30 +355,34 @@ func (l *Loop) run(ctx context.Context, initialQuery string) {
 		default:
 		}
 
+		if handled := l.auditRuntimeState(); handled {
+			continue
+		}
+
 		switch l.state {
 		case StateIdle, StateDone:
-			l.setInputOwner(InputOwnerOrchestrator)
+			l.refreshInputOwner()
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeUserInputRequest, ">>>")
 			if !l.waitForInput(ctx) {
 				return
 			}
 		case StateWaitingApproval:
-			l.setInputOwner(InputOwnerApproval)
+			l.refreshInputOwner()
 			if !l.waitForApproval(ctx) {
 				return
 			}
 		case StateWaitingDirectionChoice:
-			l.setInputOwner(InputOwnerReactChoice)
+			l.refreshInputOwner()
 			if !l.waitForDirectionChoice(ctx) {
 				return
 			}
 		case StateWaitingDirectionText:
-			l.setInputOwner(InputOwnerReactText)
+			l.refreshInputOwner()
 			if !l.waitForDirectionText(ctx) {
 				return
 			}
 		case StateRunning:
-			l.setInputOwner(InputOwnerOrchestrator)
+			l.refreshInputOwner()
 			if err := l.runIteration(ctx); err != nil {
 				l.pendingCalls = nil
 				l.currChatContent = nil
@@ -649,9 +653,6 @@ func estimateTextTokens(text string) int {
 }
 
 func (l *Loop) runIteration(ctx context.Context) error {
-	if handled := l.auditRuntimeState(); handled {
-		return nil
-	}
 	if l.currIteration >= l.cfg.MaxIterations {
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Maximum number of iterations reached.")
 		l.currIteration = 0
@@ -905,7 +906,7 @@ func (l *Loop) auditRuntimeState() bool {
 		l.pendingCalls = nil
 		l.currIteration = 0
 		l.state = StateDone
-		l.setInputOwner(InputOwnerOrchestrator)
+		l.refreshInputOwner()
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime state invariant violation: "+message)
 		return true
 	}
@@ -1824,7 +1825,7 @@ func (l *Loop) requestApproval() {
 	prompt := "다음 명령은 실행 전 승인이 필요합니다:\n* " + strings.Join(descriptions, "\n* ")
 	prompt += "\n\n진행할까요?"
 	l.state = StateWaitingApproval
-	l.setInputOwner(InputOwnerApproval)
+	l.refreshInputOwner()
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
 		Prompt: prompt,
 		Options: []api.UserChoiceOption{
@@ -1866,10 +1867,12 @@ func (l *Loop) handleApproval(ctx context.Context, choice int) error {
 
 func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 	l.toolDispatchInProgress = true
-	l.setInputOwner(InputOwnerOrchestrator)
+	l.refreshInputOwner()
+	l.publishRuntimeSnapshot()
 	defer func() {
 		l.toolDispatchInProgress = false
-		l.setInputOwner(InputOwnerOrchestrator)
+		l.refreshInputOwner()
+		l.publishRuntimeSnapshot()
 	}()
 	for _, call := range l.pendingCalls {
 		description := call.ParsedToolCall.Description()

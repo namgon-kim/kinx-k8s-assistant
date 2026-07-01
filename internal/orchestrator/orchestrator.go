@@ -618,8 +618,7 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 			continue
 		}
 		snapshot := activeRuntimeSnapshot(activeAgent)
-		inputKind := react.ClassifyUserInput(input)
-		decision := react.DecideInputDispatch(snapshot.Control, inputKind)
+		decision := decideOrchestratorInput(snapshot.Control, input)
 		if !decision.Accepted {
 			fmt.Println(colorBrightMagenta + "❌ 현재 입력 단계에서 사용할 수 없는 입력입니다" + colorReset)
 			continue
@@ -691,8 +690,7 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 			continue
 		}
 		snapshot := activeRuntimeSnapshot(activeAgent)
-		inputKind := react.ClassifyUserInput(input)
-		decision := react.DecideInputDispatch(snapshot.Control, inputKind)
+		decision := decideOrchestratorInput(snapshot.Control, input)
 		if !decision.Accepted {
 			fmt.Println(colorBrightMagenta + "❌ 유효하지 않은 선택입니다" + colorReset)
 			continue
@@ -734,6 +732,10 @@ func activeRuntimeSnapshot(agent *react.Loop) react.RuntimeSnapshot {
 		return snapshot
 	}
 	return react.RuntimeSnapshot{Control: react.ControlAwaitingUserQuery, InputOwner: react.InputOwnerOrchestrator}
+}
+
+func decideOrchestratorInput(control react.ControlState, input string) react.InputDispatchDecision {
+	return react.DecideInputDispatch(control, react.ClassifyUserInput(input))
 }
 
 func findChoiceIndex(options []api.UserChoiceOption, value string, fallback int) int {
