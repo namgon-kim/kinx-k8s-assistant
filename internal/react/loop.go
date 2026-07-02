@@ -268,9 +268,8 @@ func (l *Loop) refreshInputOwner() {
 	if l == nil {
 		return
 	}
-	snapshot := l.RuntimeSnapshot()
-	owner := snapshot.DerivedInputOwner()
-	snapshot.InputOwner = owner
+	snapshot := l.publishRuntimeSnapshot()
+	owner := snapshot.InputOwner
 	var value int32
 	switch owner {
 	case InputOwnerReactChoice:
@@ -283,7 +282,6 @@ func (l *Loop) refreshInputOwner() {
 		value = 0
 	}
 	l.inputOwner.Store(value)
-	l.runtimeSnapshot.Store(snapshot)
 }
 
 func (l *Loop) init(ctx context.Context) error {
@@ -1868,11 +1866,9 @@ func (l *Loop) handleApproval(ctx context.Context, choice int) error {
 func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 	l.toolDispatchInProgress = true
 	l.refreshInputOwner()
-	l.publishRuntimeSnapshot()
 	defer func() {
 		l.toolDispatchInProgress = false
 		l.refreshInputOwner()
-		l.publishRuntimeSnapshot()
 	}()
 	for _, call := range l.pendingCalls {
 		description := call.ParsedToolCall.Description()

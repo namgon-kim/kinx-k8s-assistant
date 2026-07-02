@@ -336,7 +336,7 @@ func (l *Loop) promptProblematicResourceInvestigation(report finalReport) bool {
 	l.state = StateWaitingDirectionChoice
 	l.refreshInputOwner()
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
-		Prompt:  "문제가 있는 관련 리소스가 확인되었습니다. 추가 조사할까요? (y/n)",
+		Prompt:  "문제가 있는 관련 리소스가 확인되었습니다. 추가 조사할 리소스를 선택해 주세요.",
 		Options: choices,
 	})
 	l.pendingCalls = nil

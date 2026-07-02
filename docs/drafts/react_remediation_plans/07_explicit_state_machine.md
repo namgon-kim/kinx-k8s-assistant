@@ -590,9 +590,12 @@ anchor := snapshot.AnchorText()
 - continuation choice는 slash meta를 받지 않고, continuation free-text에서만 slash meta를 orchestrator가 처리한다.
 - `next_directions_required`는 structured output과 plain answer 양쪽에서 deterministic gate로 강제한다.
 - impossible state audit hook을 run loop 공통 경로에 추가해 mutation verification과 final/phase requested flags 충돌, direction prompt 불일치, approval pending call 누락을 내부 invariant 위반으로 드러낸다.
+- mutation verification pending과 final/phase requested의 공존은 fatal invariant로 보지 않는다. 이 조합은 `ControlAwaitingMutationVerification*` precedence로 먼저 검증을 처리한 뒤 남은 requested output을 이어서 처리한다.
 - `ControlExecutingTool`은 `dispatchToolCalls` 동기 실행 구간에서 snapshot에 표시되며, 진입/종료 시 명시적으로 snapshot을 publish한다.
 - requested structured output gate는 raw requested flag가 아니라 `RuntimeSnapshot.Control`을 기준으로 판단한다.
-- orchestrator input dispatch, waiting-state audit, `next_directions` plain-answer gate 회귀 테스트를 추가했다.
+- orchestrator input dispatch는 표시된 입력 모드 기준으로 고정한다. `선택 (번호)`는 숫자만, `선택 (y/n)`은 `y/n/yes/no/예/아니오`만 허용한다.
+- 문제 리소스 추가 조사처럼 여러 continuation option을 보여주는 prompt는 `(y/n)`가 아니라 번호 선택 prompt로 표시한다.
+- orchestrator input dispatch, waiting-state audit, mutation verification precedence, executing-tool snapshot, `next_directions` plain-answer gate 회귀 테스트를 추가했다.
 
 아직 의도적으로 남긴 범위:
 

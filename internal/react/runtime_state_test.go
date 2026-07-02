@@ -17,11 +17,18 @@ func TestInputDispatchDecisionTable(t *testing.T) {
 		handler  InputHandlerKind
 	}{
 		{
-			name:     "choice accepts number",
+			name:     "continuation choice accepts number",
 			control:  ControlAwaitingContinuationChoice,
 			input:    "2",
 			accepted: true,
 			handler:  InputHandlerReactChoice,
+		},
+		{
+			name:     "continuation choice rejects approval token",
+			control:  ControlAwaitingContinuationChoice,
+			input:    "y",
+			accepted: false,
+			handler:  InputHandlerNone,
 		},
 		{
 			name:     "choice rejects slash meta",
@@ -86,15 +93,44 @@ func TestNextDirectionsRequiredGateBlocksOtherStructuredOutput(t *testing.T) {
 	}
 }
 
-func TestRuntimeStateAuditDetectsImpossibleRequestedReports(t *testing.T) {
+func TestRuntimeStateAuditAllowsMutationVerificationToPrecedeRequestedReport(t *testing.T) {
 	snapshot := RuntimeSnapshot{
 		LoopState:                    StateRunning,
 		PendingMutationVerification:  &pendingMutationVerification{},
 		FinalReportRequested:         true,
 		GuidedPhaseProgressRequested: false,
 	}
+	if got := snapshot.AuditError(); got != "" {
+		t.Fatalf("audit error = %q, want none because mutation verification control takes precedence", got)
+	}
+	if got := snapshot.deriveControl(); got != ControlAwaitingMutationVerificationEvidence {
+		t.Fatalf("control = %s, want %s", got, ControlAwaitingMutationVerificationEvidence)
+	}
+}
+
+func TestRuntimeStateAuditDetectsConflictingRequestedReports(t *testing.T) {
+	snapshot := RuntimeSnapshot{
+		LoopState:                    StateRunning,
+		FinalReportRequested:         true,
+		GuidedPhaseProgressRequested: true,
+	}
 	if got := snapshot.AuditError(); got == "" {
-		t.Fatal("expected pending mutation verification plus final report request to be invalid")
+		t.Fatal("expected final report plus guided phase progress request to be invalid")
+	}
+}
+
+func TestRefreshInputOwnerPublishesExecutingToolSnapshot(t *testing.T) {
+	loop := &Loop{
+		state:                  StateRunning,
+		toolDispatchInProgress: true,
+	}
+	loop.refreshInputOwner()
+	snapshot, ok := loop.PublishedRuntimeSnapshot()
+	if !ok {
+		t.Fatal("expected published snapshot")
+	}
+	if snapshot.Control != ControlExecutingTool {
+		t.Fatalf("control = %s, want %s", snapshot.Control, ControlExecutingTool)
 	}
 }
 

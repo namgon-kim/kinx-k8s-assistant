@@ -667,9 +667,14 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 	for i, opt := range options {
 		fmt.Printf("  %d. %s\n", i+1, opt.Label)
 	}
+	inputMode := choiceInputMode(choiceReq)
+	inputPrompt := "선택 (번호): "
+	if inputMode == choiceInputYesNo {
+		inputPrompt = "선택 (y/n): "
+	}
 
 	for {
-		input, err := getInputWithUIEchoNoHistory("선택 (번호): ", o.cfg.HistoryFile)
+		input, err := getInputWithUIEchoNoHistory(inputPrompt, o.cfg.HistoryFile)
 		if err != nil {
 			if err == io.EOF {
 				activeAgent.SendInput(io.EOF)
@@ -689,16 +694,17 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
 			continue
 		}
+		inputKind := react.ClassifyUserInput(input)
 		snapshot := activeRuntimeSnapshot(activeAgent)
 		decision := decideOrchestratorInput(snapshot.Control, input)
-		if !decision.Accepted {
+		if !choiceInputAccepted(inputMode, inputKind, decision) {
 			fmt.Println(colorBrightMagenta + "❌ 유효하지 않은 선택입니다" + colorReset)
 			continue
 		}
-		if input == "y" || input == "yes" || input == "예" {
+		if inputMode == choiceInputYesNo && (input == "y" || input == "yes" || input == "예") {
 			input = "1"
 		}
-		if input == "n" || input == "no" || input == "아니오" {
+		if inputMode == choiceInputYesNo && (input == "n" || input == "no" || input == "아니오") {
 			input = strconv.Itoa(findChoiceIndex(choiceReq.Options, "no", len(choiceReq.Options)))
 		}
 
@@ -736,6 +742,32 @@ func activeRuntimeSnapshot(agent *react.Loop) react.RuntimeSnapshot {
 
 func decideOrchestratorInput(control react.ControlState, input string) react.InputDispatchDecision {
 	return react.DecideInputDispatch(control, react.ClassifyUserInput(input))
+}
+
+type choiceInputKind string
+
+const (
+	choiceInputNumber choiceInputKind = "number"
+	choiceInputYesNo  choiceInputKind = "yes_no"
+)
+
+func choiceInputMode(choiceReq *api.UserChoiceRequest) choiceInputKind {
+	if choiceReq == nil {
+		return choiceInputNumber
+	}
+	if strings.Contains(strings.ToLower(choiceReq.Prompt), "(y/n)") {
+		return choiceInputYesNo
+	}
+	return choiceInputNumber
+}
+
+func choiceInputAccepted(mode choiceInputKind, inputKind react.UserInputKind, decision react.InputDispatchDecision) bool {
+	switch mode {
+	case choiceInputYesNo:
+		return inputKind == react.InputApproval
+	default:
+		return decision.Accepted && inputKind == react.InputChoiceNumber
+	}
 }
 
 func findChoiceIndex(options []api.UserChoiceOption, value string, fallback int) int {

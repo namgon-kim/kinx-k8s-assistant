@@ -74,7 +74,7 @@ func DecideInputDispatch(control ControlState, kind UserInputKind) InputDispatch
 	decision := InputDispatchDecision{Kind: kind, Handler: InputHandlerNone}
 	switch control {
 	case ControlAwaitingContinuationChoice:
-		if kind == InputChoiceNumber || kind == InputApproval {
+		if kind == InputChoiceNumber {
 			decision.Accepted = true
 			decision.Handler = InputHandlerReactChoice
 			return decision
@@ -375,8 +375,6 @@ func (s RuntimeSnapshot) NestedStateName() string {
 
 func (s RuntimeSnapshot) AuditError() string {
 	switch {
-	case s.PendingMutationVerification != nil && (s.FinalReportRequested || s.GuidedPhaseProgressRequested):
-		return "mutation verification is pending while final_report/phase_progress is also requested"
 	case s.FinalReportRequested && s.GuidedPhaseProgressRequested:
 		return "final_report and guided phase_progress are both requested"
 	case s.LoopState == StateWaitingDirectionText && s.PendingDirectionPrompt != nil:

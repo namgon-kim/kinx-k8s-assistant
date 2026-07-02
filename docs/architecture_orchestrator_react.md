@@ -369,9 +369,9 @@ anchor의 목적:
 
 정책:
 
-- continuation choice는 숫자 선택만 받는다. `/help` 같은 slash meta는 처리하지 않고 invalid choice다.
+- continuation choice는 표시된 입력 방식만 받는다. `선택 (번호)`는 숫자만, `선택 (y/n)`은 `y/n/yes/no/예/아니오`만 허용한다. `/help` 같은 slash meta는 처리하지 않고 invalid choice다.
 - continuation free text는 slash meta를 orchestrator가 처리하고, 일반 텍스트는 ReAct loop로 전달한다.
-- approval prompt는 approval 선택만 받는다.
+- approval prompt도 표시된 입력 방식만 받는다. 현재 기본 승인 UI는 번호 선택지를 출력하므로 번호만 허용한다.
 - 일반 user query prompt는 slash meta와 natural-language query를 모두 받을 수 있다.
 
 ### 7.2 Native function calling과 shim mode
