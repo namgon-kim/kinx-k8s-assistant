@@ -655,15 +655,23 @@ func (l *Loop) phaseStepAnchor() string {
 }
 
 func (l *Loop) requestGuidedDiagnosisPhaseProgress() {
-	if l.guidedPhaseProgressRequested {
+	if !l.requestOnlyGuidedDiagnosisPhaseProgress() {
 		return
 	}
-	l.guidedPhaseProgressRequested = true
 	var b strings.Builder
 	b.WriteString("All nested resource-guide guidance_step entries have been completed for the active guided_diagnosis phase.\n")
 	b.WriteString("Your next response MUST be a `phase_progress` object completing the active guided_diagnosis phase; do not emit another action or final_report yet.\n")
 	b.WriteString("Set next_phase to final_report unless live evidence requires a different allowed next phase from the accepted phase_plan.")
 	l.queueResponseDirective(b.String())
+}
+
+func (l *Loop) requestOnlyGuidedDiagnosisPhaseProgress() bool {
+	if l.guidedPhaseProgressRequested {
+		return false
+	}
+	l.finalReportRequested = false
+	l.guidedPhaseProgressRequested = true
+	return true
 }
 
 func (l *Loop) enterGuidedDiagnosisPhase() bool {

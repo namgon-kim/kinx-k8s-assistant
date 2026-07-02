@@ -617,7 +617,13 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
 			continue
 		}
-		if strings.HasPrefix(input, "/") {
+		snapshot := activeRuntimeSnapshot(activeAgent)
+		decision := decideOrchestratorInput(snapshot.Control, input)
+		if !decision.Accepted {
+			fmt.Println(colorBrightMagenta + "❌ 현재 입력 단계에서 사용할 수 없는 입력입니다" + colorReset)
+			continue
+		}
+		if decision.Handler == react.InputHandlerOrchestratorMeta {
 			if err := o.selectMetaCommand(input); err != nil {
 				if err == io.EOF {
 					if o.agentWrap == activeAgent {
@@ -630,6 +636,10 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 			if o.agentWrap != activeAgent {
 				return nil
 			}
+			continue
+		}
+		if decision.Handler != react.InputHandlerReactText && decision.Handler != react.InputHandlerUserQuery {
+			fmt.Println(colorBrightMagenta + "❌ 현재 입력 단계에서 사용할 수 없는 입력입니다" + colorReset)
 			continue
 		}
 
@@ -649,16 +659,22 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 	PrintMessage(o.formatter.FormatPropose(choiceReq.Prompt))
 	options := append([]api.UserChoiceOption(nil), choiceReq.Options...)
 	incidentChoice := 0
-	if activeAgent.InputOwner() == react.InputOwnerReactChoice && o.incidentGuidance.hasPendingOffer() && choiceOptionsAllowRunbookSearch(choiceReq.Options) {
+	initialSnapshot := activeRuntimeSnapshot(activeAgent)
+	if initialSnapshot.Control == react.ControlAwaitingContinuationChoice && o.incidentGuidance.hasPendingOffer() && choiceOptionsAllowRunbookSearch(choiceReq.Options) {
 		incidentChoice = len(options) + 1
 		options = append(options, api.UserChoiceOption{Value: "incident-runbook", Label: "[runbook 검색] 감지된 문제의 해결 방법 검색"})
 	}
 	for i, opt := range options {
 		fmt.Printf("  %d. %s\n", i+1, opt.Label)
 	}
+	inputMode := choiceInputMode(choiceReq)
+	inputPrompt := "선택 (번호): "
+	if inputMode == choiceInputYesNo {
+		inputPrompt = "선택 (y/n): "
+	}
 
 	for {
-		input, err := getInputWithUIEchoNoHistory("선택 (번호): ", o.cfg.HistoryFile)
+		input, err := getInputWithUIEchoNoHistory(inputPrompt, o.cfg.HistoryFile)
 		if err != nil {
 			if err == io.EOF {
 				activeAgent.SendInput(io.EOF)
@@ -678,10 +694,17 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
 			continue
 		}
-		if input == "y" || input == "yes" || input == "예" {
+		inputKind := react.ClassifyUserInput(input)
+		snapshot := activeRuntimeSnapshot(activeAgent)
+		decision := decideOrchestratorInput(snapshot.Control, input)
+		if !choiceInputAccepted(inputMode, inputKind, decision) {
+			fmt.Println(colorBrightMagenta + "❌ 유효하지 않은 선택입니다" + colorReset)
+			continue
+		}
+		if inputMode == choiceInputYesNo && (input == "y" || input == "yes" || input == "예") {
 			input = "1"
 		}
-		if input == "n" || input == "no" || input == "아니오" {
+		if inputMode == choiceInputYesNo && (input == "n" || input == "no" || input == "아니오") {
 			input = strconv.Itoa(findChoiceIndex(choiceReq.Options, "no", len(choiceReq.Options)))
 		}
 
@@ -704,6 +727,46 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 		}
 
 		fmt.Println(colorBrightMagenta + "❌ 유효하지 않은 선택입니다" + colorReset)
+	}
+}
+
+func activeRuntimeSnapshot(agent *react.Loop) react.RuntimeSnapshot {
+	if agent == nil {
+		return react.RuntimeSnapshot{Control: react.ControlIdle, InputOwner: react.InputOwnerOrchestrator}
+	}
+	if snapshot, ok := agent.PublishedRuntimeSnapshot(); ok {
+		return snapshot
+	}
+	return react.RuntimeSnapshot{Control: react.ControlAwaitingUserQuery, InputOwner: react.InputOwnerOrchestrator}
+}
+
+func decideOrchestratorInput(control react.ControlState, input string) react.InputDispatchDecision {
+	return react.DecideInputDispatch(control, react.ClassifyUserInput(input))
+}
+
+type choiceInputKind string
+
+const (
+	choiceInputNumber choiceInputKind = "number"
+	choiceInputYesNo  choiceInputKind = "yes_no"
+)
+
+func choiceInputMode(choiceReq *api.UserChoiceRequest) choiceInputKind {
+	if choiceReq == nil {
+		return choiceInputNumber
+	}
+	if strings.Contains(strings.ToLower(choiceReq.Prompt), "(y/n)") {
+		return choiceInputYesNo
+	}
+	return choiceInputNumber
+}
+
+func choiceInputAccepted(mode choiceInputKind, inputKind react.UserInputKind, decision react.InputDispatchDecision) bool {
+	switch mode {
+	case choiceInputYesNo:
+		return inputKind == react.InputApproval
+	default:
+		return decision.Accepted && inputKind == react.InputChoiceNumber
 	}
 }
 

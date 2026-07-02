@@ -26,12 +26,121 @@ const (
 	ControlExited                               ControlState = "exited"
 )
 
+type UserInputKind string
+
+const (
+	InputChoiceNumber UserInputKind = "choice_number"
+	InputApproval     UserInputKind = "approval"
+	InputSlashMeta    UserInputKind = "slash_meta"
+	InputFreeText     UserInputKind = "free_text"
+	InputEmpty        UserInputKind = "empty"
+)
+
+type InputHandlerKind string
+
+const (
+	InputHandlerNone             InputHandlerKind = "none"
+	InputHandlerOrchestratorMeta InputHandlerKind = "orchestrator_meta"
+	InputHandlerReactChoice      InputHandlerKind = "react_choice"
+	InputHandlerReactText        InputHandlerKind = "react_text"
+	InputHandlerReactApproval    InputHandlerKind = "react_approval"
+	InputHandlerUserQuery        InputHandlerKind = "user_query"
+)
+
+type InputDispatchDecision struct {
+	Kind     UserInputKind
+	Accepted bool
+	Handler  InputHandlerKind
+	Reason   string
+}
+
+func ClassifyUserInput(input string) UserInputKind {
+	trimmed := strings.TrimSpace(input)
+	switch {
+	case trimmed == "":
+		return InputEmpty
+	case strings.HasPrefix(trimmed, "/"):
+		return InputSlashMeta
+	case isChoiceNumber(trimmed):
+		return InputChoiceNumber
+	case isApprovalToken(trimmed):
+		return InputApproval
+	default:
+		return InputFreeText
+	}
+}
+
+func DecideInputDispatch(control ControlState, kind UserInputKind) InputDispatchDecision {
+	decision := InputDispatchDecision{Kind: kind, Handler: InputHandlerNone}
+	switch control {
+	case ControlAwaitingContinuationChoice:
+		if kind == InputChoiceNumber {
+			decision.Accepted = true
+			decision.Handler = InputHandlerReactChoice
+			return decision
+		}
+		decision.Reason = "choice prompt accepts a number only"
+		return decision
+	case ControlAwaitingApproval:
+		if kind == InputChoiceNumber || kind == InputApproval {
+			decision.Accepted = true
+			decision.Handler = InputHandlerReactApproval
+			return decision
+		}
+		decision.Reason = "approval prompt accepts approval choices only"
+		return decision
+	case ControlAwaitingContinuationText:
+		if kind == InputSlashMeta {
+			decision.Accepted = true
+			decision.Handler = InputHandlerOrchestratorMeta
+			return decision
+		}
+		if kind == InputFreeText || kind == InputChoiceNumber || kind == InputApproval || kind == InputEmpty {
+			decision.Accepted = true
+			decision.Handler = InputHandlerReactText
+			return decision
+		}
+	case ControlAwaitingUserQuery:
+		if kind == InputSlashMeta {
+			decision.Accepted = true
+			decision.Handler = InputHandlerOrchestratorMeta
+			return decision
+		}
+		if kind == InputFreeText || kind == InputChoiceNumber || kind == InputApproval || kind == InputEmpty {
+			decision.Accepted = true
+			decision.Handler = InputHandlerUserQuery
+			return decision
+		}
+	}
+	decision.Reason = "current state does not accept user input of this type"
+	return decision
+}
+
+func isChoiceNumber(input string) bool {
+	for _, r := range input {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return input != ""
+}
+
+func isApprovalToken(input string) bool {
+	switch strings.ToLower(strings.TrimSpace(input)) {
+	case "y", "yes", "n", "no", "예", "아니오":
+		return true
+	default:
+		return false
+	}
+}
+
 // RuntimeSnapshot is a shallow, same-goroutine projection of Loop control
 // state. It centralizes state interpretation for prompts and diagnostics; it
 // is not an immutable deep copy for cross-goroutine use.
 type RuntimeSnapshot struct {
-	LoopState State
-	Control   ControlState
+	LoopState  State
+	Control    ControlState
+	InputOwner InputOwner
 
 	OriginalQuery string
 
@@ -53,6 +162,7 @@ type RuntimeSnapshot struct {
 	GuidedPhaseProgressRequested   bool
 	FinalReportRequested           bool
 	RequiresResourceGuideLookupNow bool
+	ToolDispatchInProgress         bool
 }
 
 func (l *Loop) RuntimeSnapshot() RuntimeSnapshot {
@@ -78,8 +188,28 @@ func (l *Loop) RuntimeSnapshot() RuntimeSnapshot {
 		GuidedPhaseProgressRequested:   l.guidedPhaseProgressRequested,
 		FinalReportRequested:           l.finalReportRequested,
 		RequiresResourceGuideLookupNow: l.phaseStepRequiresResourceGuideLookup(),
+		ToolDispatchInProgress:         l.toolDispatchInProgress,
 	}
 	snapshot.Control = snapshot.deriveControl()
+	snapshot.InputOwner = snapshot.DerivedInputOwner()
+	return snapshot
+}
+
+func (l *Loop) PublishedRuntimeSnapshot() (RuntimeSnapshot, bool) {
+	if l == nil {
+		return RuntimeSnapshot{Control: ControlIdle, InputOwner: InputOwnerOrchestrator}, false
+	}
+	raw := l.runtimeSnapshot.Load()
+	if raw == nil {
+		return RuntimeSnapshot{}, false
+	}
+	snapshot, ok := raw.(RuntimeSnapshot)
+	return snapshot, ok
+}
+
+func (l *Loop) publishRuntimeSnapshot() RuntimeSnapshot {
+	snapshot := l.RuntimeSnapshot()
+	l.runtimeSnapshot.Store(snapshot)
 	return snapshot
 }
 
@@ -87,6 +217,8 @@ func (s RuntimeSnapshot) deriveControl() ControlState {
 	switch {
 	case s.LoopState == StateExited:
 		return ControlExited
+	case s.ToolDispatchInProgress:
+		return ControlExecutingTool
 	case s.LoopState == StateWaitingApproval:
 		return ControlAwaitingApproval
 	case s.LoopState == StateWaitingDirectionChoice:
@@ -239,4 +371,19 @@ func (s RuntimeSnapshot) NestedStateName() string {
 		return "resource_guide_steps_complete"
 	}
 	return "none"
+}
+
+func (s RuntimeSnapshot) AuditError() string {
+	switch {
+	case s.FinalReportRequested && s.GuidedPhaseProgressRequested:
+		return "final_report and guided phase_progress are both requested"
+	case s.LoopState == StateWaitingDirectionText && s.PendingDirectionPrompt != nil:
+		return "direction free-text state still has a pending choice prompt"
+	case s.LoopState == StateWaitingDirectionChoice && s.PendingDirectionPrompt == nil:
+		return "direction choice state has no pending direction prompt"
+	case s.LoopState == StateWaitingApproval && len(s.PendingCalls) == 0:
+		return "approval state has no pending calls"
+	default:
+		return ""
+	}
 }

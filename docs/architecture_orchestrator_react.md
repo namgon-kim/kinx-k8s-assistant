@@ -324,17 +324,55 @@ flowchart TD
 
 실제 prepend 순서:
 
-1. `guideStepAnchor()`
-2. `phaseStepAnchor()`
-3. `requirementAnalysisAnchor()`
+1. `mutationVerificationAnchor()`
+2. `guideStepAnchor()`
+3. `phaseStepAnchor()`
+4. `requirementAnalysisAnchor()`
+5. `runtimeStateAnchor()`
 
-최종 slice에서는 마지막에 prepend된 `requirement_analysis` anchor가 가장 앞에 온다. 즉 model은 original request와 accepted analysis, active phase, active guide step, 최신 observation 순으로 문맥을 받는다.
+최종 slice에서는 마지막에 prepend된 `runtime_state` anchor가 가장 앞에 온다. 즉 model은 현재 control state와 required next output을 먼저 보고, 그 다음 original request와 accepted analysis, active phase, active guide step, mutation verification obligation, 최신 observation 순으로 문맥을 받는다.
 
 anchor의 목적:
 
+- `runtimeStateAnchor`: `RuntimeSnapshot`에서 계산한 `control_state`, `active_gate`, `required_next_output`, `forbidden_next_outputs`를 보여준다.
 - `requirementAnalysisAnchor`: follow-up이나 긴 진단에서 원래 target/scope가 drift하지 않게 한다.
 - `phaseStepAnchor`: model-declared top-level phase plan을 계속 따르게 한다.
 - `guideStepAnchor`: guide가 주입된 뒤 nested diagnostic step 진행률과 다음 step을 유지한다.
+- `mutationVerificationAnchor`: mutation 이후 남은 verification evidence 또는 `mutation_verification_result` 요구를 유지한다.
+
+### 7.1.1 RuntimeSnapshot and input dispatch
+
+`RuntimeSnapshot`은 `Loop`의 여러 flag 조합을 하나의 `ControlState` projection으로 해석한다. 이 snapshot은 LLM anchor, input dispatch, diagnostic/audit에 사용하는 runtime-visible state다.
+
+주요 control state:
+
+- `awaiting_requirement_analysis`
+- `awaiting_phase_plan`
+- `awaiting_model_step`
+- `awaiting_resource_guide_lookup`
+- `awaiting_guided_diagnosis_step`
+- `awaiting_guided_phase_progress`
+- `awaiting_final_report`
+- `awaiting_next_directions`
+- `awaiting_mutation_verification_evidence`
+- `awaiting_mutation_verification_result`
+- `awaiting_mutation_continuation`
+- `awaiting_continuation_choice`
+- `awaiting_continuation_text`
+
+입력 처리는 단일 `InputOwner`만 보지 않고 다음 순서로 판단한다.
+
+1. raw input을 `choice_number`, `approval`, `slash_meta`, `free_text`, `empty`로 분류한다.
+2. 현재 `ControlState`와 input kind를 `DecideInputDispatch`로 비교한다.
+3. 허용되면 `orchestrator_meta`, `react_choice`, `react_text`, `react_approval`, `user_query` handler 중 하나로 보낸다.
+4. 허용되지 않으면 loop에 빈 응답을 보내지 않고 현재 prompt를 유지한다.
+
+정책:
+
+- continuation choice는 표시된 입력 방식만 받는다. `선택 (번호)`는 숫자만, `선택 (y/n)`은 `y/n/yes/no/예/아니오`만 허용한다. `/help` 같은 slash meta는 처리하지 않고 invalid choice다.
+- continuation free text는 slash meta를 orchestrator가 처리하고, 일반 텍스트는 ReAct loop로 전달한다.
+- approval prompt도 표시된 입력 방식만 받는다. 현재 기본 승인 UI는 번호 선택지를 출력하므로 번호만 허용한다.
+- 일반 user query prompt는 slash meta와 natural-language query를 모두 받을 수 있다.
 
 ### 7.2 Native function calling과 shim mode
 

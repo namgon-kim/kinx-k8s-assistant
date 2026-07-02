@@ -44,10 +44,9 @@ func (l *Loop) requestPostGuideCompletionDirective() {
 // The instruction is appended to currChatContent so it goes out in the next
 // LLM call alongside the latest observation.
 func (l *Loop) requestFinalReportFromModel() {
-	if l.finalReportRequested {
+	if !l.requestOnlyFinalReport() {
 		return
 	}
-	l.finalReportRequested = true
 	var b strings.Builder
 	b.WriteString("All resource-guide diagnostic_steps have been completed (see guide_step anchor).\n")
 	b.WriteString("Your next response MUST be a `final_report` object — do not emit another `action`.\n")
@@ -63,6 +62,15 @@ func (l *Loop) requestFinalReportFromModel() {
 	b.WriteString("- blockers: hard constraints that prevented full diagnosis (optional). Examples: \"workload kubeconfig not available in this session\".\n")
 	b.WriteString("Do not emit `action`, `resource_guide_lookup`, or `next_directions` in this response.")
 	l.queueResponseDirective(b.String())
+}
+
+func (l *Loop) requestOnlyFinalReport() bool {
+	if l.finalReportRequested {
+		return false
+	}
+	l.guidedPhaseProgressRequested = false
+	l.finalReportRequested = true
+	return true
 }
 
 // consumeFinalReport intercepts the model's final_report output. If the
@@ -304,6 +312,9 @@ func (l *Loop) requestNextDirectionsFromModel(report finalReport) {
 func (l *Loop) queueResponseDirective(directive string) {
 	directive = strings.TrimSpace(directive)
 	if directive == "" {
+		return
+	}
+	if directive == strings.TrimSpace(l.pendingResponseDirective) {
 		return
 	}
 	l.pendingResponseDirective = directive
