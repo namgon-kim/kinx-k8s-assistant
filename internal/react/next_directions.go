@@ -16,7 +16,7 @@ import (
 // inconclusive final_report. The proposed options are rendered as a
 // UserChoiceRequest with extra "직접 입력" and "여기서 종료" choices, and the
 // loop transitions to StateWaitingDirectionChoice until the user picks.
-func (l *Loop) consumeNextDirections(ctx context.Context, calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
+func (l *Loop) consumeNextDirections(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
 	var remaining []gollm.FunctionCall
 	for _, call := range calls {
 		if call.Name != internalNextDirectionsCall {
@@ -25,16 +25,23 @@ func (l *Loop) consumeNextDirections(ctx context.Context, calls []gollm.Function
 		}
 		nd, ok := nextDirectionsFromFunctionCall(call)
 		if !ok {
-			if !l.appendCorrectionWithCompaction("invalid_next_directions", "next_directions payload was invalid. Re-emit a next_directions object with 1-3 options; each option needs `kind` (another_guide|different_approach) and `summary`.") {
+			message := "next_directions payload was invalid. Re-emit a next_directions object with 1-3 options; each option needs `kind` (another_guide|different_approach) and `summary`."
+			l.applyGateOutcomeWithRepeatedCorrection(GateOutcome{
+				Kind:            GateOutcomeModelOutputCorrection,
+				Code:            "invalid_next_directions",
+				Retryable:       true,
+				RetryScope:      RetryScopeCurrentPhase,
+				UserMessage:     "next_directions 형식 오류가 반복되어 기본 선택지를 표시합니다.",
+				ModelCorrection: message,
+				CorrectionMode:  CorrectionModeAppendCompacted,
+				BranchPolicy:    BranchStayCurrent,
+			}, func(message string) bool {
 				klog.Warning("next_directions remained invalid after correction; falling back to runtime continuation choices")
 				nd = l.fallbackNextDirections()
 				l.pendingNextDirections = &nd
 				l.promptDirectionChoice(nd)
-				return nil, true
-			}
-			l.pendingCalls = nil
-			l.currIteration++
-			l.state = StateRunning
+				return true
+			})
 			return nil, true
 		}
 		l.pendingNextDirections = &nd
@@ -171,6 +178,7 @@ func (l *Loop) waitForDirectionChoice(ctx context.Context) bool {
 		return false
 	case raw := <-l.input:
 		if raw == io.EOF {
+			l.applyRuntimeCleanup(cleanupExitPolicy())
 			l.state = StateExited
 			return false
 		}
@@ -187,7 +195,7 @@ func (l *Loop) waitForDirectionChoice(ctx context.Context) bool {
 		// 1-based: first len(state.Options) are LLM options, then free-input, then finalize.
 		if choice >= 1 && choice <= len(state.Options) {
 			opt := state.Options[choice-1]
-			l.applyDirectionOption(ctx, opt)
+			l.applyDirectionOption(opt)
 			return true
 		}
 		if state.HasFreeInput && choice == state.FreeInputIdx {
@@ -198,8 +206,7 @@ func (l *Loop) waitForDirectionChoice(ctx context.Context) bool {
 			return true
 		}
 		if choice == state.FinalizeIdx {
-			l.pendingDirectionPrompt = nil
-			l.pendingNextDirections = nil
+			l.applyRuntimeCleanup(cleanupDirectionPromptPolicy())
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "진단을 여기서 종료합니다.")
 			l.state = StateDone
 			return true
@@ -218,6 +225,7 @@ func (l *Loop) waitForDirectionText(ctx context.Context) bool {
 		return false
 	case raw := <-l.input:
 		if raw == io.EOF {
+			l.applyRuntimeCleanup(cleanupExitPolicy())
 			l.state = StateExited
 			return false
 		}
@@ -227,11 +235,12 @@ func (l *Loop) waitForDirectionText(ctx context.Context) bool {
 		}
 		text := strings.TrimSpace(resp.Query)
 		if text == "" {
+			l.applyRuntimeCleanup(cleanupDirectionPromptPolicy())
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "입력이 비어 있어 진단을 종료합니다.")
 			l.state = StateDone
 			return true
 		}
-		l.applyDirectionOption(ctx, nextDirectionOption{
+		l.applyDirectionOption(nextDirectionOption{
 			Kind:        "different_approach",
 			Summary:     "사용자가 직접 지정한 방향",
 			Instruction: text,
@@ -242,14 +251,9 @@ func (l *Loop) waitForDirectionText(ctx context.Context) bool {
 
 // applyDirectionOption translates a chosen direction into runtime state and
 // resumes the ReAct loop.
-func (l *Loop) applyDirectionOption(ctx context.Context, opt nextDirectionOption) {
+func (l *Loop) applyDirectionOption(opt nextDirectionOption) {
 	continuingAfterFinalReport := l.pendingFinalReport != nil
-	l.pendingDirectionPrompt = nil
-	l.pendingNextDirections = nil
-	l.pendingFinalReport = nil
-	l.finalReportRequested = false
-	l.guidedPhaseProgressRequested = false
-	l.pendingResponseDirective = ""
+	l.applyRuntimeCleanup(cleanupDirectionPromptPolicy())
 
 	switch opt.Kind {
 	case "another_guide":

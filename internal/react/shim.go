@@ -122,11 +122,21 @@ type phasePlan struct {
 }
 
 type phaseStep struct {
-	Index               int      `json:"index"`
-	Name                string   `json:"name"`
-	Goal                string   `json:"goal"`
-	CompletionCondition string   `json:"completion_condition"`
-	AllowedNext         []string `json:"allowed_next,omitempty"`
+	Index               int                  `json:"index"`
+	Name                string               `json:"name"`
+	Goal                string               `json:"goal"`
+	CompletionCondition string               `json:"completion_condition"`
+	AllowedNext         []string             `json:"allowed_next,omitempty"`
+	Steps               []phaseExecutionStep `json:"steps,omitempty"`
+}
+
+type phaseExecutionStep struct {
+	ID              string `json:"id,omitempty"`
+	Index           int    `json:"index,omitempty"`
+	Kind            string `json:"kind,omitempty"`
+	Description     string `json:"description,omitempty"`
+	Command         string `json:"command,omitempty"`
+	ExpectedOutcome string `json:"expected_outcome,omitempty"`
 }
 
 type phaseProgress struct {
@@ -487,6 +497,9 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	} else if c.candidate.InvalidAction {
 		parts = append(parts, &shimPart{invalidAction: true})
 	}
+	if c.candidate.GuideProgress != nil && (c.candidate.Action == nil || c.candidate.Action.GuideProgress == nil) {
+		parts = append(parts, &shimPart{guideProgress: c.candidate.GuideProgress})
+	}
 	if c.candidate.ResourceGuideLookup != nil {
 		parts = append(parts, &shimPart{resourceGuideLookup: c.candidate.ResourceGuideLookup})
 	} else if c.candidate.InvalidResourceGuideLookup {
@@ -511,6 +524,20 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	return parts
 }
 
+func functionCallsFromParsedReActResponse(parsed *reActResponse) []gollm.FunctionCall {
+	if parsed == nil {
+		return nil
+	}
+	candidate := &shimCandidate{candidate: parsed}
+	var calls []gollm.FunctionCall
+	for _, part := range candidate.Parts() {
+		if partCalls, ok := part.AsFunctionCalls(); ok {
+			calls = append(calls, partCalls...)
+		}
+	}
+	return calls
+}
+
 func (c *shimCandidate) hasStructuredOutput() bool {
 	return c.candidate.hasStructuredOutput()
 }
@@ -523,6 +550,7 @@ func (c *reActResponse) hasStructuredOutput() bool {
 		c.InvalidPhaseProgress ||
 		c.Action != nil ||
 		c.InvalidAction ||
+		c.GuideProgress != nil ||
 		c.ResourceGuideLookup != nil ||
 		c.InvalidResourceGuideLookup ||
 		c.FinalReport != nil ||
@@ -541,6 +569,7 @@ type shimPart struct {
 	invalidPhaseProgress       bool
 	action                     *action
 	invalidAction              bool
+	guideProgress              *guideProgress
 	resourceGuideLookup        *resourceGuideLookup
 	invalidResourceGuideLookup bool
 	finalReport                *finalReport
@@ -600,6 +629,16 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 		return []gollm.FunctionCall{{
 			Name:      internalPhaseProgressCall,
 			Arguments: map[string]any{},
+		}}, true
+	}
+	if p.guideProgress != nil {
+		args, err := toMap(p.guideProgress)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      internalGuideProgressCall,
+			Arguments: args,
 		}}, true
 	}
 	if p.resourceGuideLookup != nil {

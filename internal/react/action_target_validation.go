@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
-	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 )
 
 func (l *Loop) rejectInconsistentActionTargets(calls []gollm.FunctionCall) bool {
@@ -17,17 +16,7 @@ func (l *Loop) rejectInconsistentActionTargets(calls []gollm.FunctionCall) bool 
 		if !invalid {
 			continue
 		}
-		if !l.appendCorrectionWithCompaction("inconsistent_action_target", message) {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 action target 불일치로 루프를 중단했습니다:\n"+message)
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.state = StateDone
-			return true
-		}
-		l.pendingCalls = nil
-		l.currIteration++
-		l.state = StateRunning
-		return true
+		return l.applyAgentCommandRetryGate("inconsistent_action_target", "반복된 action target 불일치로 루프를 중단했습니다.", message)
 	}
 	return false
 }
@@ -86,17 +75,7 @@ func (l *Loop) rejectInvalidKubectlResources(calls []gollm.FunctionCall) bool {
 			continue
 		}
 		message := fmt.Sprintf("Command %q uses \"unknown\" as a Kubernetes resource kind. `resource_class=unknown` is only a classification hint; never put `unknown` in primary_target.resource, action.target.resource, or a kubectl resource position. Return one corrected response with a concrete resource kind from the user request or observed evidence, or answer asking for clarification if no concrete resource kind is identifiable.", command)
-		if !l.appendCorrectionWithCompaction("invalid_kubectl_resource", message) {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 잘못된 kubectl 리소스로 루프를 중단했습니다:\n"+message)
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.state = StateDone
-			return true
-		}
-		l.pendingCalls = nil
-		l.currIteration++
-		l.state = StateRunning
-		return true
+		return l.applyAgentCommandRetryGate("invalid_kubectl_resource", "반복된 잘못된 kubectl 리소스로 루프를 중단했습니다.", message)
 	}
 	return false
 }
@@ -119,19 +98,22 @@ func (l *Loop) rejectUnrelatedFirstDiagnostic(calls []gollm.FunctionCall) bool {
 			continue
 		}
 		message := fmt.Sprintf("First diagnostic for explicit target %q %q must query that target or use a selector for that target before broadening. Command %q is unrelated. Start with the declared target and namespace scope.", target.Resource, target.Name, command)
-		if !l.appendCorrectionWithCompaction("unrelated_first_diagnostic", message) {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 최초 진단 대상 불일치로 루프를 중단했습니다:\n"+message)
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.state = StateDone
-			return true
-		}
-		l.pendingCalls = nil
-		l.currIteration++
-		l.state = StateRunning
-		return true
+		return l.applyAgentCommandRetryGate("unrelated_first_diagnostic", "반복된 최초 진단 대상 불일치로 루프를 중단했습니다.", message)
 	}
 	return false
+}
+
+func (l *Loop) applyAgentCommandRetryGate(code, userMessage, correction string) bool {
+	return l.applyGateOutcome(GateOutcome{
+		Kind:            GateOutcomeAgentCommandRetry,
+		Code:            code,
+		Retryable:       true,
+		RetryScope:      RetryScopeAgentCommand,
+		UserMessage:     userMessage,
+		ModelCorrection: correction,
+		CorrectionMode:  CorrectionModeAppendCompacted,
+		BranchPolicy:    BranchRetryStep,
+	})
 }
 
 func inconsistentActionTargetMessage(call gollm.FunctionCall) (string, bool) {
