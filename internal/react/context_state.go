@@ -26,6 +26,7 @@ type guideRef struct {
 type actionRecord struct {
 	Step       int            `json:"step"`
 	Tool       string         `json:"tool"`
+	Phase      *PhaseRef      `json:"phase,omitempty"`
 	Command    string         `json:"command,omitempty"`
 	Target     *actionTarget  `json:"target,omitempty"`
 	ResultHash string         `json:"result_hash"`

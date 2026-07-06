@@ -45,6 +45,60 @@ suffix`)
 	}
 }
 
+func TestFunctionCallsFromParsedReActResponseCoversNativeTextFallbackStructuredCalls(t *testing.T) {
+	parsed, err := parseReActResponse("```json\n" + `{
+  "thought": "recover structured output",
+  "guide_progress": {
+    "step_completed": 2,
+    "evidence_useful": true
+  },
+  "resource_guide_lookup": {
+    "resource_family": "widgets.example.com",
+    "problem_focus": "reconcile failure",
+    "reason": "CRD-specific issue",
+    "evidence": "controller reports reconcile error"
+  },
+  "final_report": {
+    "conclusive": false,
+    "attempted": ["checked pods"],
+    "evidence_known": ["pod pending"],
+    "evidence_missing": ["controller logs"],
+    "most_likely_cause": "inconclusive"
+  },
+  "next_directions": {
+    "options": [{
+      "kind": "different_approach",
+      "summary": "check controller logs",
+      "instruction": "Inspect controller logs"
+    }]
+  },
+  "mutation_verification_result": {
+    "status": "progressing",
+    "evidence_summary": ["rollout started"],
+    "next_action": "recheck rollout"
+  }
+}` + "\n```")
+	if err != nil {
+		t.Fatalf("parse ReAct response: %v", err)
+	}
+	calls := functionCallsFromParsedReActResponse(parsed)
+	names := map[string]bool{}
+	for _, call := range calls {
+		names[call.Name] = true
+	}
+	for _, name := range []string{
+		internalGuideProgressCall,
+		internalResourceGuideLookupCall,
+		internalFinalReportCall,
+		internalNextDirectionsCall,
+		internalMutationVerificationResultCall,
+	} {
+		if !names[name] {
+			t.Fatalf("expected recovered function call %s in %#v", name, calls)
+		}
+	}
+}
+
 func TestParseReActResponseRepairsUnescapedQuotesInAnswer(t *testing.T) {
 	parsed, err := parseReActResponse("```json\n" + `{
   "thought": "describe 확인",

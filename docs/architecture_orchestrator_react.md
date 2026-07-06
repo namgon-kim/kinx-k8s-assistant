@@ -421,6 +421,7 @@ shim parser는 `requirement_analysis`, `phase_plan`, `phase_progress`, `resource
 - `allowed_next`에 들어간 이름은 같은 plan의 `phase_steps[].name`으로 선언되어야 한다.
 - `allowed_next`는 forward-only edge여야 한다. 같은 index 또는 이전 index의 phase로 되돌아가는 back-edge/cycle은 validation에서 거부된다.
 - 뒤에 더 큰 index의 step이 있는 non-terminal step은 적어도 하나의 `allowed_next`가 필요하다.
+- 각 `phase_steps[]`는 optional `steps[]`를 가질 수 있다. 이 필드는 phase 내부의 선언형 execution/evidence step을 runtime snapshot과 anchor에 보존하기 위한 것이며, 없으면 기존 implicit phase mode로 동작한다. 현재 explicit phase step은 직접 `MarkStepCompleted`/`RetryStep`/`SkipStep` 대상이 아니고, phase 완료는 여전히 tool observation과 `phase_progress`로 판정한다.
 
 schema/graph validation 이후에는 `validatePhasePlanForRequest`가 request-aware runtime contract를 검증한다.
 
@@ -501,10 +502,13 @@ read-only enforcement는 prompt instruction만이 아니라 runtime policy다.
 
 `modifiesResource` 판정 순서:
 
+0. `echo`, `printf`, `sleep`, `read`처럼 클러스터 상태를 관찰하지 않는 shell action은 tool 실행/read-only 판정 전에 correction으로 재시도시킨다. planning이 완료됐으면 `phase_progress`, 추가 증거가 필요하면 실제 read-only `kubectl` action을 요구한다.
 1. observation tool name이면 `no`.
 2. kubectl invocation에 read-only fast path에서 금지된 shell evaluation syntax 또는 허용되지 않은 read-only subcommand가 있으면 `unknown`.
 3. kubectl invocation이 read-only pipeline이면 `no`.
 4. 그 외에는 kubectl-ai tool의 `CheckModifiesResource` 결과를 사용한다.
+
+`unknown`은 mutating command와 다르게 취급한다. read-only mode에서 명확한 mutation은 사용자의 변경 요청이 read-only 정책에 막힌 것이므로 반복하지 않는다. 반면 안전한 diagnostic인지 확인하지 못한 `unknown` command는 agent가 잘못된 command를 고른 것이므로 `retryable=true`, `retry_scope=agent_correct_command` observation을 남기고, final report를 강제하지 않고 더 구체적인 read-only `kubectl` command 또는 `phase_progress`로 재시도시킨다.
 
 read-only kubectl pipeline으로 인정되려면:
 
@@ -773,7 +777,7 @@ guidance는 MCP server가 아니다. resource guide와 incident guide는 `intern
 관련 테스트 예:
 
 ```bash
-GOCACHE=/Users/ngkim/workspaces/kinx-k8s-assistant/.cache/go-build go test ./internal/react ./internal/orchestrator ./internal/config -count=1
+go test ./internal/react ./internal/orchestrator ./internal/config -count=1
 ```
 
 문서만 변경한 이번 작업의 verification은 다음으로 충분하다.
