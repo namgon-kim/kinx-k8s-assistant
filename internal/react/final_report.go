@@ -21,7 +21,7 @@ func (l *Loop) markGuideStepCompleted(stepIndex int) bool {
 	if state.Completed == nil {
 		state.Completed = map[int]bool{}
 	}
-	if state.Completed[stepIndex] {
+	if state.Completed[stepIndex] || state.Skipped[stepIndex] {
 		return false
 	}
 	state.Completed[stepIndex] = true
@@ -86,17 +86,7 @@ func (l *Loop) consumeFinalReport(ctx context.Context, calls []gollm.FunctionCal
 		}
 		report, ok := finalReportFromFunctionCall(call)
 		if !ok {
-			if !l.appendCorrection("invalid_final_report", "final_report payload was invalid. Re-emit a final_report with required fields. Conclusive reports require attempted, evidence_known, most_likely_cause, and conclusion. Inconclusive reports require attempted, most_likely_cause, and at least one of evidence_known, evidence_missing, or blockers.") {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "final_report 형식 오류가 반복되어 진단을 중단합니다.")
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return nil, true
-			}
-			l.pendingCalls = nil
-			l.currIteration++
-			l.state = StateRunning
-			return nil, true
+			return nil, l.applyPlainModelOutputCorrectionGate("invalid_final_report", "final_report 형식 오류가 반복되어 진단을 중단합니다.", "final_report payload was invalid. Re-emit a final_report with required fields. Conclusive reports require attempted, evidence_known, most_likely_cause, and conclusion. Inconclusive reports require attempted, most_likely_cause, and at least one of evidence_known, evidence_missing, or blockers.")
 		}
 		l.pendingFinalReport = &report
 		l.emitFinalReportMessage(ctx, report)

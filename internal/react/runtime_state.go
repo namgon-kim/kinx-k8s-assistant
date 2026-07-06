@@ -26,6 +26,70 @@ const (
 	ControlExited                               ControlState = "exited"
 )
 
+type PhaseRef struct {
+	Index int
+	Name  string
+}
+
+type PhaseStatus string
+
+const (
+	PhasePending   PhaseStatus = "pending"
+	PhaseActive    PhaseStatus = "active"
+	PhaseCompleted PhaseStatus = "completed"
+	PhaseSkipped   PhaseStatus = "skipped"
+)
+
+type PhaseRuntimeState struct {
+	RequestGoal string
+	Active      PhaseRef
+	Phases      []PhaseSpec
+	Completed   map[int]bool
+}
+
+type PhaseSpec struct {
+	Ref                 PhaseRef
+	Goal                string
+	CompletionCondition string
+	AllowedNext         []string
+	Status              PhaseStatus
+	Steps               []StepRuntimeState
+}
+
+type StepKind string
+
+const (
+	StepGeneralAction               StepKind = "general_action"
+	StepExplicitPhase               StepKind = "explicit_phase_step"
+	StepResourceGuideDiagnostic     StepKind = "resource_guide_diagnostic"
+	StepMutationEvidenceRequirement StepKind = "mutation_evidence_requirement"
+)
+
+type StepStatus string
+
+const (
+	StepPending   StepStatus = "pending"
+	StepActive    StepStatus = "active"
+	StepCompleted StepStatus = "completed"
+	StepSkipped   StepStatus = "skipped"
+	StepRetrying  StepStatus = "retrying"
+)
+
+type StepRef struct {
+	Phase PhaseRef
+	Kind  StepKind
+	ID    string
+	Index int
+}
+
+type StepRuntimeState struct {
+	Ref             StepRef
+	Status          StepStatus
+	Description     string
+	Command         string
+	ExpectedOutcome string
+}
+
 type UserInputKind string
 
 const (
@@ -148,12 +212,15 @@ type RuntimeSnapshot struct {
 	Request                *requestContext
 	ResourceClassification *resourceClassification
 
-	Phase *phaseStepState
-	Guide *guideStepState
+	Phase        *phaseStepState
+	Guide        *guideStepState
+	PhaseRuntime *PhaseRuntimeState
+	ActiveSteps  []StepRuntimeState
 
 	PendingCalls                   []PendingCall
 	PendingMutationVerification    *pendingMutationVerification
 	MutationContinuationRequired   bool
+	MutationContinuationAttempts   int
 	PendingFinalReport             *finalReport
 	PendingNextDirections          *nextDirections
 	PendingDirectionPrompt         *directionPromptState
@@ -177,9 +244,11 @@ func (l *Loop) RuntimeSnapshot() RuntimeSnapshot {
 		ResourceClassification:         l.resourceClassification,
 		Phase:                          l.phaseStepState,
 		Guide:                          l.guideStepState,
+		PhaseRuntime:                   l.phaseStepState.runtimeState(),
 		PendingCalls:                   append([]PendingCall(nil), l.pendingCalls...),
 		PendingMutationVerification:    l.pendingMutationVerification,
 		MutationContinuationRequired:   l.mutationContinuationRequired,
+		MutationContinuationAttempts:   l.mutationContinuationAttempts,
 		PendingFinalReport:             l.pendingFinalReport,
 		PendingNextDirections:          l.pendingNextDirections,
 		PendingDirectionPrompt:         l.pendingDirectionPrompt,
@@ -190,9 +259,74 @@ func (l *Loop) RuntimeSnapshot() RuntimeSnapshot {
 		RequiresResourceGuideLookupNow: l.phaseStepRequiresResourceGuideLookup(),
 		ToolDispatchInProgress:         l.toolDispatchInProgress,
 	}
+	snapshot.ActiveSteps = l.activeStepRuntimeStates(snapshot.PhaseRuntime)
 	snapshot.Control = snapshot.deriveControl()
 	snapshot.InputOwner = snapshot.DerivedInputOwner()
 	return snapshot
+}
+
+func (l *Loop) activeStepRuntimeStates(phase *PhaseRuntimeState) []StepRuntimeState {
+	if l == nil {
+		return nil
+	}
+	activePhase := PhaseRef{}
+	if phase != nil {
+		activePhase = phase.Active
+	}
+	var steps []StepRuntimeState
+	for _, action := range l.completedActions {
+		if action.Phase == nil || (action.Phase.Index == 0 && strings.TrimSpace(action.Phase.Name) == "") {
+			continue
+		}
+		steps = append(steps, action.stepRuntimeState())
+	}
+	if l.guideStepState != nil {
+		steps = append(steps, l.guideStepState.stepRuntimeStates(activePhase)...)
+	}
+	if l.pendingMutationVerification != nil {
+		steps = append(steps, l.pendingMutationVerification.stepRuntimeStates(activePhase)...)
+	}
+	for i, call := range l.pendingCalls {
+		if strings.HasPrefix(strings.TrimSpace(call.FunctionCall.Name), "__") {
+			continue
+		}
+		steps = append(steps, pendingCallStepRuntimeState(activePhase, i+1, call))
+	}
+	return steps
+}
+
+func pendingCallStepRuntimeState(phase PhaseRef, index int, call PendingCall) StepRuntimeState {
+	command, _ := commandString(call.FunctionCall.Arguments["command"])
+	if command == "" {
+		command = strings.TrimSpace(stringFromAny(call.FunctionCall.Arguments["command"]))
+	}
+	return StepRuntimeState{
+		Ref: StepRef{
+			Phase: phase,
+			Kind:  StepGeneralAction,
+			Index: index,
+		},
+		Status:      StepActive,
+		Description: strings.TrimSpace(call.FunctionCall.Name),
+		Command:     command,
+	}
+}
+
+func (a actionRecord) stepRuntimeState() StepRuntimeState {
+	phase := PhaseRef{}
+	if a.Phase != nil {
+		phase = *a.Phase
+	}
+	return StepRuntimeState{
+		Ref: StepRef{
+			Phase: phase,
+			Kind:  StepGeneralAction,
+			Index: a.Step,
+		},
+		Status:      StepCompleted,
+		Description: strings.TrimSpace(a.Tool),
+		Command:     strings.TrimSpace(a.Command),
+	}
 }
 
 func (l *Loop) PublishedRuntimeSnapshot() (RuntimeSnapshot, bool) {
@@ -375,8 +509,6 @@ func (s RuntimeSnapshot) NestedStateName() string {
 
 func (s RuntimeSnapshot) AuditError() string {
 	switch {
-	case s.FinalReportRequested && s.GuidedPhaseProgressRequested:
-		return "final_report and guided phase_progress are both requested"
 	case s.LoopState == StateWaitingDirectionText && s.PendingDirectionPrompt != nil:
 		return "direction free-text state still has a pending choice prompt"
 	case s.LoopState == StateWaitingDirectionChoice && s.PendingDirectionPrompt == nil:

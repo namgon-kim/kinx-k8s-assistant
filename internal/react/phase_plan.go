@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
-	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 )
 
 type phaseStepState struct {
@@ -39,20 +38,10 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 		plan, ok := phasePlanFromFunctionCall(call)
 		if !ok {
 			message := "Phase plan was invalid. Return only one corrected phase_plan object before choosing any action. Include request_goal, current_phase_index, and ordered phase_steps with index, name, goal, completion_condition, and allowed_next. Every allowed_next value must name a declared phase_steps[].name; do not reference implicit phases such as final_report or guided_diagnosis unless they are listed as phase_steps."
-			if !l.appendCorrectionWithCompaction("invalid_phase_plan", message) {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 phase plan 오류로 루프를 중단했습니다:\n"+message)
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return nil, true
-			}
-			l.pendingCalls = nil
-			l.currIteration++
-			l.state = StateRunning
-			return nil, true
+			return nil, l.applyModelOutputCorrectionGate("invalid_phase_plan", "반복된 phase plan 오류로 루프를 중단했습니다.", message)
 		}
 		if result := l.validatePhasePlanForRequest(plan); !result.Valid {
-			if l.applyGateDecision(result.gateDecision()) {
+			if l.applyGateOutcome(result.gateOutcome()) {
 				return nil, true
 			}
 		}
@@ -68,26 +57,16 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 		}
 		if !phasePlanAllowsTrailingCalls(*accepted, remaining) {
 			message := "Phase plan was accepted, but the same response also included additional structured output. Return only the phase_plan object first, except for a single-step lightweight_lookup phase where exactly one action may be included with the phase_plan."
-			if !l.appendCorrectionWithCompaction("phase_plan_unexpected_trailing_calls", message) {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 phase plan 동시 출력 오류로 루프를 중단했습니다:\n"+message)
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return nil, true
-			}
 			l.phaseStepState = nil
-			l.pendingCalls = nil
-			l.currIteration++
-			l.state = StateRunning
-			return nil, true
+			return nil, l.applyModelOutputCorrectionGate("phase_plan_unexpected_trailing_calls", "반복된 phase plan 동시 출력 오류로 루프를 중단했습니다.", message)
 		}
 	}
 	return remaining, false
 }
 
-func (r phasePlanValidationResult) gateDecision() GateDecision {
+func (r phasePlanValidationResult) gateOutcome() GateOutcome {
 	if r.Valid {
-		return allowGateDecision()
+		return GateOutcome{Allow: true}
 	}
 	code := strings.TrimSpace(r.Code)
 	if code == "" {
@@ -97,12 +76,15 @@ func (r phasePlanValidationResult) gateDecision() GateDecision {
 	if message == "" {
 		message = "The phase_plan violates the runtime request contract. Return one corrected phase_plan object before choosing an action."
 	}
-	return GateDecision{
-		Allow:           false,
+	return GateOutcome{
+		Kind:            GateOutcomeModelOutputCorrection,
 		Code:            code,
 		UserMessage:     "phase plan이 현재 요청의 runtime contract와 맞지 않아 차단했습니다.",
 		ModelCorrection: message,
-		NextState:       StateRunning,
+		Retryable:       true,
+		RetryScope:      RetryScopeCurrentPhase,
+		CorrectionMode:  CorrectionModeAppendCompacted,
+		BranchPolicy:    BranchStayCurrent,
 	}
 }
 
@@ -145,31 +127,11 @@ func (l *Loop) consumePhaseProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 		progress, ok := phaseProgressFromFunctionCall(call)
 		if ok && l.phaseProgressBlockedByGuidanceLookup(progress) {
 			message := "Active phase is guidance_lookup for a CRD-backed primary target, but no resource-guide lookup result has been injected or recorded as unavailable. Return one top-level `resource_guide_lookup` object for the accepted primary resource and operational problem focus. Do not complete guidance_lookup with phase_progress, do not enter guided_diagnosis, and do not choose a kubectl action until the guide lookup result is observed."
-			if !l.appendCorrectionWithCompaction("guidance_lookup_missing_resource_guide_lookup", message) {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "resource_guide_lookup 없이 guidance_lookup 완료가 반복되어 진단을 중단합니다:\n"+message)
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return nil, true
-			}
-			l.pendingCalls = nil
-			l.currIteration++
-			l.state = StateRunning
-			return nil, true
+			return nil, l.applyModelOutputCorrectionGate("guidance_lookup_missing_resource_guide_lookup", "resource_guide_lookup 없이 guidance_lookup 완료가 반복되어 진단을 중단합니다.", message)
 		}
 		if !ok || l.phaseStepState == nil || !l.phaseStepState.acceptProgress(progress) {
 			message := "Phase progress was invalid. Return one corrected phase_progress object for the active phase, or continue the active phase with one valid action. Do not use guide_progress for top-level phase completion."
-			if !l.appendCorrectionWithCompaction("invalid_phase_progress", message) {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 phase progress 오류로 루프를 중단했습니다:\n"+message)
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return nil, true
-			}
-			l.pendingCalls = nil
-			l.currIteration++
-			l.state = StateRunning
-			return nil, true
+			return nil, l.applyModelOutputCorrectionGate("invalid_phase_progress", "반복된 phase progress 오류로 루프를 중단했습니다.", message)
 		}
 		if l.guideStepState != nil && strings.EqualFold(l.phaseStepState.phaseName(progress.PhaseCompleted), "guided_diagnosis") {
 			l.guideStepState = nil
@@ -216,17 +178,7 @@ func (l *Loop) requirePhasePlanBeforeAction(calls []gollm.FunctionCall) bool {
 		}
 	}
 	message := "After requirement_analysis is accepted, return only one phase_plan object before choosing any action, resource_guide_lookup, final_report, or answer. The plan must define ordered phase_steps, each with a goal, completion_condition, and allowed_next values that reference only declared phase_steps[].name entries."
-	if !l.appendCorrectionWithCompaction("missing_phase_plan", message) {
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 phase plan 누락으로 루프를 중단했습니다:\n"+message)
-		l.pendingCalls = nil
-		l.currIteration = 0
-		l.state = StateDone
-		return true
-	}
-	l.pendingCalls = nil
-	l.currIteration++
-	l.state = StateRunning
-	return true
+	return l.applyModelOutputCorrectionGate("missing_phase_plan", "반복된 phase plan 누락으로 루프를 중단했습니다.", message)
 }
 
 func (l *Loop) rejectInvalidShimStructuredCalls(calls []gollm.FunctionCall) bool {
@@ -242,17 +194,7 @@ func (l *Loop) rejectInvalidShimStructuredCalls(calls []gollm.FunctionCall) bool
 		default:
 			continue
 		}
-		if !l.appendCorrectionWithCompaction(code, message) {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 shim structured output 오류로 루프를 중단했습니다:\n"+message)
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.state = StateDone
-			return true
-		}
-		l.pendingCalls = nil
-		l.currIteration++
-		l.state = StateRunning
-		return true
+		return l.applyModelOutputCorrectionGate(code, "반복된 shim structured output 오류로 루프를 중단했습니다.", message)
 	}
 	return false
 }
@@ -406,12 +348,96 @@ func phaseStepsFromValue(value any) ([]phaseStep, bool) {
 			CompletionCondition: stringFromAny(m["completion_condition"]),
 			AllowedNext:         stringSliceFromAny(m["allowed_next"]),
 		}
+		if stepsValue, exists := m["steps"]; exists {
+			explicitSteps, ok := phaseExecutionStepsFromValue(stepsValue)
+			if !ok {
+				return nil, false
+			}
+			step.Steps = explicitSteps
+		}
 		if step.Index == 0 || step.Name == "" || step.Goal == "" || step.CompletionCondition == "" {
 			return nil, false
 		}
 		steps = append(steps, step)
 	}
 	return steps, true
+}
+
+func phaseExecutionStepsFromValue(value any) ([]phaseExecutionStep, bool) {
+	if value == nil {
+		return nil, true
+	}
+	raw, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+	steps := make([]phaseExecutionStep, 0, len(raw))
+	seenID := map[string]struct{}{}
+	seenIndex := map[int]struct{}{}
+	for _, item := range raw {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		step := phaseExecutionStep{
+			ID:              strings.TrimSpace(stringFromAny(m["id"])),
+			Index:           intFromAny(m["index"]),
+			Kind:            strings.TrimSpace(stringFromAny(m["kind"])),
+			Description:     strings.TrimSpace(stringFromAny(m["description"])),
+			Command:         strings.TrimSpace(stringFromAny(m["command"])),
+			ExpectedOutcome: strings.TrimSpace(stringFromAny(m["expected_outcome"])),
+		}
+		if !phaseExecutionStepValid(step) {
+			return nil, false
+		}
+		if id := strings.ToLower(strings.TrimSpace(step.ID)); id != "" {
+			if _, ok := seenID[id]; ok {
+				return nil, false
+			}
+			seenID[id] = struct{}{}
+		}
+		if step.Index > 0 {
+			if _, ok := seenIndex[step.Index]; ok {
+				return nil, false
+			}
+			seenIndex[step.Index] = struct{}{}
+		}
+		steps = append(steps, step)
+	}
+	return steps, true
+}
+
+func phaseExecutionStepValid(step phaseExecutionStep) bool {
+	if strings.TrimSpace(step.ID) == "" && step.Index <= 0 {
+		return false
+	}
+	return strings.TrimSpace(step.Kind) != "" ||
+		strings.TrimSpace(step.Description) != "" ||
+		strings.TrimSpace(step.Command) != "" ||
+		strings.TrimSpace(step.ExpectedOutcome) != ""
+}
+
+func phaseExecutionStepsValid(steps []phaseExecutionStep) bool {
+	seenID := map[string]struct{}{}
+	seenIndex := map[int]struct{}{}
+	for _, step := range steps {
+		if !phaseExecutionStepValid(step) {
+			return false
+		}
+		if id := strings.ToLower(strings.TrimSpace(step.ID)); id != "" {
+			if _, ok := seenID[id]; ok {
+				return false
+			}
+			seenID[id] = struct{}{}
+		}
+		if step.Index > 0 {
+			if _, ok := seenIndex[step.Index]; ok {
+				return false
+			}
+			seenIndex[step.Index] = struct{}{}
+		}
+	}
+	return true
 }
 
 func phasePlanValid(plan phasePlan) bool {
@@ -424,6 +450,9 @@ func phasePlanValid(plan phasePlan) bool {
 	indexByName := make(map[string]int, len(plan.PhaseSteps))
 	for _, step := range plan.PhaseSteps {
 		if step.Index == 0 || strings.TrimSpace(step.Name) == "" {
+			return false
+		}
+		if !phaseExecutionStepsValid(step.Steps) {
 			return false
 		}
 		if _, ok := seenIndex[step.Index]; ok {
@@ -501,6 +530,92 @@ func newPhaseStepState(plan phasePlan) *phaseStepState {
 	}
 }
 
+func (s *phaseStepState) activePhaseRef() PhaseRef {
+	current := s.currentStep()
+	if current.Index == 0 {
+		return PhaseRef{}
+	}
+	return PhaseRef{
+		Index: current.Index,
+		Name:  strings.TrimSpace(current.Name),
+	}
+}
+
+func (l *Loop) currentPhaseRef() PhaseRef {
+	if l == nil || l.phaseStepState == nil {
+		return PhaseRef{}
+	}
+	return l.phaseStepState.activePhaseRef()
+}
+
+func (s *phaseStepState) runtimeState() *PhaseRuntimeState {
+	if s == nil {
+		return nil
+	}
+	state := &PhaseRuntimeState{
+		RequestGoal: strings.TrimSpace(s.RequestGoal),
+		Active:      s.activePhaseRef(),
+		Phases:      make([]PhaseSpec, 0, len(s.PhaseSteps)),
+		Completed:   map[int]bool{},
+	}
+	for index, completed := range s.Completed {
+		if completed {
+			state.Completed[index] = true
+		}
+	}
+	for _, step := range s.PhaseSteps {
+		status := PhasePending
+		if state.Completed[step.Index] {
+			status = PhaseCompleted
+		}
+		if step.Index == state.Active.Index {
+			status = PhaseActive
+		}
+		state.Phases = append(state.Phases, PhaseSpec{
+			Ref: PhaseRef{
+				Index: step.Index,
+				Name:  strings.TrimSpace(step.Name),
+			},
+			Goal:                strings.TrimSpace(step.Goal),
+			CompletionCondition: strings.TrimSpace(step.CompletionCondition),
+			AllowedNext:         append([]string(nil), step.AllowedNext...),
+			Status:              status,
+			Steps:               step.phaseExecutionStepRuntimeStates(PhaseRef{Index: step.Index, Name: strings.TrimSpace(step.Name)}, status),
+		})
+	}
+	return state
+}
+
+func (s phaseStep) phaseExecutionStepRuntimeStates(phase PhaseRef, phaseStatus PhaseStatus) []StepRuntimeState {
+	if len(s.Steps) == 0 {
+		return nil
+	}
+	steps := make([]StepRuntimeState, 0, len(s.Steps))
+	for i, step := range s.Steps {
+		index := step.Index
+		if index == 0 {
+			index = i + 1
+		}
+		status := StepPending
+		if phaseStatus == PhaseCompleted {
+			status = StepCompleted
+		}
+		steps = append(steps, StepRuntimeState{
+			Ref: StepRef{
+				Phase: phase,
+				Kind:  StepExplicitPhase,
+				ID:    strings.TrimSpace(step.ID),
+				Index: index,
+			},
+			Status:          status,
+			Description:     strings.TrimSpace(step.Description),
+			Command:         strings.TrimSpace(step.Command),
+			ExpectedOutcome: strings.TrimSpace(step.ExpectedOutcome),
+		})
+	}
+	return steps
+}
+
 func (s *phaseStepState) acceptProgress(progress phaseProgress) bool {
 	if s == nil {
 		return false
@@ -556,6 +671,83 @@ func (s *phaseStepState) phaseName(index int) string {
 		}
 	}
 	return ""
+}
+
+func (s *phaseStepState) phaseStepForRef(ref PhaseRef) (phaseStep, bool) {
+	if s == nil {
+		return phaseStep{}, false
+	}
+	for _, step := range s.PhaseSteps {
+		candidate := PhaseRef{Index: step.Index, Name: strings.TrimSpace(step.Name)}
+		if candidate.matches(ref) {
+			return step, true
+		}
+	}
+	return phaseStep{}, false
+}
+
+func (s *phaseStepState) moveToPhase(ref PhaseRef) error {
+	if s == nil {
+		return fmt.Errorf("phase state is nil")
+	}
+	for _, step := range s.PhaseSteps {
+		candidate := PhaseRef{Index: step.Index, Name: strings.TrimSpace(step.Name)}
+		if candidate.matches(ref) {
+			if s.Completed != nil && s.Completed[step.Index] {
+				return fmt.Errorf("target phase %s is already completed", candidate.String())
+			}
+			s.CurrentPhaseIndex = step.Index
+			return nil
+		}
+	}
+	return fmt.Errorf("target phase does not exist: %s", ref.String())
+}
+
+func (s *phaseStepState) rewindToPhase(ref PhaseRef) (PhaseRef, error) {
+	if s == nil {
+		return PhaseRef{}, fmt.Errorf("phase state is nil")
+	}
+	for _, step := range s.PhaseSteps {
+		candidate := PhaseRef{Index: step.Index, Name: strings.TrimSpace(step.Name)}
+		if !candidate.matches(ref) {
+			continue
+		}
+		if s.Completed == nil {
+			s.Completed = map[int]bool{}
+		}
+		for _, phase := range s.PhaseSteps {
+			if phase.Index >= step.Index {
+				delete(s.Completed, phase.Index)
+			}
+		}
+		s.CurrentPhaseIndex = step.Index
+		return candidate, nil
+	}
+	return PhaseRef{}, fmt.Errorf("target phase does not exist: %s", ref.String())
+}
+
+func (s *phaseStepState) phasesAtOrAfter(ref PhaseRef) []PhaseRef {
+	if s == nil {
+		return nil
+	}
+	start := 0
+	for _, step := range s.PhaseSteps {
+		candidate := PhaseRef{Index: step.Index, Name: strings.TrimSpace(step.Name)}
+		if candidate.matches(ref) {
+			start = step.Index
+			break
+		}
+	}
+	if start == 0 {
+		return nil
+	}
+	var refs []PhaseRef
+	for _, step := range s.PhaseSteps {
+		if step.Index >= start {
+			refs = append(refs, PhaseRef{Index: step.Index, Name: strings.TrimSpace(step.Name)})
+		}
+	}
+	return refs
 }
 
 func (s *phaseStepState) allowedNextIndex(current phaseStep, name string) int {
@@ -724,17 +916,7 @@ func (l *Loop) rejectPlainAnswerOutsideResponsePhase() bool {
 	if current != "" {
 		message = fmt.Sprintf("Active phase is %q. %s", current, message)
 	}
-	if !l.appendCorrectionWithCompaction("plain_answer_wrong_phase", message) {
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "잘못된 phase의 일반 응답이 반복되어 루프를 중단했습니다:\n"+message)
-		l.pendingCalls = nil
-		l.currIteration = 0
-		l.state = StateDone
-		return true
-	}
-	l.pendingCalls = nil
-	l.currIteration++
-	l.state = StateRunning
-	return true
+	return l.applyModelOutputCorrectionGate("plain_answer_wrong_phase", "잘못된 phase의 일반 응답이 반복되어 루프를 중단했습니다.", message)
 }
 
 func (s *phaseStepState) compactPlan() map[string]any {
