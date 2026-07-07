@@ -360,7 +360,7 @@ guidance:
 
 `read-only`는 config 파일의 `readonly: true`, CLI의 `--read-only`, 또는 실행 중 `/readonly on|off|status` 메타 명령으로 제어합니다. 실행 중 변경한 값은 `/save`를 입력해야 `~/.k8s-assistant/config.yaml`에 저장됩니다.
 
-read-only 모드는 `kubectl get`, `describe`, `logs`, `top`, `api-resources` 같은 진단 명령은 허용하고, `apply`, `delete`, `patch`, `scale` 같은 변경 명령은 차단합니다. `kubectl -n <namespace> get ...`처럼 global flag가 verb 앞에 오는 read-only 명령도 진단 명령으로 인식합니다. `bash -c`/`bash -lc` 안의 명령이 read-only `kubectl`과 안전한 텍스트 처리 파이프라인으로만 구성된 경우도 진단 명령으로 허용합니다.
+read-only 모드는 `kubectl get`, `describe`, `logs`, `top`, `api-resources` 같은 진단 명령은 허용하고, `apply`, `delete`, `patch`, `scale`, `auth reconcile` 같은 변경 명령은 차단합니다. `kubectl auth`는 `can-i`와 `whoami`만 read-only로 허용합니다. `kubectl -n <namespace> get ...`처럼 global flag가 verb 앞에 오는 read-only 명령도 진단 명령으로 인식합니다. `bash -c`/`bash -lc` 안의 명령이 read-only `kubectl`과 안전한 텍스트 처리 파이프라인으로만 구성된 경우도 진단 명령으로 허용합니다. `$()`, backtick, heredoc, process substitution, shell redirection처럼 안전성이 확인되지 않는 command는 변경 명령과 구분해 agent가 더 구체적인 read-only 명령으로 재시도하게 합니다.
 
 JSON ReAct shim 사용 시 모델이 최종 답변을 JSON code block 없이 plain text로 반환해도, k8s-assistant는 이를 shim parse error가 아니라 최종 답변으로 처리합니다.
 
@@ -368,10 +368,13 @@ JSON ReAct shim 사용 시 모델이 최종 답변을 JSON code block 없이 pla
 
 k8s-assistant는 runtime prompt를 section 단위로 조립합니다. core ReAct, output contract, language policy, target/scope 보존, command guideline은 항상 포함하고, read-only, guidance protocol, manifest generation, Cluster API guardrail은 현재 요청과 RAG 결과에 따라 조건부로 포함합니다.
 
-system prompt 자체는 매 iteration 동일하지만, 모델 attention이 최근 observation으로 쏠리는 문제를 줄이기 위해 매 iteration 전송 직전에 두 개의 짧은 anchor를 prepend합니다.
+system prompt 자체는 매 iteration 동일하지만, 모델 attention이 최근 observation으로 쏠리는 문제를 줄이기 위해 매 iteration 전송 직전에 짧은 runtime anchor들을 prepend합니다.
 
+- **runtime_state anchor**: 현재 `ControlState`, active gate, required/forbidden next output을 명시합니다.
 - **requirement_analysis anchor**: 승인된 요청 분류와 `request_context`를 다시 명시합니다.
+- **phase_step anchor**: accepted `phase_plan`의 현재 phase와 allowed next phase를 유지합니다.
 - **guide_step anchor**: 활성 resource guide의 step checklist와 진행 상황을 다시 명시합니다.
+- **mutation_verification anchor**: 변경 이후 남은 read-only evidence requirement 또는 `mutation_verification_result` 요구를 유지합니다.
 
 가이드의 모든 step이 완료되면 모델에게 `final_report`를 요청하고, inconclusive면 `next_directions` 옵션을 받아 사용자 선택을 거쳐 진단을 계속하거나 종료합니다. 자세한 schema와 state machine은 `docs/guide_progress_and_continuation.md`에 정리되어 있습니다.
 

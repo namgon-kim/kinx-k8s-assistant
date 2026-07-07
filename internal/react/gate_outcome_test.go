@@ -44,10 +44,23 @@ func TestGateOutcomeValidateChecksTargetPhaseAndStep(t *testing.T) {
 	if err := missingStep.Validate(snapshot); err == nil {
 		t.Fatal("expected missing target step to be rejected")
 	}
-	wrongControl := valid
-	wrongControl.ExpectedControl = ControlAwaitingFinalReport
-	if err := wrongControl.Validate(snapshot); err == nil {
-		t.Fatal("expected mismatched expected control to be rejected")
+}
+
+func TestGateOutcomeExpectedControlIsPostApplyAssertion(t *testing.T) {
+	loop := &Loop{state: StateRunning}
+	handled := loop.applyGateOutcome(GateOutcome{
+		Kind:            GateOutcomeModelOutputCorrection,
+		Code:            "expected_control_mismatch",
+		ExpectedControl: ControlAwaitingFinalReport,
+		ModelCorrection: "retry",
+		CorrectionMode:  CorrectionModeAppendCompacted,
+		BranchPolicy:    BranchStayCurrent,
+	})
+	if !handled {
+		t.Fatal("expected outcome to be handled")
+	}
+	if loop.state != StateDone {
+		t.Fatalf("state = %v, want StateDone for post-apply expected control mismatch", loop.state)
 	}
 }
 
@@ -339,30 +352,8 @@ func TestApplyGateOutcomeBranchRecheckStepConsumesMutationBudget(t *testing.T) {
 	if !strings.Contains(loop.pendingResponseDirective, "conclusive=false") {
 		t.Fatalf("directive = %q, want inconclusive final report instruction", loop.pendingResponseDirective)
 	}
-}
-
-func TestStepRuntimeMarksAndRetriesGuideStep(t *testing.T) {
-	loop := &Loop{
-		guideStepState: &guideStepState{
-			TotalSteps: 2,
-			Completed:  map[int]bool{},
-		},
-	}
-	ref := StepRef{Kind: StepResourceGuideDiagnostic, Index: 1}
-	if !loop.MarkStepCompleted(ref) {
-		t.Fatal("expected guide step completion to change state")
-	}
-	if !loop.guideStepState.Completed[1] {
-		t.Fatalf("guide completed map = %#v", loop.guideStepState.Completed)
-	}
-	if loop.MarkStepCompleted(ref) {
-		t.Fatal("expected duplicate guide step completion to be ignored")
-	}
-	if !loop.RetryStep(ref) {
-		t.Fatal("expected guide retry to clear completion")
-	}
-	if loop.guideStepState.Completed[1] {
-		t.Fatalf("guide completed map = %#v", loop.guideStepState.Completed)
+	if !strings.Contains(loop.pendingResponseDirective, "after 3 recheck attempts") {
+		t.Fatalf("directive = %q, want exhausted attempt count", loop.pendingResponseDirective)
 	}
 }
 
@@ -412,37 +403,6 @@ func TestApplyGateOutcomeSkipsGuideStep(t *testing.T) {
 	}
 	if snapshot.ActiveSteps[1].Status != StepActive {
 		t.Fatalf("guide step 2 status = %s, want %s", snapshot.ActiveSteps[1].Status, StepActive)
-	}
-}
-
-func TestStepRuntimeMarksAndRetriesMutationEvidence(t *testing.T) {
-	loop := &Loop{
-		pendingMutationVerification: &pendingMutationVerification{
-			Requirements: []mutationEvidenceRequirement{
-				{ID: "direct"},
-				{ID: "outcome"},
-			},
-			Satisfied: map[string]bool{"direct": true},
-		},
-	}
-	ref := StepRef{Kind: StepMutationEvidenceRequirement, ID: "outcome"}
-	if !loop.MarkStepCompleted(ref) {
-		t.Fatal("expected mutation evidence completion to change state")
-	}
-	if !loop.pendingMutationVerification.Satisfied["outcome"] {
-		t.Fatalf("satisfied map = %#v", loop.pendingMutationVerification.Satisfied)
-	}
-	if !loop.pendingMutationVerification.AwaitingResult {
-		t.Fatal("expected all satisfied mutation verification to await result")
-	}
-	if !loop.RetryStep(ref) {
-		t.Fatal("expected retry to clear satisfied mutation evidence")
-	}
-	if loop.pendingMutationVerification.Satisfied["outcome"] {
-		t.Fatalf("satisfied map = %#v", loop.pendingMutationVerification.Satisfied)
-	}
-	if loop.pendingMutationVerification.AwaitingResult {
-		t.Fatal("expected retry to clear awaiting result")
 	}
 }
 

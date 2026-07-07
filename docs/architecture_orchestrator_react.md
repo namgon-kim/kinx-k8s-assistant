@@ -421,7 +421,7 @@ shim parser는 `requirement_analysis`, `phase_plan`, `phase_progress`, `resource
 - `allowed_next`에 들어간 이름은 같은 plan의 `phase_steps[].name`으로 선언되어야 한다.
 - `allowed_next`는 forward-only edge여야 한다. 같은 index 또는 이전 index의 phase로 되돌아가는 back-edge/cycle은 validation에서 거부된다.
 - 뒤에 더 큰 index의 step이 있는 non-terminal step은 적어도 하나의 `allowed_next`가 필요하다.
-- 각 `phase_steps[]`는 optional `steps[]`를 가질 수 있다. 이 필드는 phase 내부의 선언형 execution/evidence step을 runtime snapshot과 anchor에 보존하기 위한 것이며, 없으면 기존 implicit phase mode로 동작한다. 현재 explicit phase step은 직접 `MarkStepCompleted`/`RetryStep`/`SkipStep` 대상이 아니고, phase 완료는 여전히 tool observation과 `phase_progress`로 판정한다.
+- 각 `phase_steps[]`는 optional `steps[]`를 가질 수 있다. 이 필드는 phase 내부의 선언형 execution/evidence step을 runtime snapshot과 anchor에 보존하기 위한 것이며, 없으면 기존 implicit phase mode로 동작한다. 현재 explicit phase step에는 직접 완료/재시도/skip helper를 적용하지 않고, phase 완료는 여전히 tool observation과 `phase_progress`로 판정한다. 공통 `SkipStep` branch helper는 persistent terminal state가 있는 guide step과 mutation evidence requirement에만 적용된다.
 
 schema/graph validation 이후에는 `validatePhasePlanForRequest`가 request-aware runtime contract를 검증한다.
 
@@ -504,11 +504,14 @@ read-only enforcement는 prompt instruction만이 아니라 runtime policy다.
 
 0. `echo`, `printf`, `sleep`, `read`처럼 클러스터 상태를 관찰하지 않는 shell action은 tool 실행/read-only 판정 전에 correction으로 재시도시킨다. planning이 완료됐으면 `phase_progress`, 추가 증거가 필요하면 실제 read-only `kubectl` action을 요구한다.
 1. observation tool name이면 `no`.
-2. kubectl invocation에 read-only fast path에서 금지된 shell evaluation syntax 또는 허용되지 않은 read-only subcommand가 있으면 `unknown`.
-3. kubectl invocation이 read-only pipeline이면 `no`.
-4. 그 외에는 kubectl-ai tool의 `CheckModifiesResource` 결과를 사용한다.
+2. kubectl-ai tool의 `CheckModifiesResource`가 `yes`이거나 runtime이 실제 실행 위치의 kubectl mutation verb/subcommand를 확인하면 `yes`.
+3. kubectl invocation에 read-only fast path에서 금지된 shell evaluation syntax 또는 안전성이 확인되지 않은 command shape가 있으면 `unknown`.
+4. kubectl invocation이 read-only pipeline이면 `no`.
+5. 그 외에는 kubectl-ai tool의 `CheckModifiesResource` 결과를 사용한다.
 
 `unknown`은 mutating command와 다르게 취급한다. read-only mode에서 명확한 mutation은 사용자의 변경 요청이 read-only 정책에 막힌 것이므로 반복하지 않는다. 반면 안전한 diagnostic인지 확인하지 못한 `unknown` command는 agent가 잘못된 command를 고른 것이므로 `retryable=true`, `retry_scope=agent_correct_command` observation을 남기고, final report를 강제하지 않고 더 구체적인 read-only `kubectl` command 또는 `phase_progress`로 재시도시킨다.
+
+명확한 mutation과 `unknown`이 같은 batch에 섞이면 전체 gate outcome은 사용자 요청 차단으로 취급한다. 이때 unknown command의 개별 observation도 agent retry가 아니라 `user_request_blocked_by_read_only` scope를 따른다.
 
 read-only kubectl pipeline으로 인정되려면:
 
@@ -525,12 +528,20 @@ read-only kubectl pipeline으로 인정되려면:
 get, describe, logs, top, api-resources, api-versions, version, config, auth
 ```
 
-`kubectl auth`는 verb만으로 허용하지 않는다. read-only fast path에서는 `auth can-i`, `auth whoami`만 allowlist로 허용하고, 나머지 auth subcommand는 `unknown`으로 분류해 read-only mode에서 차단한다.
+`kubectl auth`는 verb만으로 허용하지 않는다. read-only fast path에서는 `auth can-i`, `auth whoami`만 allowlist로 허용한다. `auth reconcile`은 안전성 미확인이 아니라 명확한 mutation으로 분류하고, 그 밖의 인식되지 않은 auth shape는 read-only로 허용하지 않는다.
 
 현재 mutating verb:
 
 ```text
-apply, delete, patch, replace, edit, scale, set, create, annotate, label, cordon, uncordon, drain, taint
+apply, delete, patch, replace, edit, scale, autoscale, set, create,
+annotate, label, cordon, uncordon, drain, taint, expose, run, exec,
+debug, attach, cp, reconcile, approve, deny
+```
+
+현재 mutating subcommand:
+
+```text
+rollout pause/restart/resume/undo, auth reconcile, certificate approve/deny
 ```
 
 safe local pipeline command:

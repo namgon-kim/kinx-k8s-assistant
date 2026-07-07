@@ -40,8 +40,7 @@ func (l *Loop) applyRuntimeCleanup(policy runtimeCleanupPolicy) {
 
 func cleanupApprovalDeclinedPolicy() runtimeCleanupPolicy {
 	return runtimeCleanupPolicy{
-		ClearPendingCalls:       true,
-		ClearResponseDirectives: true,
+		ClearPendingCalls: true,
 	}
 }
 

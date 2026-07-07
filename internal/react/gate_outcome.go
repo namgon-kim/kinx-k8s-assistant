@@ -54,11 +54,6 @@ const (
 	BranchBlockUserRequest BranchPolicy = "block_user_request"
 )
 
-type GateObservation struct {
-	Key   string
-	Value string
-}
-
 type GateOutcome struct {
 	Allow bool
 	Kind  GateOutcomeKind
@@ -74,7 +69,6 @@ type GateOutcome struct {
 	UserVisible     bool
 	UserMessage     string
 	ModelCorrection string
-	Observations    []GateObservation
 
 	CorrectionMode CorrectionMode
 	BranchPolicy   BranchPolicy
@@ -83,9 +77,6 @@ type GateOutcome struct {
 func (o GateOutcome) Validate(snapshot RuntimeSnapshot) error {
 	if o.Allow {
 		return nil
-	}
-	if o.ExpectedControl != "" && snapshot.Control != o.ExpectedControl {
-		return fmt.Errorf("expected control %s, got %s", o.ExpectedControl, snapshot.Control)
 	}
 	if o.TargetPhase != nil && !snapshot.hasPhaseRef(*o.TargetPhase) {
 		return fmt.Errorf("target phase does not exist: %s", o.TargetPhase.String())
@@ -188,7 +179,21 @@ func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repea
 	l.pendingCalls = nil
 	l.currIteration++
 	l.state = StateRunning
+	if err := outcome.AssertExpectedControl(l.RuntimeSnapshot()); err != nil {
+		l.pendingCalls = nil
+		l.currIteration = 0
+		l.state = StateDone
+		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime gate outcome 적용 후 control assertion이 맞지 않아 루프를 중단했습니다.\n"+err.Error())
+		return true
+	}
 	return true
+}
+
+func (o GateOutcome) AssertExpectedControl(snapshot RuntimeSnapshot) error {
+	if o.ExpectedControl == "" || snapshot.Control == o.ExpectedControl {
+		return nil
+	}
+	return fmt.Errorf("expected control %s, got %s", o.ExpectedControl, snapshot.Control)
 }
 
 func (l *Loop) applyGateBranch(outcome GateOutcome) error {
@@ -307,15 +312,15 @@ func (l *Loop) applyRecheckStepBranch(outcome GateOutcome) error {
 	if l == nil || !l.mutationContinuationRequired {
 		return fmt.Errorf("branch policy %s requires active external-state mutation continuation", outcome.BranchPolicy)
 	}
-	l.mutationContinuationAttempts++
-	if l.mutationContinuationAttempts > maxMutationContinuationAttempts {
+	attempt, exhausted := l.consumeMutationContinuationAttempt()
+	if exhausted {
 		l.mutationContinuationRequired = false
 		l.guidedPhaseProgressRequested = false
 		l.finalReportRequested = true
-		l.queueResponseDirective(fmt.Sprintf("External state recheck budget is exhausted for source_gate=%s. Return final_report with conclusive=false, summarize the recheck attempts, and explain that the external state did not reach a resolved condition within the runtime budget.", strings.TrimSpace(outcome.Code)))
+		l.queueResponseDirective(fmt.Sprintf("External state recheck budget is exhausted after %d recheck attempts for source_gate=%s. Return final_report with conclusive=false, summarize the recheck attempts, and explain that the external state did not reach a resolved condition within the runtime budget.", attempt, strings.TrimSpace(outcome.Code)))
 		return nil
 	}
-	l.queueResponseDirective(fmt.Sprintf("External state still needs verification for source_gate=%s. Continue with one read-only recheck action or a valid mutation_verification_result after the observation. recheck_attempt: %d/%d.", strings.TrimSpace(outcome.Code), l.mutationContinuationAttempts, maxMutationContinuationAttempts))
+	l.queueResponseDirective(fmt.Sprintf("External state still needs verification for source_gate=%s. Continue with one read-only recheck action or a valid mutation_verification_result after the observation. recheck_attempt: %d/%d.", strings.TrimSpace(outcome.Code), attempt, maxMutationContinuationAttempts))
 	return nil
 }
 

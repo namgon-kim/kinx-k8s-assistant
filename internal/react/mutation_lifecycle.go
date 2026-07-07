@@ -154,25 +154,33 @@ func mutationContinuationDirective(result mutationVerificationResult) string {
 }
 
 func (l *Loop) requestMutationContinuationOrBudgetReport(result mutationVerificationResult) {
-	l.mutationContinuationAttempts++
-	if l.mutationContinuationAttempts > maxMutationContinuationAttempts {
+	attempt, exhausted := l.consumeMutationContinuationAttempt()
+	if exhausted {
 		l.mutationContinuationRequired = false
 		l.guidedPhaseProgressRequested = false
 		l.finalReportRequested = true
-		l.queueResponseDirective(mutationContinuationBudgetExhaustedDirective(result, l.mutationContinuationAttempts))
+		l.queueResponseDirective(mutationContinuationBudgetExhaustedDirective(result, attempt))
 		return
 	}
 	l.mutationContinuationRequired = true
 	directive := mutationContinuationDirective(result)
 	if directive != "" {
-		directive = fmt.Sprintf("%s\nrecheck_attempt: %d/%d", directive, l.mutationContinuationAttempts, maxMutationContinuationAttempts)
+		directive = fmt.Sprintf("%s\nrecheck_attempt: %d/%d", directive, attempt, maxMutationContinuationAttempts)
 	}
 	l.queueResponseDirective(directive)
 }
 
+func (l *Loop) consumeMutationContinuationAttempt() (int, bool) {
+	l.mutationContinuationAttempts++
+	if l.mutationContinuationAttempts > maxMutationContinuationAttempts {
+		return maxMutationContinuationAttempts, true
+	}
+	return l.mutationContinuationAttempts, false
+}
+
 func mutationContinuationBudgetExhaustedDirective(result mutationVerificationResult, attempts int) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Mutation verification continuation budget is exhausted after %d recheck attempts. Your next response MUST be exactly one final_report object with conclusive=false. Summarize the mutation verification evidence, state that the external state did not settle within the runtime recheck budget, and recommend the next manual or follow-up observation. Do not emit another action, phase_progress, next_directions, or plain answer.", attempts-1)
+	fmt.Fprintf(&b, "Mutation verification continuation budget is exhausted after %d recheck attempts. Your next response MUST be exactly one final_report object with conclusive=false. Summarize the mutation verification evidence, state that the external state did not settle within the runtime recheck budget, and recommend the next manual or follow-up observation. Do not emit another action, phase_progress, next_directions, or plain answer.", attempts)
 	if next := strings.TrimSpace(result.NextAction); next != "" {
 		fmt.Fprintf(&b, "\nlast_model_proposed_next_action: %s", next)
 	}
