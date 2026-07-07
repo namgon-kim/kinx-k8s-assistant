@@ -535,7 +535,7 @@ get, describe, logs, top, api-resources, api-versions, version, config, auth
 ```text
 apply, delete, patch, replace, edit, scale, autoscale, set, create,
 annotate, label, cordon, uncordon, drain, taint, expose, run, exec,
-debug, attach, cp, reconcile, approve, deny
+debug, attach, cp
 ```
 
 현재 mutating subcommand:
@@ -543,6 +543,8 @@ debug, attach, cp, reconcile, approve, deny
 ```text
 rollout pause/restart/resume/undo, auth reconcile, certificate approve/deny
 ```
+
+현재 lightweight detector는 실제 실행 command 위치의 `kubectl`만 positive mutation으로 본다. `sudo kubectl ...`, `xargs kubectl ...`처럼 wrapper 뒤에 오는 kubectl 실행은 후속 과제로 남기며, 향후 `Evaneos/kubectl-readonly` 기반 command classifier로 대체/보강할 예정이다.
 
 safe local pipeline command:
 

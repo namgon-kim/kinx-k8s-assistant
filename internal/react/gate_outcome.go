@@ -179,6 +179,9 @@ func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repea
 	l.pendingCalls = nil
 	l.currIteration++
 	l.state = StateRunning
+	// This is a post-condition assertion only. Branch side effects are not
+	// rolled back on failure, so production gates should avoid ExpectedControl
+	// unless the branch outcome is already safe to keep if the assertion fails.
 	if err := outcome.AssertExpectedControl(l.RuntimeSnapshot()); err != nil {
 		l.pendingCalls = nil
 		l.currIteration = 0

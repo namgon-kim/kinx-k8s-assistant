@@ -1905,7 +1905,7 @@ func isKubectlMutatingVerb(verb string) bool {
 	switch strings.ToLower(verb) {
 	case "apply", "delete", "patch", "replace", "edit", "scale", "autoscale", "set", "create",
 		"annotate", "label", "cordon", "uncordon", "drain", "taint", "expose", "run", "exec",
-		"debug", "attach", "cp", "reconcile", "approve", "deny":
+		"debug", "attach", "cp":
 		return true
 	default:
 		return false
