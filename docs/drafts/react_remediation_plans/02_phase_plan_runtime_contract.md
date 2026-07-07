@@ -24,7 +24,8 @@ Phase plan은 다음 두 계층으로 나눈다.
    - 사용자의 의도와 필요한 관찰 단계를 제안한다.
 
 2. Runtime-constrained plan
-   - runtime이 request type, read-only, mutation, namespace, guidance eligibility를 기준으로 필수 phase를 삽입하거나 거부한다.
+   - runtime이 request type, read-only, mutation, namespace, guidance eligibility를 기준으로 plan을 수용하거나 거부한다.
+   - runtime은 현재 phase graph를 자동으로 재작성하거나 verification phase를 삽입하지 않는다. 필수 phase가 빠졌으면 plan을 reject하고 corrected `phase_plan`을 다시 요구한다.
 
 ## Required Runtime Rules
 

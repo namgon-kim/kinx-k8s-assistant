@@ -292,6 +292,23 @@ func TestRuntimeCleanupPoliciesClearControlBoundaryState(t *testing.T) {
 	}
 }
 
+func TestApprovalDeclinedCleanupPreservesResponseDirectives(t *testing.T) {
+	loop := &Loop{
+		pendingCalls:             []PendingCall{{FunctionCall: gollm.FunctionCall{Name: "kubectl"}}},
+		finalReportRequested:     true,
+		pendingResponseDirective: "return final_report",
+	}
+
+	loop.applyRuntimeCleanup(cleanupApprovalDeclinedPolicy())
+
+	if len(loop.pendingCalls) != 0 {
+		t.Fatalf("pendingCalls = %#v, want cleared", loop.pendingCalls)
+	}
+	if !loop.finalReportRequested || loop.guidedPhaseProgressRequested || loop.pendingResponseDirective != "return final_report" {
+		t.Fatalf("approval cleanup must preserve directives: final=%v guided=%v directive=%q", loop.finalReportRequested, loop.guidedPhaseProgressRequested, loop.pendingResponseDirective)
+	}
+}
+
 func TestDirectionCleanupPreservesPendingCalls(t *testing.T) {
 	loop := &Loop{
 		pendingCalls:                 []PendingCall{{FunctionCall: gollm.FunctionCall{Name: "kubectl"}}},

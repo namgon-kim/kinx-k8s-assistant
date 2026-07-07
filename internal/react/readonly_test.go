@@ -357,7 +357,6 @@ func TestAnalyzeToolCallsAllowsOnlySafeKubectlAuthReadOnlySubcommands(t *testing
 	}
 
 	blocked := []string{
-		"kubectl auth reconcile -f role.yaml",
 		"kubectl auth",
 	}
 	for _, command := range blocked {
@@ -373,6 +372,19 @@ func TestAnalyzeToolCallsAllowsOnlySafeKubectlAuthReadOnlySubcommands(t *testing
 		if pending[0].ModifiesResource == "no" {
 			t.Fatalf("expected auth command %q to be blocked, got %q", command, pending[0].ModifiesResource)
 		}
+	}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command": "kubectl auth reconcile -f role.yaml",
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze auth reconcile command: %v", err)
+	}
+	if pending[0].ModifiesResource != "yes" {
+		t.Fatalf("expected auth reconcile to be classified as mutation, got %q", pending[0].ModifiesResource)
 	}
 }
 
@@ -401,8 +413,78 @@ func TestAnalyzeToolCallsBlocksMutatingBashCCommand(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("unexpected pending count: %d", len(pending))
 	}
-	if pending[0].ModifiesResource == "no" {
-		t.Fatalf("expected mutating bash -c command to be blocked, got %q", pending[0].ModifiesResource)
+	if pending[0].ModifiesResource != "yes" {
+		t.Fatalf("expected mutating bash -c command to be a known mutation, got %q", pending[0].ModifiesResource)
+	}
+}
+
+func TestAnalyzeToolCallsKeepsMutationClassificationWithBlockedFastPathFeatures(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	cases := []string{
+		`bash -c "kubectl delete pod \"$(cat /tmp/podname)\" -n tests"`,
+		`bash -c "kubectl patch deployment app -n tests -p \"$(cat /tmp/patch.json)\""`,
+		`bash -c "kubectl auth reconcile -f role.yaml"`,
+	}
+	for _, command := range cases {
+		pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+			Name: "bash",
+			Arguments: map[string]any{
+				"command": command,
+			},
+		}})
+		if err != nil {
+			t.Fatalf("analyze tool calls for %q: %v", command, err)
+		}
+		if pending[0].ModifiesResource != "yes" {
+			t.Fatalf("expected %q to remain a known mutation, got %q", command, pending[0].ModifiesResource)
+		}
+	}
+}
+
+func TestAnalyzeToolCallsDoesNotTreatSafePipelineArgumentsAsMutation(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "bash",
+		Arguments: map[string]any{
+			"command": `bash -c "kubectl get pods -A | grep 'kubectl delete'"`,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if pending[0].ModifiesResource != "no" {
+		t.Fatalf("expected safe grep pipeline to remain read-only, got %q", pending[0].ModifiesResource)
+	}
+}
+
+func TestAnalyzeToolCallsDetectsMutationAfterShellAssignments(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{ReadOnly: true}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "bash",
+		Arguments: map[string]any{
+			"command": `bash -c "KUBECONFIG=/tmp/config NS=tests kubectl delete pod app -n $NS"`,
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if pending[0].ModifiesResource != "yes" {
+		t.Fatalf("expected env-prefixed kubectl delete to be a known mutation, got %q", pending[0].ModifiesResource)
 	}
 }
 
@@ -449,8 +531,8 @@ func TestAnalyzeToolCallsBlocksKubectlApplyAfterReadOnlyPipeline(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("unexpected pending count: %d", len(pending))
 	}
-	if pending[0].ModifiesResource == "no" {
-		t.Fatalf("expected kubectl apply pipeline to be blocked, got %q", pending[0].ModifiesResource)
+	if pending[0].ModifiesResource != "yes" {
+		t.Fatalf("expected kubectl apply pipeline to be a known mutation, got %q", pending[0].ModifiesResource)
 	}
 }
 
@@ -565,6 +647,51 @@ func TestRejectReadOnlyMutationIsUserRequestBlocker(t *testing.T) {
 	}
 }
 
+func TestRejectReadOnlyMixedUnknownAndMutationIsUserRequestBlocker(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{
+		cfg:      &config.Config{ReadOnly: true},
+		registry: registry,
+		state:    StateRunning,
+		output:   make(chan *api.Message, 1),
+	}
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{
+		{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command": `kubectl delete pod app -n tests`,
+			},
+		},
+		{
+			Name: "bash",
+			Arguments: map[string]any{
+				"command": `bash -c "kubectl get secret app -o yaml > /tmp/leak.yaml"`,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	loop.pendingCalls = pending
+	loop.rejectReadOnlyModifyingCalls()
+
+	for _, result := range functionCallResults(t, loop.currChatContent) {
+		if result["retryable"] != false {
+			t.Fatalf("mixed read-only block must not be agent-retryable, got %#v in %#v", result["retryable"], result)
+		}
+		if result["retry_scope"] != "user_request_blocked_by_read_only" {
+			t.Fatalf("retry_scope = %#v, want user_request_blocked_by_read_only in %#v", result["retry_scope"], result)
+		}
+	}
+	text := strings.Join(stringContent(loop.currChatContent), "\n")
+	if !strings.Contains(text, "user/request blocker") {
+		t.Fatalf("expected user/request blocker correction, got %q", text)
+	}
+}
+
 func TestRejectInteractiveToolCallsUsesPolicyBlockOutcome(t *testing.T) {
 	loop := &Loop{
 		cfg:    &config.Config{},
@@ -618,11 +745,21 @@ func stringContent(values []any) []string {
 
 func firstFunctionCallResult(t *testing.T, values []any) map[string]any {
 	t.Helper()
-	for _, value := range values {
-		if result, ok := value.(gollm.FunctionCallResult); ok {
-			return result.Result
-		}
+	results := functionCallResults(t, values)
+	if len(results) > 0 {
+		return results[0]
 	}
 	t.Fatalf("no function call result in %#v", values)
 	return nil
+}
+
+func functionCallResults(t *testing.T, values []any) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, value := range values {
+		if result, ok := value.(gollm.FunctionCallResult); ok {
+			out = append(out, result.Result)
+		}
+	}
+	return out
 }

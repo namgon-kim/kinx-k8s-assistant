@@ -1277,13 +1277,34 @@ func (l *Loop) modifiesResource(parsed *tools.ToolCall, call gollm.FunctionCall)
 	if isObservationToolName(call.Name) {
 		return "no"
 	}
+	toolDecision := parsed.GetTool().CheckModifiesResource(call.Arguments)
+	if toolDecision == "yes" || hasKnownMutatingKubectlInvocation(call) {
+		return "yes"
+	}
 	if hasBlockedReadOnlyFastPathFeature(call) {
 		return "unknown"
 	}
 	if isNonMutatingKubectlInvocation(call) {
 		return "no"
 	}
-	return parsed.GetTool().CheckModifiesResource(call.Arguments)
+	return toolDecision
+}
+
+func hasKnownMutatingKubectlInvocation(call gollm.FunctionCall) bool {
+	script, ok := readonlyShellScriptFromFunctionCall(call)
+	if !ok {
+		return false
+	}
+	commands := splitShellCommandList(script)
+	if len(commands) == 0 {
+		return false
+	}
+	for _, command := range commands {
+		if containsMutatingKubectlCommand(command) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasBlockedReadOnlyFastPathFeature(call gollm.FunctionCall) bool {
@@ -1637,16 +1658,68 @@ func shellWords(command string) []string {
 }
 
 func containsMutatingKubectlVerb(segment string) bool {
-	fields := strings.Fields(strings.ToLower(segment))
-	for i := 0; i < len(fields); i++ {
-		if fields[i] != "kubectl" {
-			continue
-		}
-		if verb, ok := kubectlVerbFromFields(fields, i); ok && isKubectlMutatingVerb(verb) {
+	fields := shellWords(strings.ToLower(segment))
+	kubectlIndex, ok := kubectlExecutableIndexFromFields(fields)
+	if !ok {
+		return false
+	}
+	verb, verbIndex, ok := kubectlVerbAndIndexFromFields(fields, kubectlIndex)
+	if !ok {
+		return false
+	}
+	if isKubectlMutatingVerb(verb) {
+		return true
+	}
+	if subcommand, ok := kubectlSubcommandFromFields(fields, verbIndex); ok && isKubectlMutatingSubcommand(verb, subcommand) {
+		return true
+	}
+	return false
+}
+
+func containsMutatingKubectlCommand(command string) bool {
+	for _, segment := range splitShellPipeline(command) {
+		if containsMutatingKubectlVerb(segment) {
 			return true
 		}
 	}
 	return false
+}
+
+func kubectlExecutableIndexFromFields(fields []string) (int, bool) {
+	for i, field := range fields {
+		field = strings.Trim(field, "'\"")
+		if field == "" {
+			continue
+		}
+		if i == 0 || isShellAssignment(fields[i-1]) {
+			if isShellAssignment(field) {
+				continue
+			}
+		}
+		if field == "kubectl" {
+			return i, true
+		}
+		return -1, false
+	}
+	return -1, false
+}
+
+func isShellAssignment(field string) bool {
+	field = strings.Trim(field, "'\"")
+	if field == "" || strings.HasPrefix(field, "-") {
+		return false
+	}
+	index := strings.IndexByte(field, '=')
+	if index <= 0 {
+		return false
+	}
+	name := field[:index]
+	for i, ch := range name {
+		if !(ch == '_' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || i > 0 && ch >= '0' && ch <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func kubectlVerbFromFields(fields []string, kubectlIndex int) (string, bool) {
@@ -1704,6 +1777,35 @@ func kubectlVerbAndIndexFromFields(fields []string, kubectlIndex int) (string, i
 		return strings.ToLower(field), i, true
 	}
 	return "", -1, false
+}
+
+func kubectlSubcommandFromFields(fields []string, verbIndex int) (string, bool) {
+	if verbIndex < 0 || verbIndex >= len(fields) {
+		return "", false
+	}
+	for i := verbIndex + 1; i < len(fields); i++ {
+		field := strings.Trim(fields[i], "'\"")
+		if field == "" {
+			continue
+		}
+		if strings.HasPrefix(field, "--") {
+			if strings.Contains(field, "=") {
+				continue
+			}
+			if kubectlFlagRequiresValue(field) && i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(field, "-") {
+			if kubectlShortFlagRequiresValue(field) && len(field) == 2 && i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		return strings.ToLower(field), true
+	}
+	return "", false
 }
 
 func kubectlGlobalFlagRequiresValue(flag string) bool {
@@ -1801,11 +1903,31 @@ func kubectlAuthShortFlagRequiresValue(flag string) bool {
 
 func isKubectlMutatingVerb(verb string) bool {
 	switch strings.ToLower(verb) {
-	case "apply", "delete", "patch", "replace", "edit", "scale", "set", "create", "annotate", "label", "cordon", "uncordon", "drain", "taint":
+	case "apply", "delete", "patch", "replace", "edit", "scale", "autoscale", "set", "create",
+		"annotate", "label", "cordon", "uncordon", "drain", "taint", "expose", "run", "exec",
+		"debug", "attach", "cp", "reconcile", "approve", "deny":
 		return true
 	default:
 		return false
 	}
+}
+
+func isKubectlMutatingSubcommand(verb, subcommand string) bool {
+	switch strings.ToLower(verb) {
+	case "rollout":
+		switch strings.ToLower(subcommand) {
+		case "pause", "restart", "resume", "undo":
+			return true
+		}
+	case "auth":
+		return strings.EqualFold(subcommand, "reconcile")
+	case "certificate":
+		switch strings.ToLower(subcommand) {
+		case "approve", "deny":
+			return true
+		}
+	}
+	return false
 }
 
 func isSafeLocalPipelineCommand(command string) bool {
@@ -1852,6 +1974,11 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 			hasKnownMutation = true
 		}
 		descriptions = append(descriptions, call.ParsedToolCall.Description())
+	}
+	for _, call := range l.pendingCalls {
+		if call.ModifiesResource == "no" {
+			continue
+		}
 		errorMessage := "read-only mode is enabled; commands that modify Kubernetes resources are blocked."
 		if call.ModifiesResource == "unknown" {
 			errorMessage = "read-only mode is enabled; command safety could not be verified, so the command was blocked."
@@ -1859,13 +1986,13 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 		l.appendToolObservation(call, map[string]any{
 			"error":              errorMessage,
 			"status":             "blocked",
-			"retryable":          readOnlyBlockRetryable(call.ModifiesResource),
-			"retry_scope":        readOnlyBlockRetryScope(call.ModifiesResource),
+			"retryable":          readOnlyBlockRetryable(call.ModifiesResource, hasKnownMutation),
+			"retry_scope":        readOnlyBlockRetryScope(call.ModifiesResource, hasKnownMutation),
 			"modifies_resource":  call.ModifiesResource,
 			"read_only_mode":     true,
 			"allowed_operation":  "read-only diagnostics such as get, describe, logs, top, events",
 			"blocked_operation":  call.ParsedToolCall.Description(),
-			"suggested_response": readOnlyBlockedSuggestedResponse(call.ModifiesResource),
+			"suggested_response": readOnlyBlockedSuggestedResponse(call.ModifiesResource, hasKnownMutation),
 		})
 	}
 	if len(descriptions) == 0 {
@@ -1907,19 +2034,19 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 	})
 }
 
-func readOnlyBlockedSuggestedResponse(modifiesResource string) string {
-	if modifiesResource == "unknown" {
+func readOnlyBlockedSuggestedResponse(modifiesResource string, hasKnownMutation bool) string {
+	if modifiesResource == "unknown" && !hasKnownMutation {
 		return "Agent retry: replace the blocked command with a concrete read-only kubectl diagnostic, or emit phase_progress if the active phase is complete. Do not finalize solely because this command was blocked."
 	}
 	return "User/request blocker: do not repeat this mutation while read-only mode is enabled. Explain the read-only blocker only when a final response is otherwise appropriate."
 }
 
-func readOnlyBlockRetryable(modifiesResource string) bool {
-	return modifiesResource == "unknown"
+func readOnlyBlockRetryable(modifiesResource string, hasKnownMutation bool) bool {
+	return modifiesResource == "unknown" && !hasKnownMutation
 }
 
-func readOnlyBlockRetryScope(modifiesResource string) string {
-	if modifiesResource == "unknown" {
+func readOnlyBlockRetryScope(modifiesResource string, hasKnownMutation bool) string {
+	if modifiesResource == "unknown" && !hasKnownMutation {
 		return "agent_correct_command"
 	}
 	return "user_request_blocked_by_read_only"

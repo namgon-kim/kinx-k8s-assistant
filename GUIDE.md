@@ -131,7 +131,7 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
 
 **주의:** `/readonly` 변경 후 `/save` 명령으로 저장해야 다음 실행에도 유지됩니다.
 
-read-only 모드는 Kubernetes 리소스 변경 명령을 차단하지만 `kubectl get`, `describe`, `logs`, `top`, `api-resources` 같은 진단 명령은 허용합니다. `kubectl -n <namespace> get ...`처럼 namespace flag가 verb 앞에 있는 명령도 read-only 진단 명령으로 인식합니다. `bash -c`/`bash -lc` 안의 명령이 read-only `kubectl`과 안전한 텍스트 처리 파이프라인으로만 구성된 경우도 진단 명령으로 허용합니다.
+read-only 모드는 Kubernetes 리소스 변경 명령을 차단하지만 `kubectl get`, `describe`, `logs`, `top`, `api-resources` 같은 진단 명령은 허용합니다. `kubectl auth`는 `can-i`와 `whoami`만 read-only로 허용하고, `auth reconcile` 같은 변경 성격의 subcommand는 차단합니다. `kubectl -n <namespace> get ...`처럼 namespace flag가 verb 앞에 있는 명령도 read-only 진단 명령으로 인식합니다. `bash -c`/`bash -lc` 안의 명령이 read-only `kubectl`과 안전한 텍스트 처리 파이프라인으로만 구성된 경우도 진단 명령으로 허용합니다. `$()`, backtick, heredoc, process substitution, shell redirection처럼 안전성이 확인되지 않는 command는 변경 명령과 구분해 agent가 더 구체적인 read-only 명령으로 재시도하게 합니다.
 
 ### 출력 언어
 ```bash
@@ -325,6 +325,8 @@ JSON ReAct shim 사용 시 모델이 최종 답변을 JSON code block 없이 pla
 ## Prompt / tool context 관리
 
 k8s-assistant는 runtime prompt를 section 단위로 조립합니다. core ReAct, output contract, language policy, target/scope 보존, command guideline은 항상 포함하고, read-only, guidance protocol, manifest generation, Cluster API guardrail은 현재 요청과 RAG 결과에 따라 조건부로 포함합니다.
+
+매 iteration 전송 직전에는 `runtime_state`, `requirement_analysis`, `phase_step`, `guide_step`, `mutation_verification` anchor를 prepend해 현재 control state, 원래 요청, active phase, guide progress, 변경 검증 의무가 최근 observation에 묻히지 않게 합니다.
 
 tool schema는 안전성을 위해 pruning하지 않고 등록된 전체 tool set을 유지합니다. 대신 ToolProfile hash를 사용해 동일한 tool schema 조합을 캐싱/참조 가능한 단위로 관리합니다.
 
