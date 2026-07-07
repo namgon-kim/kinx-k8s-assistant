@@ -222,7 +222,7 @@ func main() {
 	f.StringVar(&cfg.SystemLogDir, "log-dir", cfg.SystemLogDir,
 		"k8s-assistant 시스템 로그 디렉토리")
 	f.IntVar(&cfg.LogLevel, "log-level", cfg.LogLevel,
-		"k8s-assistant 시스템 로그 레벨 (기본: 0=info)")
+		"k8s-assistant 시스템 로그 레벨 (0=기본 흐름, 1=상세 상태, 2=추적 상세)")
 	f.BoolVar(&cfg.ShowLogOutput, "show-log-output", cfg.ShowLogOutput,
 		"k8s-assistant 시스템 로그를 콘솔에도 출력")
 
@@ -283,14 +283,25 @@ func setupKlog(cfg *config.Config) (func(), error) {
 	_ = fs.Set("stderrthreshold", "FATAL")
 	_ = fs.Set("v", fmt.Sprintf("%d", cfg.LogLevel))
 
-	klog.Infof("k8s-assistant log started: %s", logFile)
+	klog.V(0).InfoS("k8s-assistant system log started", "file", logFile, "level", cfg.LogLevel, "console", cfg.ShowLogOutput)
 	return func() {
+		klog.V(0).InfoS("k8s-assistant system log stopped", "file", logFile)
 		klog.Flush()
 		_ = f.Close()
 	}, nil
 }
 
 func run(ctx context.Context, cfg *config.Config, initialQuery string) error {
+	klog.V(0).InfoS("k8s-assistant run starting",
+		"provider", cfg.LLMProvider,
+		"model", cfg.Model,
+		"kubeconfig_set", cfg.Kubeconfig != "",
+		"context", cfg.CurrentContext,
+		"read_only", cfg.ReadOnly,
+		"shim", cfg.EnableToolUseShim,
+		"mcp", cfg.MCPClient,
+		"initial_query", strings.TrimSpace(initialQuery) != "",
+	)
 	// 바이너리와 같은 디렉토리의 prompts/default.tmpl 자동 탐색
 	if cfg.PromptTemplateFile == "" {
 		execPath, err := os.Executable()
@@ -298,15 +309,23 @@ func run(ctx context.Context, cfg *config.Config, initialQuery string) error {
 			candidate := filepath.Join(filepath.Dir(execPath), "..", "prompts", "default.tmpl")
 			if _, err := os.Stat(candidate); err == nil {
 				cfg.PromptTemplateFile = candidate
+				klog.V(1).InfoS("default prompt template discovered near executable", "path", cfg.PromptTemplateFile)
 			}
 		}
 	}
+	klog.V(1).InfoS("runtime prompt template selected", "path", cfg.PromptTemplateFile)
 
 	orch, err := orchestrator.New(cfg)
 	if err != nil {
+		klog.ErrorS(err, "orchestrator initialization failed")
 		return fmt.Errorf("orchestrator 초기화 실패: %w", err)
 	}
 	defer orch.Close()
 
-	return orch.Run(ctx, initialQuery)
+	if err := orch.Run(ctx, initialQuery); err != nil {
+		klog.ErrorS(err, "orchestrator run failed")
+		return err
+	}
+	klog.V(0).InfoS("k8s-assistant run completed")
+	return nil
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"k8s.io/klog/v2"
 )
 
 func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
@@ -24,7 +25,14 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 			}
 			analysis = l.applyPriorContextToFollowUpRequirementAnalysis(analysis)
 			l.requirementAnalysis = &analysis
+			klog.V(0).InfoS("requirement analysis accepted",
+				"request_type", analysis.RequestType,
+				"action", analysis.Action,
+				"target_category", analysis.Target.Category,
+				"resources", len(analysis.Resources),
+			)
 			if message, needsClarification := requirementAnalysisClarificationMessage(analysis); needsClarification {
+				klog.V(0).InfoS("requirement analysis needs clarification", "message_len", len(message))
 				l.addMessage(api.MessageSourceModel, api.MessageTypeText, message)
 				l.pendingCalls = nil
 				l.currIteration = 0
@@ -42,6 +50,12 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 				l.requestContext = &request
 				classification := l.classifyResourceByDiscovery(ctx, request.PrimaryTarget.Resource)
 				l.resourceClassification = &classification
+				klog.V(0).InfoS("request context derived from requirement analysis",
+					"primary_resource", request.PrimaryTarget.Resource,
+					"primary_name_set", strings.TrimSpace(request.PrimaryTarget.Name) != "",
+					"namespace_set", strings.TrimSpace(request.Scope.Namespace) != "",
+					"classification", classification.Kind,
+				)
 			}
 			l.currIteration++
 			l.state = StateRunning
@@ -62,6 +76,12 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 		l.requestContext = &request
 		classification := l.classifyResourceByDiscovery(ctx, request.PrimaryTarget.Resource)
 		l.resourceClassification = &classification
+		klog.V(0).InfoS("request context accepted",
+			"primary_resource", request.PrimaryTarget.Resource,
+			"primary_name_set", strings.TrimSpace(request.PrimaryTarget.Name) != "",
+			"namespace_set", strings.TrimSpace(request.Scope.Namespace) != "",
+			"classification", classification.Kind,
+		)
 	}
 	return remaining, false
 }

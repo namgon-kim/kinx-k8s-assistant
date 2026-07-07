@@ -306,6 +306,14 @@ type Orchestrator struct {
 func New(cfg *config.Config) (*Orchestrator, error) {
 	// agent는 나중에 필요할 때 생성 (지연 초기화)
 	// 이렇게 하면 config/context 설정 후에 agent를 초기화할 수 있음
+	klog.V(0).InfoS("orchestrator initializing",
+		"provider", cfg.LLMProvider,
+		"model", cfg.Model,
+		"kubeconfig", cfg.Kubeconfig,
+		"log_file_set", cfg.LogFile != "",
+		"read_only", cfg.ReadOnly,
+		"show_tool_output", cfg.ShowToolOutput,
+	)
 
 	var logger *Logger
 	if cfg.LogFile != "" {
@@ -313,6 +321,8 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		logger, logErr = NewLogger(cfg.LogFile)
 		if logErr != nil {
 			klog.Warningf("로그 파일 열기 실패 (%s): %v", cfg.LogFile, logErr)
+		} else {
+			klog.V(0).InfoS("conversation logger opened", "path", cfg.LogFile)
 		}
 	}
 
@@ -326,6 +336,7 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 			kubeconfigInfo = info
 			cfg.CurrentContext = info.CurrentContext
 			cfg.AvailableContexts = info.Contexts
+			klog.V(0).InfoS("kubeconfig loaded", "path", cfg.Kubeconfig, "current_context", info.CurrentContext, "contexts", len(info.Contexts))
 		}
 	}
 
@@ -352,6 +363,7 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 		AutoComplete:    &metaCmdCompleter{names: cmdNames},
 	})
 	if err != nil {
+		klog.ErrorS(err, "readline initialization failed")
 		return nil, fmt.Errorf("readline 초기화 실패: %w", err)
 	}
 
@@ -370,9 +382,11 @@ func New(cfg *config.Config) (*Orchestrator, error) {
 // Run은 대화 루프를 시작합니다.
 // initialQuery가 비어 있으면 인터랙티브 모드로 동작합니다.
 func (o *Orchestrator) Run(ctx context.Context, initialQuery string) error {
+	klog.V(0).InfoS("orchestrator run loop starting", "initial_query", strings.TrimSpace(initialQuery) != "", "mcp", o.cfg.MCPClient)
 	PrintBanner(o.kubeconfigInfo, o.cfg.Kubeconfig)
 	if o.cfg.MCPClient {
 		if path, err := toolconnector.PrepareKinxMCPClient(); err != nil {
+			klog.ErrorS(err, "MCP client preparation failed")
 			return fmt.Errorf("MCP 클라이언트 준비 실패: %w", err)
 		} else {
 			klog.Infof("MCP 설정 준비 완료: %s", path)
@@ -382,6 +396,7 @@ func (o *Orchestrator) Run(ctx context.Context, initialQuery string) error {
 	initialQuery = strings.TrimSpace(initialQuery)
 	if initialQuery != "" {
 		o.runOnce = true
+		klog.V(0).InfoS("starting one-shot query", "query_len", len(initialQuery))
 		if inputIsQuit(initialQuery) {
 			fmt.Println("종료는 exit 또는 Ctrl+C를 사용하세요.")
 			return nil
@@ -404,11 +419,13 @@ func (o *Orchestrator) Run(ctx context.Context, initialQuery string) error {
 
 		select {
 		case <-ctx.Done():
+			klog.V(0).InfoS("orchestrator context cancelled")
 			fmt.Println("\n👋 종료합니다.")
 			return nil
 
 		case msg, ok := <-o.outputCh:
 			if !ok {
+				klog.V(1).InfoS("agent output channel closed")
 				o.clearAgent()
 				continue
 			}
@@ -435,9 +452,11 @@ func (o *Orchestrator) readAndDispatchInput(ctx context.Context) error {
 
 	input = strings.TrimSpace(input)
 	if input == "" {
+		klog.V(2).InfoS("empty interactive input ignored")
 		return nil
 	}
 	if input == "exit" {
+		klog.V(0).InfoS("interactive exit requested")
 		fmt.Println("👋 종료합니다.")
 		return io.EOF
 	}
@@ -446,6 +465,7 @@ func (o *Orchestrator) readAndDispatchInput(ctx context.Context) error {
 		return nil
 	}
 	if strings.HasPrefix(input, "/") {
+		klog.V(0).InfoS("orchestrator meta command received", "command", input)
 		if err := o.selectMetaCommand(input); err != nil {
 			if err == io.EOF {
 				return io.EOF
@@ -463,6 +483,7 @@ func (o *Orchestrator) readAndDispatchInput(ctx context.Context) error {
 
 	o.logEntry("user_input", input)
 	o.incidentGuidance.ObserveUserInput(input)
+	klog.V(0).InfoS("dispatching user query to agent", "query_len", len(input))
 	return o.startAgent(ctx, input)
 }
 
@@ -475,22 +496,24 @@ func (o *Orchestrator) startAgent(ctx context.Context, initialQuery string) erro
 	}
 	o.incidentGuidance.ObserveUserInput(initialQuery)
 
-	klog.Info("agent 초기화 중...", "kubeconfig", o.cfg.Kubeconfig, "context", o.cfg.CurrentContext)
+	klog.V(0).InfoS("agent initializing", "kubeconfig", o.cfg.Kubeconfig, "context", o.cfg.CurrentContext, "query_len", len(initialQuery))
 	agentWrap, err := react.New(o.cfg)
 	if err != nil {
 		o.agentInitErr = err
+		klog.ErrorS(err, "react loop creation failed")
 		return fmt.Errorf("react loop 생성 실패: %w", err)
 	}
 	if err := agentWrap.Start(ctx, initialQuery); err != nil {
 		agentWrap.Close()
 		o.agentInitErr = err
+		klog.ErrorS(err, "react loop start failed")
 		return fmt.Errorf("react loop 시작 실패: %w", err)
 	}
 
 	o.agentWrap = agentWrap
 	o.outputCh = agentWrap.Output()
 	o.agentInitErr = nil
-	klog.Info("agent 준비 완료", "kubeconfig", o.cfg.Kubeconfig, "context", o.cfg.CurrentContext)
+	klog.V(0).InfoS("agent ready", "kubeconfig", o.cfg.Kubeconfig, "context", o.cfg.CurrentContext)
 	return nil
 }
 
@@ -511,18 +534,20 @@ func (o *Orchestrator) invalidateAgent(reason string) {
 	if o.agentWrap == nil {
 		return
 	}
-	klog.Info("agent invalidated", "reason", reason)
+	klog.V(0).InfoS("agent invalidated", "reason", reason)
 	o.agentWrap.Close()
 	o.clearAgent()
 }
 
 func (o *Orchestrator) clearAgent() {
+	klog.V(1).InfoS("agent references cleared")
 	o.agentWrap = nil
 	o.outputCh = nil
 }
 
 // handleMessage는 Agent Output 채널에서 수신한 메시지를 처리합니다.
 func (o *Orchestrator) handleMessage(msg *api.Message) error {
+	klog.V(2).InfoS("orchestrator handling agent message", "type", msg.Type, "source", msg.Source)
 	switch msg.Type {
 
 	case api.MessageTypeText:
@@ -534,6 +559,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 			return nil
 		}
 		masked := MaskSensitiveData(sanitizeDisplayText(text))
+		klog.V(1).InfoS("agent text message received", "text_len", len(masked))
 		PrintMessage(o.formatter.FormatText(masked))
 		o.logEntry("response", masked)
 		return o.incidentGuidance.AfterAgentText(o, masked)
@@ -544,6 +570,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 			return nil
 		}
 		errText = sanitizeDisplayText(errText)
+		klog.V(0).InfoS("agent error message received", "text_len", len(errText))
 		PrintMessage(o.formatter.FormatError(errText))
 		o.logEntry("error", errText)
 		return nil
@@ -554,18 +581,21 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 			return nil
 		}
 		PrintMessage(o.formatter.FormatToolCall(desc))
+		klog.V(0).InfoS("tool call requested", "description", desc)
 		o.logEntry("tool_call", desc)
 
 	case api.MessageTypeToolCallResponse:
 		resultStr := sanitizeDisplayText(fmt.Sprintf("%v", msg.Payload))
 		masked := MaskSensitiveData(MaskSecretResource(resultStr))
 		refID := o.ctx.AddToolResult("tool", masked)
+		klog.V(0).InfoS("tool result received", "ref_id", refID, "result_len", len(masked))
 		PrintMessage(o.formatter.FormatToolResult(masked, refID))
 		o.logEntry("tool_result", fmt.Sprintf("[%s] %s", refID, masked))
 		o.incidentGuidance.RecordEvidence(masked)
 
 	case api.MessageTypeUserInputRequest:
 		if o.runOnce {
+			klog.V(1).InfoS("one-shot run completed after user input request")
 			o.runOnce = false
 			if o.agentWrap != nil {
 				o.agentWrap.Close()
@@ -591,6 +621,7 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 	if activeAgent == nil {
 		return nil
 	}
+	klog.V(1).InfoS("agent requested free-text input")
 	if o.incidentGuidance.hasPendingOffer() {
 		o.incidentGuidance.deferOffer()
 	}
@@ -619,6 +650,7 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 		}
 		snapshot := activeRuntimeSnapshot(activeAgent)
 		decision := decideOrchestratorInput(snapshot.Control, input)
+		klog.V(1).InfoS("agent input dispatch decision", "control", snapshot.Control, "kind", decision.Kind, "accepted", decision.Accepted, "handler", decision.Handler, "reason", decision.Reason)
 		if !decision.Accepted {
 			fmt.Println(colorBrightMagenta + "❌ 현재 입력 단계에서 사용할 수 없는 입력입니다" + colorReset)
 			continue
@@ -645,6 +677,7 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 
 		o.logEntry("user_input", input)
 		o.incidentGuidance.ObserveUserInput(input)
+		klog.V(0).InfoS("sending user input to active agent", "query_len", len(input), "handler", decision.Handler)
 		activeAgent.SendInput(&api.UserInputResponse{Query: input})
 		return nil
 	}
@@ -655,6 +688,7 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 	if activeAgent == nil {
 		return nil
 	}
+	klog.V(0).InfoS("agent requested user choice", "options", len(choiceReq.Options), "prompt_len", len(choiceReq.Prompt))
 
 	PrintMessage(o.formatter.FormatPropose(choiceReq.Prompt))
 	options := append([]api.UserChoiceOption(nil), choiceReq.Options...)
@@ -697,6 +731,7 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 		inputKind := react.ClassifyUserInput(input)
 		snapshot := activeRuntimeSnapshot(activeAgent)
 		decision := decideOrchestratorInput(snapshot.Control, input)
+		klog.V(1).InfoS("choice input dispatch decision", "control", snapshot.Control, "kind", inputKind, "accepted", decision.Accepted, "handler", decision.Handler, "reason", decision.Reason)
 		if !choiceInputAccepted(inputMode, inputKind, decision) {
 			fmt.Println(colorBrightMagenta + "❌ 유효하지 않은 선택입니다" + colorReset)
 			continue
@@ -711,6 +746,7 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 		choice, err := strconv.Atoi(input)
 		if err == nil && choice == incidentChoice && incidentChoice > 0 {
 			o.logEntry("user_choice", "incident-runbook")
+			klog.V(0).InfoS("user selected incident runbook search")
 			if err := o.incidentGuidance.handleChoiceRunbookSearch(o); err != nil {
 				return err
 			}
@@ -719,6 +755,7 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 		}
 		if err == nil && choice >= 1 && choice <= len(choiceReq.Options) {
 			o.logEntry("user_choice", input)
+			klog.V(0).InfoS("sending user choice to active agent", "choice", choice)
 			if incidentChoice > 0 {
 				o.incidentGuidance.deferOffer()
 			}

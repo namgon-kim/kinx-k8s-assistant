@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"k8s.io/klog/v2"
 )
 
 type GateOutcomeKind string
@@ -120,9 +121,19 @@ func (l *Loop) applyGateOutcome(outcome GateOutcome) bool {
 
 func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repeated func(message string) bool) bool {
 	if outcome.Allow {
+		klog.V(2).InfoS("runtime gate outcome allowed", "code", outcome.Code, "kind", outcome.Kind)
 		return false
 	}
+	klog.V(0).InfoS("runtime gate outcome blocking",
+		"code", outcome.Code,
+		"kind", outcome.Kind,
+		"retryable", outcome.Retryable,
+		"retry_scope", outcome.RetryScope,
+		"branch_policy", outcome.BranchPolicy,
+		"correction_mode", outcome.CorrectionMode,
+	)
 	if err := outcome.Validate(l.RuntimeSnapshot()); err != nil {
+		klog.ErrorS(err, "runtime gate outcome validation failed", "code", outcome.Code, "kind", outcome.Kind)
 		l.pendingCalls = nil
 		l.currIteration = 0
 		l.state = StateDone
@@ -152,6 +163,7 @@ func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repea
 			appended = l.appendCorrectionWithCompaction(code, message)
 		}
 		if !appended {
+			klog.V(0).InfoS("runtime gate correction repeated", "code", code)
 			if repeated != nil {
 				return repeated(message)
 			}
@@ -170,6 +182,7 @@ func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repea
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, strings.TrimSpace(outcome.UserMessage))
 	}
 	if err := l.applyGateBranch(outcome); err != nil {
+		klog.ErrorS(err, "runtime gate branch failed", "code", code, "branch_policy", outcome.BranchPolicy)
 		l.pendingCalls = nil
 		l.currIteration = 0
 		l.state = StateDone
@@ -183,12 +196,14 @@ func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repea
 	// rolled back on failure, so production gates should avoid ExpectedControl
 	// unless the branch outcome is already safe to keep if the assertion fails.
 	if err := outcome.AssertExpectedControl(l.RuntimeSnapshot()); err != nil {
+		klog.ErrorS(err, "runtime gate expected control assertion failed", "code", code, "expected", outcome.ExpectedControl)
 		l.pendingCalls = nil
 		l.currIteration = 0
 		l.state = StateDone
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime gate outcome 적용 후 control assertion이 맞지 않아 루프를 중단했습니다.\n"+err.Error())
 		return true
 	}
+	klog.V(1).InfoS("runtime gate outcome applied", "code", code, "next_iteration", l.currIteration+1)
 	return true
 }
 
