@@ -778,7 +778,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 			return err
 		}
 	}
-	klog.V(0).InfoS("model response received", "duration", time.Since(sendStart), "text_len", len(streamedText), "function_calls", len(functionCalls), "call_names", logFunctionCallNames(functionCalls))
+	klog.V(1).InfoS("model response received", "duration", time.Since(sendStart), "text_len", len(streamedText), "function_calls", len(functionCalls), "call_names", logFunctionCallNames(functionCalls))
 	klog.V(2).InfoS("model response call summaries", "calls", logFunctionCallSummaries(functionCalls))
 	l.noteContextContent(sentContent...)
 	l.currChatContent = nil
@@ -942,7 +942,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		return err
 	}
 	l.pendingCalls = pending
-	klog.V(0).InfoS("tool calls analyzed", "pending", len(pending), "summaries", logPendingCallSummaries(pending))
+	klog.V(1).InfoS("tool calls analyzed", "pending", len(pending), "summaries", logPendingCallSummaries(pending))
 
 	if handled := l.rejectInteractiveToolCalls(); handled {
 		klog.V(0).InfoS("interactive tool calls rejected")
@@ -950,12 +950,14 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	if l.cfg.ReadOnly && l.hasModifyingCalls() {
-		klog.V(0).InfoS("read-only mode blocking modifying tool calls", "pending", logPendingCallSummaries(l.pendingCalls))
+		klog.V(0).InfoS("read-only mode blocking modifying tool calls", "pending", len(l.pendingCalls))
+		klog.V(1).InfoS("read-only blocked call summaries", "pending", logPendingCallSummaries(l.pendingCalls))
 		l.rejectReadOnlyModifyingCalls()
 		return nil
 	}
 	if !l.skipPermissions && l.hasModifyingCalls() {
-		klog.V(0).InfoS("approval required for modifying tool calls", "pending", logPendingCallSummaries(l.pendingCalls))
+		klog.V(0).InfoS("approval required for modifying tool calls", "pending", len(l.pendingCalls))
+		klog.V(1).InfoS("approval required call summaries", "pending", logPendingCallSummaries(l.pendingCalls))
 		l.emitAcceptedProgressText(ctx, deferredProgressText)
 		l.requestApproval()
 		return nil
@@ -2058,7 +2060,8 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 			"suggested_response": readOnlyBlockedSuggestedResponse(call.ModifiesResource, hasKnownMutation),
 		})
 	}
-	klog.V(0).InfoS("read-only modifying calls rejected", "has_unknown", hasUnknown, "has_known_mutation", hasKnownMutation, "descriptions", descriptions)
+	klog.V(0).InfoS("read-only modifying calls rejected", "has_unknown", hasUnknown, "has_known_mutation", hasKnownMutation, "calls", len(descriptions))
+	klog.V(1).InfoS("read-only rejected call summaries", "descriptions", maskedLogStrings(descriptions))
 	if len(descriptions) == 0 {
 		descriptions = append(descriptions, "안전성이 확인되지 않은 명령")
 	}
@@ -2123,7 +2126,8 @@ func (l *Loop) requestApproval() {
 	}
 	prompt := "다음 명령은 실행 전 승인이 필요합니다:\n* " + strings.Join(descriptions, "\n* ")
 	prompt += "\n\n진행할까요?"
-	klog.V(0).InfoS("approval requested", "calls", len(l.pendingCalls), "descriptions", descriptions)
+	klog.V(0).InfoS("approval requested", "calls", len(l.pendingCalls))
+	klog.V(1).InfoS("approval request call summaries", "descriptions", maskedLogStrings(descriptions))
 	l.state = StateWaitingApproval
 	l.refreshInputOwner()
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
@@ -2169,7 +2173,7 @@ func (l *Loop) handleApproval(ctx context.Context, choice int) error {
 }
 
 func (l *Loop) dispatchToolCalls(ctx context.Context) error {
-	klog.V(0).InfoS("tool dispatch starting", "pending", len(l.pendingCalls), "summaries", logPendingCallSummaries(l.pendingCalls))
+	klog.V(1).InfoS("tool dispatch starting", "pending", len(l.pendingCalls), "summaries", logPendingCallSummaries(l.pendingCalls))
 	l.toolDispatchInProgress = true
 	l.refreshInputOwner()
 	defer func() {
@@ -2180,7 +2184,7 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 	for _, call := range l.pendingCalls {
 		description := call.ParsedToolCall.Description()
 		toolStart := time.Now()
-		klog.V(0).InfoS("tool invocation starting", "tool", call.FunctionCall.Name, "description", description, "modifies_resource", call.ModifiesResource)
+		klog.V(1).InfoS("tool invocation starting", "tool", call.FunctionCall.Name, "description", maskForSystemLog(description), "modifies_resource", call.ModifiesResource)
 		l.addMessage(api.MessageSourceModel, api.MessageTypeToolCallRequest, description)
 
 		output, err := call.ParsedToolCall.InvokeTool(ctx, tools.InvokeToolOptions{
@@ -2222,7 +2226,7 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 			failureOutcome = &outcome
 		}
 		status, errText, keys := logResultSummary(result)
-		klog.V(0).InfoS("tool invocation completed", "tool", call.FunctionCall.Name, "duration", time.Since(toolStart), "status", status, "error", errText)
+		klog.V(1).InfoS("tool invocation completed", "tool", call.FunctionCall.Name, "duration", time.Since(toolStart), "status", status, "error", errText)
 		klog.V(2).InfoS("tool result summary", "tool", call.FunctionCall.Name, "keys", keys)
 		l.appendToolObservation(call, result)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, result)

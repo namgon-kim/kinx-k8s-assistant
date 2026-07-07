@@ -465,7 +465,11 @@ func (o *Orchestrator) readAndDispatchInput(ctx context.Context) error {
 		return nil
 	}
 	if strings.HasPrefix(input, "/") {
-		klog.V(0).InfoS("orchestrator meta command received", "command", input)
+		commandName := input
+		if fields := strings.Fields(input); len(fields) > 0 {
+			commandName = fields[0]
+		}
+		klog.V(0).InfoS("orchestrator meta command received", "command", commandName, "input_len", len(input))
 		if err := o.selectMetaCommand(input); err != nil {
 			if err == io.EOF {
 				return io.EOF
@@ -581,7 +585,7 @@ func (o *Orchestrator) handleMessage(msg *api.Message) error {
 			return nil
 		}
 		PrintMessage(o.formatter.FormatToolCall(desc))
-		klog.V(0).InfoS("tool call requested", "description", desc)
+		klog.V(1).InfoS("tool call requested", "description", MaskSensitiveData(desc))
 		o.logEntry("tool_call", desc)
 
 	case api.MessageTypeToolCallResponse:

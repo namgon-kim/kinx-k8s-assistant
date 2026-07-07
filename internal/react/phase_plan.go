@@ -48,7 +48,7 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 		}
 		accepted = &plan
 		l.phaseStepState = newPhaseStepState(plan)
-		klog.V(0).InfoS("phase plan accepted", "request_goal", trimForLog(plan.RequestGoal, 160), "phase_steps", len(plan.PhaseSteps), "current_phase_index", plan.CurrentPhaseIndex)
+		klog.V(1).InfoS("phase plan accepted", "request_goal", trimForLog(plan.RequestGoal, 160), "phase_steps", len(plan.PhaseSteps), "current_phase_index", plan.CurrentPhaseIndex)
 		continue
 	}
 	if accepted != nil {

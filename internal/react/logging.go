@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/masking"
 )
 
 func logStateName(state State) string {
@@ -42,7 +43,7 @@ func logFunctionCallSummaries(calls []gollm.FunctionCall) []string {
 	for _, call := range calls {
 		summary := strings.TrimSpace(call.Name)
 		if command, ok := commandString(call.Arguments["command"]); ok && strings.TrimSpace(command) != "" {
-			summary += " command=" + trimForLog(command, 180)
+			summary += " command=" + trimForLog(masking.MaskSensitiveData(command), 180)
 		}
 		summaries = append(summaries, summary)
 	}
@@ -54,7 +55,7 @@ func logPendingCallSummaries(calls []PendingCall) []string {
 	for _, call := range calls {
 		summary := fmt.Sprintf("%s modifies=%s interactive=%t", call.FunctionCall.Name, call.ModifiesResource, call.IsInteractive)
 		if call.ParsedToolCall != nil {
-			summary += " desc=" + trimForLog(call.ParsedToolCall.Description(), 180)
+			summary += " desc=" + trimForLog(masking.MaskSensitiveData(call.ParsedToolCall.Description()), 180)
 		}
 		summaries = append(summaries, summary)
 	}
@@ -90,8 +91,20 @@ func logMapKeys(values map[string]any) []string {
 	return keys
 }
 
+func maskedLogStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, maskForSystemLog(value))
+	}
+	return out
+}
+
+func maskForSystemLog(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(masking.MaskSensitiveData(value))), " ")
+}
+
 func trimForLog(value string, limit int) string {
-	value = strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	value = maskForSystemLog(value)
 	if limit <= 0 || len(value) <= limit {
 		return value
 	}
