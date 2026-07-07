@@ -116,6 +116,7 @@ type Loop struct {
 	pendingDirectionPrompt       *directionPromptState
 	pendingMutationVerification  *pendingMutationVerification
 	mutationContinuationRequired bool
+	mutationContinuationAttempts int
 	toolDispatchInProgress       bool
 
 	cancel context.CancelFunc
@@ -133,6 +134,7 @@ type guideStepState struct {
 	StepHash     string
 	StepDetails  []guideStepDetail
 	Completed    map[int]bool
+	Skipped      map[int]bool
 }
 
 type guideStepDetail struct {
@@ -149,7 +151,7 @@ func (g *guideStepState) allCompleted() bool {
 		return false
 	}
 	for i := 1; i <= g.TotalSteps; i++ {
-		if !g.Completed[i] {
+		if !g.Completed[i] && !g.Skipped[i] {
 			return false
 		}
 	}
@@ -162,11 +164,54 @@ func (g *guideStepState) remainingSteps() []int {
 	}
 	var remaining []int
 	for i := 1; i <= g.TotalSteps; i++ {
-		if !g.Completed[i] {
+		if !g.Completed[i] && !g.Skipped[i] {
 			remaining = append(remaining, i)
 		}
 	}
 	return remaining
+}
+
+func (g *guideStepState) skippedSteps() []int {
+	if g == nil {
+		return nil
+	}
+	var skipped []int
+	for i := 1; i <= g.TotalSteps; i++ {
+		if g.Skipped[i] {
+			skipped = append(skipped, i)
+		}
+	}
+	return skipped
+}
+
+func (g *guideStepState) stepRuntimeStates(phase PhaseRef) []StepRuntimeState {
+	if g == nil {
+		return nil
+	}
+	remaining := g.remainingSteps()
+	steps := make([]StepRuntimeState, 0, len(g.StepDetails))
+	for _, detail := range g.StepDetails {
+		status := StepPending
+		if g.Completed != nil && g.Completed[detail.Index] {
+			status = StepCompleted
+		} else if g.Skipped != nil && g.Skipped[detail.Index] {
+			status = StepSkipped
+		} else if detail.Index > 0 && len(remaining) > 0 && remaining[0] == detail.Index {
+			status = StepActive
+		}
+		steps = append(steps, StepRuntimeState{
+			Ref: StepRef{
+				Phase: phase,
+				Kind:  StepResourceGuideDiagnostic,
+				Index: detail.Index,
+			},
+			Status:          status,
+			Description:     strings.TrimSpace(detail.Description),
+			Command:         strings.TrimSpace(detail.RenderedCommand),
+			ExpectedOutcome: strings.TrimSpace(detail.ExpectedOutcome),
+		})
+	}
+	return steps
 }
 
 // directionPromptState records the LLM-proposed next_directions options that
@@ -400,6 +445,7 @@ func (l *Loop) waitForInput(ctx context.Context) bool {
 		return false
 	case raw := <-l.input:
 		if raw == io.EOF {
+			l.applyRuntimeCleanup(cleanupExitPolicy())
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "종료합니다.")
 			l.state = StateExited
 			return false
@@ -431,6 +477,7 @@ func (l *Loop) waitForApproval(ctx context.Context) bool {
 		return false
 	case raw := <-l.input:
 		if raw == io.EOF {
+			l.applyRuntimeCleanup(cleanupExitPolicy())
 			l.state = StateExited
 			return false
 		}
@@ -491,6 +538,7 @@ func (l *Loop) startQuery(query string) error {
 	l.pendingDirectionPrompt = nil
 	l.pendingMutationVerification = nil
 	l.mutationContinuationRequired = false
+	l.mutationContinuationAttempts = 0
 	l.state = StateRunning
 	return nil
 }
@@ -538,6 +586,7 @@ func (l *Loop) handleMetaQuery(ctx context.Context, query string) bool {
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "대화 컨텍스트를 초기화했습니다.")
 		return true
 	case "exit", "quit":
+		l.applyRuntimeCleanup(cleanupExitPolicy())
 		l.state = StateExited
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "종료합니다.")
 		return true
@@ -597,6 +646,7 @@ func (l *Loop) clearConversationState() {
 	l.pendingDirectionPrompt = nil
 	l.pendingMutationVerification = nil
 	l.mutationContinuationRequired = false
+	l.mutationContinuationAttempts = 0
 }
 
 func (l *Loop) noteContextContent(contents ...any) {
@@ -685,29 +735,8 @@ func (l *Loop) runIteration(ctx context.Context) error {
 
 	if len(functionCalls) == 0 {
 		if strings.TrimSpace(streamedText) != "" {
-			// Native text fallback intentionally recovers only the minimum
-			// planning gates. Full structured recovery remains owned by native
-			// function calling or shim parsing so runtime-internal calls do not
-			// silently diverge between execution modes.
-			if parsed, err := parseReActResponse(streamedText); err == nil && l.requirementAnalysis == nil && parsed.RequirementAnalysis != nil {
-				functionCalls = []gollm.FunctionCall{{
-					Name:      internalRequirementAnalysisCall,
-					Arguments: requirementAnalysisToArguments(parsed.RequirementAnalysis),
-				}}
-			} else if err == nil && l.requirementAnalysis != nil && l.phaseStepState == nil && parsed.PhasePlan != nil {
-				if args, mapErr := toMap(parsed.PhasePlan); mapErr == nil {
-					functionCalls = []gollm.FunctionCall{{
-						Name:      internalPhasePlanCall,
-						Arguments: args,
-					}}
-				}
-			} else if err == nil && l.phaseStepState != nil && parsed.PhaseProgress != nil {
-				if args, mapErr := toMap(parsed.PhaseProgress); mapErr == nil {
-					functionCalls = []gollm.FunctionCall{{
-						Name:      internalPhaseProgressCall,
-						Arguments: args,
-					}}
-				}
+			if parsed, err := parseReActResponse(streamedText); err == nil {
+				functionCalls = functionCallsFromParsedReActResponse(parsed)
 			}
 		}
 		if len(functionCalls) == 0 && l.requirementAnalysis == nil {
@@ -723,10 +752,10 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	if len(functionCalls) == 0 {
-		if handled := l.rejectPlainAnswerDuringMutationVerification(streamedText); handled {
+		if handled := l.rejectMissingMutationVerificationOnNoCalls(); handled {
 			return nil
 		}
-		if handled := l.rejectPlainAnswerDuringMutationContinuation(streamedText); handled {
+		if handled := l.rejectMutationContinuationOnNoCalls(); handled {
 			return nil
 		}
 		if handled := l.rejectPlainAnswerDuringNextDirections(streamedText); handled {
@@ -825,7 +854,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	var nextDirectionsHandled bool
-	functionCalls, nextDirectionsHandled = l.consumeNextDirections(ctx, functionCalls)
+	functionCalls, nextDirectionsHandled = l.consumeNextDirections(functionCalls)
 	if nextDirectionsHandled {
 		return nil
 	}
@@ -848,21 +877,18 @@ func (l *Loop) runIteration(ctx context.Context) error {
 		return nil
 	}
 
+	if handled := l.rejectNonObservationShellToolCalls(functionCalls); handled {
+		return nil
+	}
+
 	pending, err := l.analyzeToolCalls(ctx, functionCalls)
 	if err != nil {
 		return err
 	}
 	l.pendingCalls = pending
 
-	for _, call := range pending {
-		if call.IsInteractive {
-			errText := call.InteractiveError.Error()
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, errText)
-			l.appendToolObservation(call, map[string]any{"error": errText})
-			l.pendingCalls = nil
-			l.currIteration++
-			return nil
-		}
+	if handled := l.rejectInteractiveToolCalls(); handled {
+		return nil
 	}
 
 	if l.cfg.ReadOnly && l.hasModifyingCalls() {
@@ -885,17 +911,7 @@ func (l *Loop) rejectPlainAnswerDuringNextDirections(text string) bool {
 	}
 	message := "The previous final_report was inconclusive and the runtime requested `next_directions`. Return only a next_directions object with concrete continuation options; do not emit a plain answer yet."
 	l.queueResponseDirective(message)
-	if !l.appendCorrectionWithCompaction("next_directions_required_plain_answer", message) {
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "next_directions 요청이 반복적으로 무시되어 진단을 중단합니다.")
-		l.pendingCalls = nil
-		l.currIteration = 0
-		l.state = StateDone
-		return true
-	}
-	l.pendingCalls = nil
-	l.currIteration++
-	l.state = StateRunning
-	return true
+	return l.applyModelOutputCorrectionGate("next_directions_required_plain_answer", "next_directions 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
 }
 
 func (l *Loop) auditRuntimeState() bool {
@@ -1003,45 +1019,15 @@ func (l *Loop) enforceRequestedStructuredDirective(calls []gollm.FunctionCall) b
 	case snapshot.Control == ControlAwaitingNextDirections && !onlyFunctionCall(calls, internalNextDirectionsCall):
 		message := "The previous final_report was inconclusive and the runtime requested `next_directions`. Return only a next_directions object with concrete continuation options; do not emit action, final_report, phase_progress, or a plain answer yet."
 		l.queueResponseDirective(message)
-		if !l.appendCorrectionWithCompaction("next_directions_required", message) {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "next_directions 요청이 반복적으로 무시되어 진단을 중단합니다.")
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.state = StateDone
-			return true
-		}
-		l.pendingCalls = nil
-		l.currIteration++
-		l.state = StateRunning
-		return true
+		return l.applyModelOutputCorrectionGate("next_directions_required", "next_directions 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
 	case snapshot.Control == ControlAwaitingGuidedPhaseProgress && !onlyFunctionCall(calls, internalPhaseProgressCall):
 		message := "The runtime already requested `phase_progress` for the completed guided_diagnosis phase. Do not emit another action. Return only a phase_progress object completing guided_diagnosis."
 		l.queueResponseDirective(message)
-		if !l.appendCorrectionWithCompaction("guided_phase_progress_required", message) {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "guided_diagnosis phase_progress 요청이 반복적으로 무시되어 진단을 중단합니다.")
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.state = StateDone
-			return true
-		}
-		l.pendingCalls = nil
-		l.currIteration++
-		l.state = StateRunning
-		return true
+		return l.applyModelOutputCorrectionGate("guided_phase_progress_required", "guided_diagnosis phase_progress 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
 	case snapshot.Control == ControlAwaitingFinalReport && !onlyFunctionCall(calls, internalFinalReportCall):
 		message := "The runtime already requested `final_report` after completing the resource-guide diagnostic steps. Do not emit another action. Return only a final_report object."
 		l.queueResponseDirective(message)
-		if !l.appendCorrectionWithCompaction("final_report_required", message) {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "final_report 요청이 반복적으로 무시되어 진단을 중단합니다.")
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.state = StateDone
-			return true
-		}
-		l.pendingCalls = nil
-		l.currIteration++
-		l.state = StateRunning
-		return true
+		return l.applyModelOutputCorrectionGate("final_report_required", "final_report 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
 	}
 	return false
 }
@@ -1062,19 +1048,102 @@ func (l *Loop) rejectConversationalToolCalls(calls []gollm.FunctionCall) bool {
 			continue
 		}
 		message := "The accepted requirement_analysis is a conversation/clarification request. Do not call shell, bash, kubectl, echo, or any other tool to ask the user a question. Return a plain assistant answer/question directly, or complete the clarification phase with phase_progress when the user's intent is already clear."
-		if !l.appendCorrectionWithCompaction("conversation_tool_call", message) {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "대화/확인 요청에서 tool call이 반복되어 진단을 중단합니다.")
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.state = StateDone
-			return true
-		}
-		l.pendingCalls = nil
-		l.currIteration++
-		l.state = StateRunning
-		return true
+		return l.applyModelOutputCorrectionGate("conversation_tool_call", "대화/확인 요청에서 tool call이 반복되어 진단을 중단합니다.", message)
 	}
 	return false
+}
+
+func (l *Loop) rejectNonObservationShellToolCalls(calls []gollm.FunctionCall) bool {
+	for _, call := range calls {
+		command, ok := selfTalkShellCommand(call)
+		if !ok {
+			continue
+		}
+		message := fmt.Sprintf("The previous action was rejected before execution because it does not observe cluster state. Command %q only prints or waits locally, so it is assistant self-talk, not a diagnostic command. Retry with one of these valid next outputs: emit phase_progress if the current planning phase is complete, or emit one real read-only kubectl action if more evidence is needed. Do not return final_report yet unless the active phase allows it and enough evidence is already available.", command)
+		return l.applyGateOutcome(GateOutcome{
+			Kind:            GateOutcomeAgentCommandRetry,
+			Code:            "non_observation_shell_action",
+			Retryable:       true,
+			RetryScope:      RetryScopeAgentCommand,
+			UserVisible:     true,
+			UserMessage:     "관찰이 없는 shell action을 실행하지 않고 다음 응답을 재요청합니다:\n* " + command,
+			ModelCorrection: message,
+			CorrectionMode:  CorrectionModeAppendCompacted,
+			BranchPolicy:    BranchRetryStep,
+		})
+	}
+	return false
+}
+
+func (l *Loop) rejectInteractiveToolCalls() bool {
+	var descriptions []string
+	for _, call := range l.pendingCalls {
+		if !call.IsInteractive {
+			continue
+		}
+		errText := "interactive command cannot run in this non-interactive session"
+		if call.InteractiveError != nil {
+			errText = call.InteractiveError.Error()
+		}
+		descriptions = append(descriptions, call.FunctionCall.Name+": "+errText)
+		l.appendToolObservation(call, map[string]any{
+			"error":              errText,
+			"status":             "blocked",
+			"policy":             "interactive_command_blocked",
+			"retryable":          true,
+			"retry_scope":        "agent_correct_command",
+			"suggested_response": "Retry with a non-interactive command that observes the same evidence or performs the same safe operation without prompting for stdin/TTY input.",
+		})
+	}
+	if len(descriptions) == 0 {
+		return false
+	}
+	message := "The previous tool call requires interactive input and cannot run in this non-interactive ReAct loop. Retry with one non-interactive command that observes the same evidence or performs the same safe operation without stdin/TTY prompts. Do not ask the user to run the blocked command unless no safe non-interactive alternative exists."
+	return l.applyGateOutcome(GateOutcome{
+		Kind:            GateOutcomePolicyBlock,
+		Code:            "interactive_command_blocked",
+		Retryable:       true,
+		RetryScope:      RetryScopeAgentCommand,
+		UserVisible:     true,
+		UserMessage:     "interactive command를 실행하지 않고 non-interactive 대안을 재요청합니다:\n* " + strings.Join(descriptions, "\n* "),
+		ModelCorrection: message,
+		CorrectionMode:  CorrectionModeAppendCompacted,
+		BranchPolicy:    BranchRetryStep,
+	})
+}
+
+func selfTalkShellCommand(call gollm.FunctionCall) (string, bool) {
+	command, ok := commandString(call.Arguments["command"])
+	if !ok {
+		return "", false
+	}
+	script := strings.TrimSpace(command)
+	if extracted, ok := extractShellScript(script); ok {
+		script = extracted
+	}
+	commands := splitShellCommandList(script)
+	if len(commands) == 0 {
+		commands = []string{script}
+	}
+	for _, candidate := range commands {
+		fields := shellWords(candidate)
+		if len(fields) == 0 {
+			continue
+		}
+		if !isSelfTalkShellProgram(fields[0]) {
+			return "", false
+		}
+	}
+	return command, true
+}
+
+func isSelfTalkShellProgram(program string) bool {
+	switch strings.Trim(strings.ToLower(program), "'\"") {
+	case "echo", "printf", "true", "false", "sleep", "read":
+		return true
+	default:
+		return false
+	}
 }
 
 func (l *Loop) requirementAnalysisNeedsDirectConversation() bool {
@@ -1208,13 +1277,34 @@ func (l *Loop) modifiesResource(parsed *tools.ToolCall, call gollm.FunctionCall)
 	if isObservationToolName(call.Name) {
 		return "no"
 	}
+	toolDecision := parsed.GetTool().CheckModifiesResource(call.Arguments)
+	if toolDecision == "yes" || hasKnownMutatingKubectlInvocation(call) {
+		return "yes"
+	}
 	if hasBlockedReadOnlyFastPathFeature(call) {
 		return "unknown"
 	}
 	if isNonMutatingKubectlInvocation(call) {
 		return "no"
 	}
-	return parsed.GetTool().CheckModifiesResource(call.Arguments)
+	return toolDecision
+}
+
+func hasKnownMutatingKubectlInvocation(call gollm.FunctionCall) bool {
+	script, ok := readonlyShellScriptFromFunctionCall(call)
+	if !ok {
+		return false
+	}
+	commands := splitShellCommandList(script)
+	if len(commands) == 0 {
+		return false
+	}
+	for _, command := range commands {
+		if containsMutatingKubectlCommand(command) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasBlockedReadOnlyFastPathFeature(call gollm.FunctionCall) bool {
@@ -1568,16 +1658,68 @@ func shellWords(command string) []string {
 }
 
 func containsMutatingKubectlVerb(segment string) bool {
-	fields := strings.Fields(strings.ToLower(segment))
-	for i := 0; i < len(fields); i++ {
-		if fields[i] != "kubectl" {
-			continue
-		}
-		if verb, ok := kubectlVerbFromFields(fields, i); ok && isKubectlMutatingVerb(verb) {
+	fields := shellWords(strings.ToLower(segment))
+	kubectlIndex, ok := kubectlExecutableIndexFromFields(fields)
+	if !ok {
+		return false
+	}
+	verb, verbIndex, ok := kubectlVerbAndIndexFromFields(fields, kubectlIndex)
+	if !ok {
+		return false
+	}
+	if isKubectlMutatingVerb(verb) {
+		return true
+	}
+	if subcommand, ok := kubectlSubcommandFromFields(fields, verbIndex); ok && isKubectlMutatingSubcommand(verb, subcommand) {
+		return true
+	}
+	return false
+}
+
+func containsMutatingKubectlCommand(command string) bool {
+	for _, segment := range splitShellPipeline(command) {
+		if containsMutatingKubectlVerb(segment) {
 			return true
 		}
 	}
 	return false
+}
+
+func kubectlExecutableIndexFromFields(fields []string) (int, bool) {
+	for i, field := range fields {
+		field = strings.Trim(field, "'\"")
+		if field == "" {
+			continue
+		}
+		if i == 0 || isShellAssignment(fields[i-1]) {
+			if isShellAssignment(field) {
+				continue
+			}
+		}
+		if field == "kubectl" {
+			return i, true
+		}
+		return -1, false
+	}
+	return -1, false
+}
+
+func isShellAssignment(field string) bool {
+	field = strings.Trim(field, "'\"")
+	if field == "" || strings.HasPrefix(field, "-") {
+		return false
+	}
+	index := strings.IndexByte(field, '=')
+	if index <= 0 {
+		return false
+	}
+	name := field[:index]
+	for i, ch := range name {
+		if !(ch == '_' || ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || i > 0 && ch >= '0' && ch <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func kubectlVerbFromFields(fields []string, kubectlIndex int) (string, bool) {
@@ -1635,6 +1777,35 @@ func kubectlVerbAndIndexFromFields(fields []string, kubectlIndex int) (string, i
 		return strings.ToLower(field), i, true
 	}
 	return "", -1, false
+}
+
+func kubectlSubcommandFromFields(fields []string, verbIndex int) (string, bool) {
+	if verbIndex < 0 || verbIndex >= len(fields) {
+		return "", false
+	}
+	for i := verbIndex + 1; i < len(fields); i++ {
+		field := strings.Trim(fields[i], "'\"")
+		if field == "" {
+			continue
+		}
+		if strings.HasPrefix(field, "--") {
+			if strings.Contains(field, "=") {
+				continue
+			}
+			if kubectlFlagRequiresValue(field) && i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(field, "-") {
+			if kubectlShortFlagRequiresValue(field) && len(field) == 2 && i+1 < len(fields) {
+				i++
+			}
+			continue
+		}
+		return strings.ToLower(field), true
+	}
+	return "", false
 }
 
 func kubectlGlobalFlagRequiresValue(flag string) bool {
@@ -1732,11 +1903,31 @@ func kubectlAuthShortFlagRequiresValue(flag string) bool {
 
 func isKubectlMutatingVerb(verb string) bool {
 	switch strings.ToLower(verb) {
-	case "apply", "delete", "patch", "replace", "edit", "scale", "set", "create", "annotate", "label", "cordon", "uncordon", "drain", "taint":
+	case "apply", "delete", "patch", "replace", "edit", "scale", "autoscale", "set", "create",
+		"annotate", "label", "cordon", "uncordon", "drain", "taint", "expose", "run", "exec",
+		"debug", "attach", "cp":
 		return true
 	default:
 		return false
 	}
+}
+
+func isKubectlMutatingSubcommand(verb, subcommand string) bool {
+	switch strings.ToLower(verb) {
+	case "rollout":
+		switch strings.ToLower(subcommand) {
+		case "pause", "restart", "resume", "undo":
+			return true
+		}
+	case "auth":
+		return strings.EqualFold(subcommand, "reconcile")
+	case "certificate":
+		switch strings.ToLower(subcommand) {
+		case "approve", "deny":
+			return true
+		}
+	}
+	return false
 }
 
 func isSafeLocalPipelineCommand(command string) bool {
@@ -1772,14 +1963,22 @@ func (l *Loop) hasModifyingCalls() bool {
 func (l *Loop) rejectReadOnlyModifyingCalls() {
 	var descriptions []string
 	hasUnknown := false
+	hasKnownMutation := false
 	for _, call := range l.pendingCalls {
 		if call.ModifiesResource == "no" {
 			continue
 		}
 		if call.ModifiesResource == "unknown" {
 			hasUnknown = true
+		} else {
+			hasKnownMutation = true
 		}
 		descriptions = append(descriptions, call.ParsedToolCall.Description())
+	}
+	for _, call := range l.pendingCalls {
+		if call.ModifiesResource == "no" {
+			continue
+		}
 		errorMessage := "read-only mode is enabled; commands that modify Kubernetes resources are blocked."
 		if call.ModifiesResource == "unknown" {
 			errorMessage = "read-only mode is enabled; command safety could not be verified, so the command was blocked."
@@ -1787,32 +1986,70 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 		l.appendToolObservation(call, map[string]any{
 			"error":              errorMessage,
 			"status":             "blocked",
-			"retryable":          false,
+			"retryable":          readOnlyBlockRetryable(call.ModifiesResource, hasKnownMutation),
+			"retry_scope":        readOnlyBlockRetryScope(call.ModifiesResource, hasKnownMutation),
 			"modifies_resource":  call.ModifiesResource,
 			"read_only_mode":     true,
 			"allowed_operation":  "read-only diagnostics such as get, describe, logs, top, events",
 			"blocked_operation":  call.ParsedToolCall.Description(),
-			"suggested_response": "Return one final answer now. Explain that read-only mode blocks this change, state the observed cause and evidence once, and provide the manual recommendation once. Do not issue the same mutating action again.",
+			"suggested_response": readOnlyBlockedSuggestedResponse(call.ModifiesResource, hasKnownMutation),
 		})
 	}
 	if len(descriptions) == 0 {
 		descriptions = append(descriptions, "안전성이 확인되지 않은 명령")
 	}
 	headline := "read-only 모드가 활성화되어 리소스 변경 명령을 차단했습니다"
+	code := "readonly_mutation_blocked"
+	correction := "Read-only mode blocked a command that can modify Kubernetes resources. This is a user/request blocker, not an agent retry. Do not repeat the same mutation. If the user asked for a change, explain that read-only mode blocks it and provide one manual recommendation."
 	if hasUnknown {
-		headline = "read-only 모드가 활성화되어 안전성이 확인되지 않은 명령을 차단했습니다"
+		headline = "안전한 read-only 진단 명령으로 확인되지 않아 실행하지 않았습니다"
+	}
+	if hasUnknown && hasKnownMutation {
+		headline = "read-only 모드에서 변경 명령과 안전성이 확인되지 않은 명령을 차단했습니다"
+	}
+	if hasUnknown && !hasKnownMutation {
+		code = "readonly_unknown_command_blocked"
+		correction = "The runtime did not execute the previous command because it could not verify it as a safe Kubernetes diagnostic. This is an agent retry, not a user-request blocker. Retry with one real read-only kubectl command such as get, describe, logs, top, api-resources, api-versions, version, config, or auth can-i/whoami. If the active phase is complete, emit phase_progress. Do not return final_report only because this command was blocked."
 	}
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeError, headline+":\n* "+strings.Join(descriptions, "\n* "))
-	if !l.appendCorrection("readonly_mutation_blocked", "Read-only mode blocked the proposed mutation. Do not repeat the same action or restate the same recommendation in another loop. Your next response must be a single final answer with the cause, evidence, and one manual recommendation.") {
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "read-only 차단 correction이 반복되어 진단을 중단합니다.")
-		l.pendingCalls = nil
-		l.currIteration = 0
-		l.state = StateDone
-		return
+	kind := GateOutcomeUserRequestBlocked
+	retryable := false
+	retryScope := RetryScopeUserRequest
+	branch := BranchBlockUserRequest
+	if hasUnknown && !hasKnownMutation {
+		kind = GateOutcomeAgentCommandRetry
+		retryable = true
+		retryScope = RetryScopeAgentCommand
+		branch = BranchRetryStep
 	}
-	l.pendingCalls = nil
-	l.currIteration++
-	l.state = StateRunning
+	l.applyGateOutcome(GateOutcome{
+		Kind:            kind,
+		Code:            code,
+		Retryable:       retryable,
+		RetryScope:      retryScope,
+		UserMessage:     "read-only 차단 correction이 반복되어 진단을 중단합니다.",
+		ModelCorrection: correction,
+		CorrectionMode:  CorrectionModeAppendPlain,
+		BranchPolicy:    branch,
+	})
+}
+
+func readOnlyBlockedSuggestedResponse(modifiesResource string, hasKnownMutation bool) string {
+	if modifiesResource == "unknown" && !hasKnownMutation {
+		return "Agent retry: replace the blocked command with a concrete read-only kubectl diagnostic, or emit phase_progress if the active phase is complete. Do not finalize solely because this command was blocked."
+	}
+	return "User/request blocker: do not repeat this mutation while read-only mode is enabled. Explain the read-only blocker only when a final response is otherwise appropriate."
+}
+
+func readOnlyBlockRetryable(modifiesResource string, hasKnownMutation bool) bool {
+	return modifiesResource == "unknown" && !hasKnownMutation
+}
+
+func readOnlyBlockRetryScope(modifiesResource string, hasKnownMutation bool) string {
+	if modifiesResource == "unknown" && !hasKnownMutation {
+		return "agent_correct_command"
+	}
+	return "user_request_blocked_by_read_only"
 }
 
 func (l *Loop) requestApproval() {
@@ -1854,7 +2091,7 @@ func (l *Loop) handleApproval(ctx context.Context, choice int) error {
 			})
 		}
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "사용자가 작업 실행을 거부했습니다.")
-		l.pendingCalls = nil
+		l.applyRuntimeCleanup(cleanupApprovalDeclinedPolicy())
 		l.currIteration++
 		l.state = StateRunning
 	default:
@@ -1870,6 +2107,7 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 		l.toolDispatchInProgress = false
 		l.refreshInputOwner()
 	}()
+	var failureOutcome *GateOutcome
 	for _, call := range l.pendingCalls {
 		description := call.ParsedToolCall.Description()
 		l.addMessage(api.MessageSourceModel, api.MessageTypeToolCallRequest, description)
@@ -1880,16 +2118,38 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 			Executor:   l.executor,
 		})
 		if err != nil {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, err.Error())
-			return err
+			if ctx.Err() != nil {
+				return err
+			}
+			result := toolFailureResultFromError(err)
+			if outcome, failed := l.annotateToolFailureResult(call, result); failed && failureOutcome == nil {
+				failureOutcome = &outcome
+			}
+			l.appendToolObservation(call, result)
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, result)
+			break
 		}
 
 		result, err := tools.ToolResultToMap(output)
 		if err != nil {
-			return err
+			result = toolFailureResultFromMapError(err)
+			if outcome, failed := l.annotateToolFailureResult(call, result); failed && failureOutcome == nil {
+				failureOutcome = &outcome
+			}
+			l.appendToolObservation(call, result)
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, result)
+			break
+		}
+		if outcome, failed := l.annotateToolFailureResult(call, result); failed && failureOutcome == nil {
+			failureOutcome = &outcome
 		}
 		l.appendToolObservation(call, result)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, result)
+	}
+
+	if failureOutcome != nil {
+		l.applyGateOutcome(*failureOutcome)
+		return nil
 	}
 
 	l.pendingCalls = nil
@@ -1920,6 +2180,7 @@ func (l *Loop) recordAction(call PendingCall, result map[string]any) {
 	command, _ := commandString(call.FunctionCall.Arguments["command"])
 	target, ok := actionTargetFromFunctionCall(call.FunctionCall)
 	l.actionSeq++
+	phase := l.currentPhaseRef()
 	record := actionRecord{
 		Step:       l.actionSeq,
 		Tool:       call.FunctionCall.Name,
@@ -1927,6 +2188,9 @@ func (l *Loop) recordAction(call PendingCall, result map[string]any) {
 		ResultHash: contextHash(fmt.Sprintf("%v", result)),
 		Result:     compactObservationResult(result),
 		Clues:      extractObservationClues(result),
+	}
+	if phase.Index != 0 || strings.TrimSpace(phase.Name) != "" {
+		record.Phase = &phase
 	}
 	if ok {
 		record.Target = &target
@@ -1954,27 +2218,11 @@ func (l *Loop) consumeGuideProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 		}
 		handled = true
 		if !l.guideProgressAllowedForCurrentPhase() {
-			if !l.appendCorrectionWithCompaction("guide_progress_wrong_phase", "guide_progress is only valid while a resource guide is active inside guided_diagnosis. Continue the current phase with a valid structured output or action.") {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "잘못된 phase의 guide_progress가 반복되어 진단을 중단합니다.")
-				l.currIteration = 0
-				l.state = StateDone
-				return remaining, true
-			}
-			l.currIteration++
-			l.state = StateRunning
-			return remaining, true
+			return remaining, l.applyModelOutputCorrectionGate("guide_progress_wrong_phase", "잘못된 phase의 guide_progress가 반복되어 진단을 중단합니다.", "guide_progress is only valid while a resource guide is active inside guided_diagnosis. Continue the current phase with a valid structured output or action.")
 		}
 		step, ok := guideStepCompletedFromArguments(call.Arguments)
 		if !ok {
-			if !l.appendCorrectionWithCompaction("invalid_guide_progress", "guide_progress payload was invalid. Return guide_progress with step_completed as a positive 1-based guide step index and evidence_useful=true only when live evidence advanced that step.") {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "guide_progress 형식 오류가 반복되어 진단을 중단합니다.")
-				l.currIteration = 0
-				l.state = StateDone
-				return remaining, true
-			}
-			l.currIteration++
-			l.state = StateRunning
-			return remaining, true
+			return remaining, l.applyModelOutputCorrectionGate("invalid_guide_progress", "guide_progress 형식 오류가 반복되어 진단을 중단합니다.", "guide_progress payload was invalid. Return guide_progress with step_completed as a positive 1-based guide step index and evidence_useful=true only when live evidence advanced that step.")
 		}
 		completedAll := l.markGuideStepCompleted(step)
 		l.currChatContent = append(l.currChatContent, gollm.FunctionCallResult{

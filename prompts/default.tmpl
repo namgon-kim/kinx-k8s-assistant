@@ -241,7 +241,8 @@ Keep Kubernetes resource names, field names, command names, flags, error message
 - For Kubernetes resource observation, prefer API-object evidence (`get`, `describe`, status, conditions, spec, metadata, events, owner/dependent references, and related resources). Do not use logs as a default resource-observation step.
 - Use `kubectl logs` only when the user explicitly asks for logs/log analysis, or when prior live evidence or guide context identifies a concrete log-bearing Pod, container, or controller as the diagnostic target.
 - If the user asks for a change, explain that read-only mode blocks the operation and provide the exact manual command or recommendation without executing it.
-- After read-only mode blocks a proposed mutation, do not retry the mutation and do not keep restating the same recommendation. Return one final answer with the cause, evidence, and one manual recommendation, then stop.
+- After read-only mode blocks a proposed mutation, do not retry the mutation and do not keep restating the same recommendation. Return a final answer with the cause, evidence, and one manual recommendation only when the active phase can be completed from current evidence.
+- If the runtime blocks a command because it is not verified as a safe diagnostic, retry with a concrete read-only `kubectl` diagnostic or emit `phase_progress` when the active phase is complete. Do not use `echo`, `printf`, or local shell output to print plans, explanations, or next steps.
 - Set `modifies_resource` to `yes` or `unknown` for any potentially mutating command so the runtime can block it.
 - Do not use shell evaluation syntax in read-only diagnostics: command substitution `$()`, backtick substitution, heredoc, and process substitution are blocked. Rewrite such commands as plain read-only kubectl commands and safe text-processing pipelines.
 {{end}}

@@ -80,6 +80,29 @@ func (s RuntimeSnapshot) writeRuntimePhaseSummary(b *strings.Builder) {
 	if current.CompletionCondition != "" {
 		fmt.Fprintf(b, "current_phase_completion_condition: %s\n", current.CompletionCondition)
 	}
+	if len(current.Steps) > 0 {
+		b.WriteString("current_phase_declared_steps:\n")
+		for _, step := range current.Steps {
+			ref := step.ID
+			if ref == "" && step.Index > 0 {
+				ref = fmt.Sprintf("%d", step.Index)
+			}
+			var details []string
+			if step.Kind != "" {
+				details = append(details, "kind="+step.Kind)
+			}
+			if step.Description != "" {
+				details = append(details, "description="+step.Description)
+			}
+			if step.Command != "" {
+				details = append(details, "command="+step.Command)
+			}
+			if step.ExpectedOutcome != "" {
+				details = append(details, "expected_outcome="+step.ExpectedOutcome)
+			}
+			fmt.Fprintf(b, "- %s: %s\n", ref, strings.Join(details, "; "))
+		}
+	}
 	if len(current.AllowedNext) > 0 {
 		fmt.Fprintf(b, "allowed_next_phases: %s\n", strings.Join(current.AllowedNext, ","))
 	}
@@ -101,6 +124,9 @@ func (s RuntimeSnapshot) writeRuntimeNestedStateSummary(b *strings.Builder) {
 		return
 	}
 	if s.Guide != nil {
+		if skipped := s.Guide.skippedSteps(); len(skipped) > 0 {
+			fmt.Fprintf(b, "skipped_guide_step_indices: %s\n", formatStepIndices(skipped))
+		}
 		if remaining := s.Guide.remainingSteps(); len(remaining) > 0 {
 			fmt.Fprintf(b, "remaining_guide_step_indices: %s\n", formatStepIndices(remaining))
 			fmt.Fprintf(b, "next_guide_step_index: %d\n", remaining[0])

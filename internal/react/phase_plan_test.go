@@ -34,6 +34,84 @@ func TestPhasePlanValidAllowsForwardEdges(t *testing.T) {
 	}
 }
 
+func TestPhasePlanValidAllowsOptionalExplicitSteps(t *testing.T) {
+	plan := phasePlan{
+		RequestGoal:       "diagnose",
+		CurrentPhaseIndex: 1,
+		PhaseSteps: []phaseStep{
+			{
+				Index:               1,
+				Name:                "observation_execution",
+				Goal:                "observe",
+				CompletionCondition: "observed",
+				Steps: []phaseExecutionStep{
+					{
+						ID:              "list_pods",
+						Kind:            "observation",
+						Description:     "List pods in the requested namespace",
+						Command:         "kubectl get pods -n app",
+						ExpectedOutcome: "pod status is visible",
+					},
+				},
+			},
+		},
+	}
+	if !phasePlanValid(plan) {
+		t.Fatal("phase plan with optional explicit steps should be valid")
+	}
+}
+
+func TestPhasePlanValidRejectsMalformedOptionalExplicitSteps(t *testing.T) {
+	plan := phasePlan{
+		RequestGoal:       "diagnose",
+		CurrentPhaseIndex: 1,
+		PhaseSteps: []phaseStep{
+			{
+				Index:               1,
+				Name:                "observation_execution",
+				Goal:                "observe",
+				CompletionCondition: "observed",
+				Steps: []phaseExecutionStep{
+					{Description: "missing stable id or index"},
+				},
+			},
+		},
+	}
+	if phasePlanValid(plan) {
+		t.Fatal("phase plan with malformed optional explicit steps should be invalid")
+	}
+}
+
+func TestPhasePlanValidRejectsDuplicateOptionalExplicitStepRefs(t *testing.T) {
+	plan := phasePlan{
+		RequestGoal:       "diagnose",
+		CurrentPhaseIndex: 1,
+		PhaseSteps: []phaseStep{
+			{
+				Index:               1,
+				Name:                "observation_execution",
+				Goal:                "observe",
+				CompletionCondition: "observed",
+				Steps: []phaseExecutionStep{
+					{ID: "same", Description: "first observation"},
+					{ID: "same", Description: "second observation"},
+				},
+			},
+		},
+	}
+	if phasePlanValid(plan) {
+		t.Fatal("phase plan with duplicate explicit step ids should be invalid")
+	}
+
+	plan.PhaseSteps[0].Steps = []phaseExecutionStep{
+		{Index: 1, Description: "first observation"},
+		{Index: 1, Description: "second observation"},
+	}
+	if phasePlanValid(plan) {
+		t.Fatal("phase plan with duplicate explicit step indices should be invalid")
+	}
+}
+
 func TestValidatePhasePlanForRequestRequiresMutationVerification(t *testing.T) {
 	loop := &Loop{requirementAnalysis: &requirementAnalysis{
 		RequestType: "mutation",

@@ -21,54 +21,18 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 			continue
 		}
 		if !l.phaseAllowsResourceGuideLookup() {
-			if !l.appendCorrectionWithCompaction("resource_guide_wrong_phase", "Resource guide lookup is only allowed from the guidance_lookup phase after observation evidence is available. Complete or advance the current phase with phase_progress, or continue the active phase with the next safest diagnostic.") {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "잘못된 phase의 resource_guide_lookup 요청이 반복되어 진단을 중단합니다.")
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return true
-			}
-			l.currIteration++
-			l.state = StateRunning
-			return true
+			return l.applyModelOutputCorrectionGate("resource_guide_wrong_phase", "잘못된 phase의 resource_guide_lookup 요청이 반복되어 진단을 중단합니다.", "Resource guide lookup is only allowed from the guidance_lookup phase after observation evidence is available. Complete or advance the current phase with phase_progress, or continue the active phase with the next safest diagnostic.")
 		}
 		request, ok := resourceGuideLookupFromFunctionCall(call)
 		if !ok {
-			if !l.appendCorrectionWithCompaction("invalid_resource_guide_lookup", "Resource guide lookup request was invalid. Continue with the next safest kubectl diagnostic.") {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "resource_guide_lookup 형식 오류가 반복되어 진단을 중단합니다.")
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return true
-			}
-			l.currIteration++
-			l.state = StateRunning
-			return true
+			return l.applyModelOutputCorrectionGate("invalid_resource_guide_lookup", "resource_guide_lookup 형식 오류가 반복되어 진단을 중단합니다.", "Resource guide lookup request was invalid. Continue with the next safest kubectl diagnostic.")
 		}
 		if l.resourceClassification == nil || l.resourceClassification.Kind != resourceClassificationCRD {
-			if !l.appendCorrectionWithCompaction("resource_guide_without_confirmed_crd", "Resource guide lookup is only available after runtime discovery confirms the primary target is a CRD. Continue with the next safest kubectl diagnostic and do not infer a CRD or Cluster API family from the name alone.") {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "확인되지 않은 CRD resource_guide_lookup 요청이 반복되어 진단을 중단합니다.")
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return true
-			}
-			l.currIteration++
-			l.state = StateRunning
-			return true
+			return l.applyModelOutputCorrectionGate("resource_guide_without_confirmed_crd", "확인되지 않은 CRD resource_guide_lookup 요청이 반복되어 진단을 중단합니다.", "Resource guide lookup is only available after runtime discovery confirms the primary target is a CRD. Continue with the next safest kubectl diagnostic and do not infer a CRD or Cluster API family from the name alone.")
 		}
 		query := l.resourceGuideRefinementQuery(request)
 		if l.resourceGuideQueryAlreadyUsed(query) {
-			if !l.appendCorrectionWithCompaction("duplicate_resource_guide_lookup", "That refined resource-guide lookup was already performed for the same problem focus and evidence. Do not repeat it; choose the next kubectl diagnostic or answer from the evidence.") {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "중복 resource_guide_lookup 요청이 반복되어 진단을 중단합니다.")
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return true
-			}
-			l.currIteration++
-			l.state = StateRunning
-			return true
+			return l.applyModelOutputCorrectionGate("duplicate_resource_guide_lookup", "중복 resource_guide_lookup 요청이 반복되어 진단을 중단합니다.", "That refined resource-guide lookup was already performed for the same problem focus and evidence. Do not repeat it; choose the next kubectl diagnostic or answer from the evidence.")
 		}
 		l.searchAndInjectResourceGuide(ctx, request.ResourceFamily, query)
 		return true
@@ -95,17 +59,7 @@ func (l *Loop) rejectActionDuringGuidanceLookupWithoutGuide(calls []gollm.Functi
 			continue
 		}
 		message := "Active phase is guidance_lookup for a CRD-backed primary target. This phase must request a top-level `resource_guide_lookup` before any kubectl action. Return one `resource_guide_lookup` object for the accepted primary resource and operational problem focus."
-		if !l.appendCorrectionWithCompaction("guidance_lookup_action_before_lookup", message) {
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "resource_guide_lookup 전 kubectl action이 반복되어 진단을 중단합니다:\n"+message)
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.state = StateDone
-			return true
-		}
-		l.pendingCalls = nil
-		l.currIteration++
-		l.state = StateRunning
-		return true
+		return l.applyModelOutputCorrectionGate("guidance_lookup_action_before_lookup", "resource_guide_lookup 전 kubectl action이 반복되어 진단을 중단합니다.", message)
 	}
 	return false
 }
@@ -185,16 +139,7 @@ func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.Guide
 			l.guideStepState = nil
 			l.phaseStepState = nil
 			message := "A resource guide was found, but the accepted phase_plan has no guided_diagnosis phase_step. Return one corrected phase_plan that declares guidance_lookup, guided_diagnosis, and the final response phase as explicit phase_steps before using guide steps. guidance_step entries can run only inside a declared guided_diagnosis phase_step."
-			if !l.appendCorrectionWithCompaction("guided_diagnosis_phase_missing", message) {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "guided_diagnosis phase 누락 오류가 반복되어 진단을 중단합니다:\n"+message)
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return false
-			}
-			l.pendingCalls = nil
-			l.currIteration++
-			l.state = StateRunning
+			l.applyModelOutputCorrectionGate("guided_diagnosis_phase_missing", "guided_diagnosis phase 누락 오류가 반복되어 진단을 중단합니다.", message)
 			return false
 		}
 	}
@@ -277,20 +222,6 @@ func (l *Loop) resetChatSessionPreservingCurrentContent() error {
 	l.currChatContent = current
 	l.contextBlockHashes = hashes
 	return nil
-}
-
-func (l *Loop) resourceGuideQuery(resource string) string {
-	lines := []string{l.originalQuery, "observed custom resource: " + resource}
-	if l.resourceClassification != nil {
-		lines = append(lines,
-			"resource classification: "+l.resourceClassification.Kind,
-			"classification source: "+l.resourceClassification.Source,
-		)
-		if l.resourceClassification.APIGroup != "" {
-			lines = append(lines, "api group: "+l.resourceClassification.APIGroup)
-		}
-	}
-	return strings.Join(append(lines, l.resourceGuideEvidence...), "\n")
 }
 
 func (l *Loop) resourceGuideRefinementQuery(request resourceGuideLookup) string {
@@ -551,6 +482,7 @@ func (l *Loop) buildGuideStepState(found *guidance.GuideSearchResult) *guideStep
 		Title:      c.Title,
 		TotalSteps: len(c.DiagnosticSteps),
 		Completed:  map[int]bool{},
+		Skipped:    map[int]bool{},
 	}
 	for i, step := range c.DiagnosticSteps {
 		desc := strings.TrimSpace(step.Description)

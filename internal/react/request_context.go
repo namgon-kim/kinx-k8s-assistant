@@ -20,16 +20,7 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 			analysis, ok := requirementAnalysisFromFunctionCall(call)
 			if !ok {
 				message := "Requirement analysis was invalid. Return only one corrected requirement_analysis object before choosing any action. Identify request_type, action, target.category, target.description, scope.type, resource_candidates, optional operational_focus, evidence_needs, constraints, and ambiguities. Do not classify broad cluster/environment requests as Kubernetes Cluster resources unless the user names a concrete Cluster object."
-				if !l.appendCorrectionWithCompaction("invalid_requirement_analysis", message) {
-					l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 requirement analysis 오류로 루프를 중단했습니다:\n"+message)
-					l.pendingCalls = nil
-					l.currIteration = 0
-					l.state = StateDone
-					return nil, true
-				}
-				l.currIteration++
-				l.state = StateRunning
-				return nil, true
+				return nil, l.applyModelOutputCorrectionGate("invalid_requirement_analysis", "반복된 requirement analysis 오류로 루프를 중단했습니다.", message)
 			}
 			analysis = l.applyPriorContextToFollowUpRequirementAnalysis(analysis)
 			l.requirementAnalysis = &analysis
@@ -66,16 +57,7 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 		request, ok := requestContextFromFunctionCall(call)
 		if !ok {
 			message := "Request context was invalid. Return only one corrected request_context object before choosing any action. Namespace is a scope field unless the user explicitly asks about a Namespace object; do not set primary_target.resource=namespace while also setting scope.namespace. Do not use primary_target.resource=unknown; resource_class=unknown is allowed only as a classification hint. If no concrete resource kind is identifiable, return a final answer asking for clarification instead of inventing a kubectl action."
-			if !l.appendCorrectionWithCompaction("invalid_request_context", message) {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 request context 오류로 루프를 중단했습니다:\n"+message)
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.state = StateDone
-				return nil, true
-			}
-			l.currIteration++
-			l.state = StateRunning
-			return nil, true
+			return nil, l.applyModelOutputCorrectionGate("invalid_request_context", "반복된 request context 오류로 루프를 중단했습니다.", message)
 		}
 		l.requestContext = &request
 		classification := l.classifyResourceByDiscovery(ctx, request.PrimaryTarget.Resource)
@@ -525,17 +507,6 @@ func stringSliceFromArgument(value any) []string {
 	return out
 }
 
-func requirementAnalysisToArguments(analysis *requirementAnalysis) map[string]any {
-	if analysis == nil {
-		return nil
-	}
-	args, err := toMap(analysis)
-	if err != nil {
-		return nil
-	}
-	return args
-}
-
 func (l *Loop) requireRequirementAnalysisBeforeAction(calls []gollm.FunctionCall) bool {
 	if l.requirementAnalysis != nil {
 		return false
@@ -546,17 +517,7 @@ func (l *Loop) requireRequirementAnalysisBeforeAction(calls []gollm.FunctionCall
 		}
 	}
 	message := "The first response for this user request must be only a requirement_analysis object. Identify request_type, action, target.category, target.description, scope.type, resource_candidates, optional operational_focus, evidence_needs, constraints, and ambiguities before selecting any tool, resource guide lookup, or final answer. Do not turn a broad cluster/environment target into a Kubernetes Cluster resource unless the user names a concrete Cluster object."
-	if !l.appendCorrectionWithCompaction("missing_requirement_analysis", message) {
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "반복된 requirement analysis 누락으로 루프를 중단했습니다:\n"+message)
-		l.pendingCalls = nil
-		l.currIteration = 0
-		l.state = StateDone
-		return true
-	}
-	l.pendingCalls = nil
-	l.currIteration++
-	l.state = StateRunning
-	return true
+	return l.applyModelOutputCorrectionGate("missing_requirement_analysis", "반복된 requirement analysis 누락으로 루프를 중단했습니다.", message)
 }
 
 func requestContextFromFunctionCall(call gollm.FunctionCall) (requestContext, bool) {
@@ -645,6 +606,9 @@ func (l *Loop) guideStepAnchor() string {
 		fmt.Fprintf(&b, "guide_title: %s\n", state.Title)
 	}
 	fmt.Fprintf(&b, "steps_completed: %d / %d\n", completed, state.TotalSteps)
+	if skipped := state.skippedSteps(); len(skipped) > 0 {
+		fmt.Fprintf(&b, "steps_skipped: %s\n", formatStepIndices(skipped))
+	}
 	if state.StepFilePath != "" {
 		fmt.Fprintf(&b, "step_store: %s\n", state.StepFilePath)
 	}
@@ -723,27 +687,4 @@ func (l *Loop) requirementAnalysisAnchor() string {
 	b.WriteString("- Do not silently switch the diagnosis subject because a status string mentions another resource kind. If live evidence implies a different operational focus on the same target family, use `resource_guide_lookup` instead of pivoting the target.\n")
 	b.WriteString("- Before emitting `action`, mentally check whether it serves this anchor. If it does not, choose a different action or return a final answer that addresses the original_query.")
 	return b.String()
-}
-
-func (l *Loop) initialResourceGuideQuery(request requestContext) string {
-	lines := []string{
-		l.originalQuery,
-		"primary target resource: " + request.PrimaryTarget.Resource,
-	}
-	if l.resourceClassification != nil {
-		lines = append(lines,
-			"resource classification: "+l.resourceClassification.Kind,
-			"classification source: "+l.resourceClassification.Source,
-		)
-		if l.resourceClassification.APIGroup != "" {
-			lines = append(lines, "api group: "+l.resourceClassification.APIGroup)
-		}
-	}
-	if request.PrimaryTarget.Name != "" {
-		lines = append(lines, "primary target name: "+request.PrimaryTarget.Name)
-	}
-	if request.Scope.Namespace != "" {
-		lines = append(lines, "scope namespace: "+request.Scope.Namespace)
-	}
-	return strings.Join(lines, "\n")
 }

@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
-	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 )
 
 type pendingMutationVerification struct {
@@ -13,6 +12,7 @@ type pendingMutationVerification struct {
 	MutationCommand string
 	Requirements    []mutationEvidenceRequirement
 	Satisfied       map[string]bool
+	Skipped         map[string]bool
 	AwaitingResult  bool
 }
 
@@ -24,6 +24,8 @@ type mutationEvidenceRequirement struct {
 	SuggestedCommand string
 }
 
+const maxMutationContinuationAttempts = 3
+
 func (l *Loop) mutationVerificationAnchor() string {
 	if l.pendingMutationVerification == nil {
 		return ""
@@ -31,18 +33,18 @@ func (l *Loop) mutationVerificationAnchor() string {
 	return "Active mutation verification obligation:\n" + l.pendingMutationVerification.requiredMessage()
 }
 
-func (l *Loop) rejectPlainAnswerDuringMutationVerification(text string) bool {
+func (l *Loop) rejectMissingMutationVerificationOnNoCalls() bool {
 	if l.pendingMutationVerification == nil {
 		return false
 	}
-	return l.rejectMissingMutationVerification("mutation_verification_required_plain_answer")
+	return l.rejectMissingMutationVerification("mutation_verification_required_no_call")
 }
 
-func (l *Loop) rejectPlainAnswerDuringMutationContinuation(text string) bool {
+func (l *Loop) rejectMutationContinuationOnNoCalls() bool {
 	if !l.mutationContinuationRequired {
 		return false
 	}
-	return l.rejectMutationContinuationRequired("mutation_continuation_required_plain_answer")
+	return l.rejectMutationContinuationRequired("mutation_continuation_required_no_call")
 }
 
 func (l *Loop) enforceMutationContinuation(calls []gollm.FunctionCall) bool {
@@ -60,17 +62,7 @@ func (l *Loop) enforceMutationContinuation(calls []gollm.FunctionCall) bool {
 
 func (l *Loop) rejectMutationContinuationRequired(kind string) bool {
 	message := "The previous mutation verification result was progressing or unresolved. Continue the ReAct loop with the next best action based on the verification evidence; do not emit final_report, phase_progress, next_directions, or a plain answer yet."
-	if !l.appendCorrectionWithCompaction(kind, message) {
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "mutation continuation 요구가 반복적으로 무시되어 루프를 중단했습니다:\n"+message)
-		l.pendingCalls = nil
-		l.currIteration = 0
-		l.state = StateDone
-		return true
-	}
-	l.pendingCalls = nil
-	l.currIteration++
-	l.state = StateRunning
-	return true
+	return l.applyModelOutputCorrectionGate(kind, "mutation continuation 요구가 반복적으로 무시되어 루프를 중단했습니다.", message)
 }
 
 func (l *Loop) enforcePendingMutationVerification(calls []gollm.FunctionCall) bool {
@@ -95,17 +87,7 @@ func (l *Loop) rejectMissingMutationVerification(kind string) bool {
 		return false
 	}
 	message := verification.requiredMessage()
-	if !l.appendCorrectionWithCompaction(kind, message) {
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "mutation verification 요구가 반복적으로 무시되어 루프를 중단했습니다:\n"+message)
-		l.pendingCalls = nil
-		l.currIteration = 0
-		l.state = StateDone
-		return true
-	}
-	l.pendingCalls = nil
-	l.currIteration++
-	l.state = StateRunning
-	return true
+	return l.applyModelOutputCorrectionGate(kind, "mutation verification 요구가 반복적으로 무시되어 루프를 중단했습니다.", message)
 }
 
 func (l *Loop) consumeMutationVerificationResult(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
@@ -119,39 +101,22 @@ func (l *Loop) consumeMutationVerificationResult(calls []gollm.FunctionCall) ([]
 			continue
 		}
 		if l.pendingMutationVerification == nil || !l.pendingMutationVerification.AwaitingResult {
-			if !l.appendCorrectionWithCompaction("unexpected_mutation_verification_result", "mutation_verification_result is only valid immediately after all required mutation verification evidence has been collected. Continue with the active phase using a valid action, phase_progress, or final_report.") {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "unexpected mutation_verification_result가 반복되어 루프를 중단했습니다.")
-				l.currIteration = 0
-				l.state = StateDone
-				return remaining, true
-			}
-			l.currIteration++
-			l.state = StateRunning
-			return remaining, true
+			return remaining, l.applyModelOutputCorrectionGate("unexpected_mutation_verification_result", "unexpected mutation_verification_result가 반복되어 루프를 중단했습니다.", "mutation_verification_result is only valid immediately after all required mutation verification evidence has been collected. Continue with the active phase using a valid action, phase_progress, or final_report.")
 		}
 		result, ok := mutationVerificationResultFromFunctionCall(call)
 		if !ok {
-			if !l.appendCorrectionWithCompaction("invalid_mutation_verification_result", "mutation_verification_result payload was invalid. Return status as one of resolved, progressing, or unresolved. Include evidence_summary and a next_action when status is progressing or unresolved.") {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "mutation_verification_result 형식 오류가 반복되어 루프를 중단했습니다.")
-				l.currIteration = 0
-				l.state = StateDone
-				return remaining, true
-			}
-			l.currIteration++
-			l.state = StateRunning
-			return remaining, true
+			return remaining, l.applyModelOutputCorrectionGate("invalid_mutation_verification_result", "mutation_verification_result 형식 오류가 반복되어 루프를 중단했습니다.", "mutation_verification_result payload was invalid. Return status as one of resolved, progressing, or unresolved. Include evidence_summary and a next_action when status is progressing or unresolved.")
 		}
 		l.pendingMutationVerification = nil
 		switch result.Status {
 		case "resolved":
 			l.mutationContinuationRequired = false
+			l.mutationContinuationAttempts = 0
 			l.queueResponseDirective("Mutation verification result is resolved. You may now complete the active phase or emit a final_report grounded in the verification evidence. Do not claim more than the evidence supports.")
 		case "progressing":
-			l.mutationContinuationRequired = true
-			l.queueResponseDirective(mutationContinuationDirective(result))
+			l.requestMutationContinuationOrBudgetReport(result)
 		case "unresolved":
-			l.mutationContinuationRequired = true
-			l.queueResponseDirective(mutationContinuationDirective(result))
+			l.requestMutationContinuationOrBudgetReport(result)
 		}
 		l.currChatContent = append(l.currChatContent, gollm.FunctionCallResult{
 			ID:   call.ID,
@@ -184,6 +149,43 @@ func mutationContinuationDirective(result mutationVerificationResult) string {
 	}
 	if next := strings.TrimSpace(result.NextAction); next != "" {
 		fmt.Fprintf(&b, "\nmodel_proposed_next_action: %s", next)
+	}
+	return b.String()
+}
+
+func (l *Loop) requestMutationContinuationOrBudgetReport(result mutationVerificationResult) {
+	attempt, exhausted := l.consumeMutationContinuationAttempt()
+	if exhausted {
+		l.mutationContinuationRequired = false
+		l.guidedPhaseProgressRequested = false
+		l.finalReportRequested = true
+		l.queueResponseDirective(mutationContinuationBudgetExhaustedDirective(result, attempt))
+		return
+	}
+	l.mutationContinuationRequired = true
+	directive := mutationContinuationDirective(result)
+	if directive != "" {
+		directive = fmt.Sprintf("%s\nrecheck_attempt: %d/%d", directive, attempt, maxMutationContinuationAttempts)
+	}
+	l.queueResponseDirective(directive)
+}
+
+func (l *Loop) consumeMutationContinuationAttempt() (int, bool) {
+	l.mutationContinuationAttempts++
+	if l.mutationContinuationAttempts > maxMutationContinuationAttempts {
+		return maxMutationContinuationAttempts, true
+	}
+	return l.mutationContinuationAttempts, false
+}
+
+func mutationContinuationBudgetExhaustedDirective(result mutationVerificationResult, attempts int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Mutation verification continuation budget is exhausted after %d recheck attempts. Your next response MUST be exactly one final_report object with conclusive=false. Summarize the mutation verification evidence, state that the external state did not settle within the runtime recheck budget, and recommend the next manual or follow-up observation. Do not emit another action, phase_progress, next_directions, or plain answer.", attempts)
+	if next := strings.TrimSpace(result.NextAction); next != "" {
+		fmt.Fprintf(&b, "\nlast_model_proposed_next_action: %s", next)
+	}
+	if reason := strings.TrimSpace(result.Reason); reason != "" {
+		fmt.Fprintf(&b, "\nlast_reason: %s", reason)
 	}
 	return b.String()
 }
@@ -251,9 +253,38 @@ func (v pendingMutationVerification) remainingRequirements() []mutationEvidenceR
 		if v.Satisfied != nil && v.Satisfied[req.ID] {
 			continue
 		}
+		if v.Skipped != nil && v.Skipped[req.ID] {
+			continue
+		}
 		out = append(out, req)
 	}
 	return out
+}
+
+func (v pendingMutationVerification) stepRuntimeStates(phase PhaseRef) []StepRuntimeState {
+	steps := make([]StepRuntimeState, 0, len(v.Requirements))
+	for _, req := range v.Requirements {
+		status := StepPending
+		if v.Satisfied != nil && v.Satisfied[req.ID] {
+			status = StepCompleted
+		} else if v.Skipped != nil && v.Skipped[req.ID] {
+			status = StepSkipped
+		} else if !v.AwaitingResult {
+			status = StepActive
+		}
+		steps = append(steps, StepRuntimeState{
+			Ref: StepRef{
+				Phase: phase,
+				Kind:  StepMutationEvidenceRequirement,
+				ID:    strings.TrimSpace(req.ID),
+			},
+			Status:          status,
+			Description:     strings.TrimSpace(req.Purpose),
+			Command:         strings.TrimSpace(req.SuggestedCommand),
+			ExpectedOutcome: strings.TrimSpace(req.Kind),
+		})
+	}
+	return steps
 }
 
 func (v pendingMutationVerification) allSatisfied() bool {
@@ -268,6 +299,7 @@ func (l *Loop) trackMutationVerification(call PendingCall, result map[string]any
 		if l.shouldStartMutationVerification(call, result) {
 			if verification, ok := l.mutationVerificationFromCall(call); ok {
 				l.mergeMutationVerification(verification)
+				l.mutationContinuationAttempts = 0
 			}
 			return
 		}
@@ -290,11 +322,13 @@ func (l *Loop) trackMutationVerification(call PendingCall, result map[string]any
 		return
 	}
 	l.pendingMutationVerification = &verification
+	l.mutationContinuationAttempts = 0
 }
 
 func (l *Loop) mergeMutationVerification(next pendingMutationVerification) {
 	if l.pendingMutationVerification == nil {
 		l.pendingMutationVerification = &next
+		l.mutationContinuationAttempts = 0
 		return
 	}
 	if next.MutationCommand != "" {
@@ -307,15 +341,23 @@ func (l *Loop) mergeMutationVerification(next pendingMutationVerification) {
 	if l.pendingMutationVerification.Satisfied == nil {
 		l.pendingMutationVerification.Satisfied = map[string]bool{}
 	}
+	if l.pendingMutationVerification.Skipped == nil {
+		l.pendingMutationVerification.Skipped = map[string]bool{}
+	}
 	seen := map[string]bool{}
 	for _, req := range l.pendingMutationVerification.Requirements {
 		seen[req.ID] = true
 	}
+	expanded := false
 	for _, req := range next.Requirements {
 		if !seen[req.ID] {
 			l.pendingMutationVerification.Requirements = append(l.pendingMutationVerification.Requirements, req)
 			seen[req.ID] = true
+			expanded = true
 		}
+	}
+	if expanded {
+		l.mutationContinuationAttempts = 0
 	}
 }
 
@@ -370,6 +412,7 @@ func (l *Loop) mutationVerificationFromCall(call PendingCall) (pendingMutationVe
 		MutationCommand: command,
 		Requirements:    requirements,
 		Satisfied:       map[string]bool{},
+		Skipped:         map[string]bool{},
 	}
 	return verification, true
 }
@@ -386,6 +429,11 @@ func (l *Loop) mutationVerificationCallsMatch(calls []gollm.FunctionCall) bool {
 	satisfied := map[string]bool{}
 	for key, value := range l.pendingMutationVerification.Satisfied {
 		satisfied[key] = value
+	}
+	for key, value := range l.pendingMutationVerification.Skipped {
+		if value {
+			satisfied[key] = true
+		}
 	}
 	for _, call := range calls {
 		reqID, ok := l.mutationVerificationCallMatchIDWithSatisfied(call, satisfied)
@@ -417,6 +465,9 @@ func (l *Loop) mutationVerificationCallMatchIDWithSatisfied(call gollm.FunctionC
 	bestScore := -1
 	for _, req := range verification.Requirements {
 		if satisfied != nil && satisfied[req.ID] {
+			continue
+		}
+		if verification.Skipped != nil && verification.Skipped[req.ID] {
 			continue
 		}
 		if evidenceRequirementMatchesCommand(req, command) {
@@ -560,12 +611,15 @@ func toolResultSucceeded(result map[string]any) bool {
 	if result == nil {
 		return false
 	}
+	if isPartialToolResult(result) {
+		return false
+	}
 	if err, ok := result["error"].(string); ok && strings.TrimSpace(err) != "" {
 		return false
 	}
 	status, _ := result["status"].(string)
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "blocked", "declined", "denied", "failed", "failure", "error":
+	case "blocked", "declined", "denied", "failed", "failure", "error", "partial", "partial_success", "partially_succeeded":
 		return false
 	default:
 		return true

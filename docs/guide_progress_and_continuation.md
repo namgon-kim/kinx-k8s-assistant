@@ -45,7 +45,7 @@ The model completes a phase with `phase_progress`. Runtime must not use `guide_p
 
 ### guide_step anchor (L2, nested)
 
-Re-emits a compact progress representation of the active resource guide. This anchor exists only when the active `phase_step` is `guided_diagnosis`. The full guide body is still injected only once via `appendGuideObservation`. The complete diagnostic step list is persisted in a workspace-local temporary step store; each iteration carries only the progress counters and the next step detail needed for the current action.
+Re-emits a compact progress representation of the active resource guide. This anchor exists only when the active `phase_step` is `guided_diagnosis`. The full guide body is still injected only once via `appendGuideObservation`. The diagnostic step list is stored in `guideStepState.StepDetails`; each iteration carries only the progress counters and the next step detail needed for the current action.
 
 Format (rendered each iteration):
 
@@ -54,21 +54,19 @@ Active resource-guide progress. Continue following this guide unless final_repor
 guide_id: <id>
 guide_title: <title>
 steps_completed: <done> / <total>
-step_store: <workdir>/guides/guide-steps-<hash>.json
-step_store_hash: sha256:<hash>
 remaining_step_indices: 3,4,5
 next_step_index: 3
 next_step_description: Inspect Cluster conditions and synchronization annotations
 next_step_command_template: kubectl -n <ns> get cluster <name> -o yaml
 next_step_expected_outcome: Conditions identify the reconciliation blocker
 Rules:
-- For each action, set action.guide_progress.step_completed to the 1-based step index this action advances, and action.guide_progress.evidence_useful to whether the observation moved diagnosis forward.
+- After useful live evidence advances a guide step, emit `guide_progress.step_completed` with the 1-based step index and `guide_progress.evidence_useful=true`.
 - Follow next_step unless live evidence makes it redundant; if skipping, explain why and mark only the step that was actually advanced.
 - Do not invent step indices outside remaining_step_indices.
-- When every step is completed (or further steps are clearly redundant for the live evidence), emit final_report instead of another action.
+- When every step is completed (or further steps are clearly redundant for the live evidence), complete the parent `guided_diagnosis` phase with `phase_progress`; the runtime may then request `final_report`.
 ```
 
-`guideStepState` is built from `GuideCase.DiagnosticSteps` at the moment the guide is injected. Only the top case is tracked because the runtime injects one case at a time. The runtime stores the full diagnostic step payload in `step_store` for bookkeeping, but the model does not need the full list in every iteration.
+`guideStepState` is built from `GuideCase.DiagnosticSteps` at the moment the guide is injected. Only the top case is tracked because the runtime injects one case at a time. The runtime stores the diagnostic step payload in `guideStepState.StepDetails` and exposes current progress through the runtime snapshot/anchor; the model does not need the full list in every iteration.
 
 `guideStepState` is scoped to the current `guided_diagnosis` `phase_step`. When every nested guide step is completed, the model should complete the parent `guided_diagnosis` phase with `phase_progress` and move to `final_report`.
 
@@ -100,31 +98,27 @@ Self-reported progress for the active top-level `phase_step`. This is separate f
 
 `phase_progress` owns the parent workflow. `guide_progress` owns nested guide diagnostic steps only.
 
-### `action.guide_progress`
+### `guide_progress`
 
-Self-reported nested guide progress for the action that the model is emitting. This field is valid only while the active top-level phase is `guided_diagnosis`.
+Self-reported nested guide progress. This field is valid only while the active top-level phase is `guided_diagnosis`.
+
+In native function-calling mode, guide progress is a separate runtime-internal function call named `__guide_progress__`; it is not part of the real `kubectl` or `bash` tool schema. In shim mode, the parser accepts top-level `guide_progress` and also preserves backward compatibility for `action.guide_progress` by folding it into the same internal guide-progress call. Duplicate guide progress from the same shim response is not emitted twice.
 
 ```json
 {
-  "action": {
-    "name": "kubectl",
-    "command": "kubectl -n <ns> get cluster <name> -o yaml",
-    "modifies_resource": "no",
-    "guide_progress": {
-      "step_completed": 1,
-      "evidence_useful": true
-    }
-    /* ...other fields... */
+  "guide_progress": {
+    "step_completed": 1,
+    "evidence_useful": true
   }
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `step_completed` | 1-based index of the guide step this action advances. Omit when no guide is active. |
+| `step_completed` | 1-based index of the guide step advanced by live evidence. Omit when no guide is active. |
 | `evidence_useful` | True when the previous observation moved diagnosis forward. Omit when no guide is active. |
 
-When this field is present and the tool observation is useful, `recordAction` calls `markGuideStepCompleted(step)`. If the model omits `action.guide_progress`, the runtime may infer completion only for the current next guide step when the executed command matches that step's command template. Observations with explicit errors or statuses such as `blocked`, `declined`, `failed`, or `error` do not complete guide steps.
+When this field is present and the referenced evidence is useful, `consumeGuideProgress` calls `markGuideStepCompleted(step)`. If the model omits explicit guide progress, the runtime may infer completion only for the current next guide step when the executed command matches that step's command template. Observations with explicit errors or statuses such as `blocked`, `declined`, `failed`, or `error` do not complete guide steps.
 
 When `guideStepState.allCompleted()` becomes true, the model should emit `phase_progress` for the parent `guided_diagnosis` phase and then proceed to `final_report`. Runtime may request a final report as a safety fallback, but the conceptual transition is phase-level, not guide-step-level.
 
@@ -267,10 +261,10 @@ New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirec
 | `internal/react/loop.go` | State enum, `phaseStepState`, `guideStepState`, mutation verification state, anchor wiring (`buildIterationSendContent`), phase and guide step completion bookkeeping. |
 | `internal/react/request_context.go`, `internal/react/phase_plan.go` | `requirementAnalysisAnchor()`, `phaseStepAnchor()`, `guideStepAnchor()`. |
 | `internal/react/mutation_lifecycle.go` | Goal-level mutation verification requirements, verification result consumption, and continuation enforcement after unresolved/progressing remediation. |
-| `internal/react/resource_guidance.go` | `buildGuideStepState` builds nested guide progress from `GuideCase.DiagnosticSteps` and persists the full step details to `step_store` when the guide is injected under `guided_diagnosis`. |
+| `internal/react/resource_guidance.go` | `buildGuideStepState` builds nested guide progress from `GuideCase.DiagnosticSteps` and stores step details in `guideStepState` when the guide is injected under `guided_diagnosis`. |
 | `internal/react/final_report.go` | `requestFinalReportFromModel`, `consumeFinalReport`, `renderFinalReport`, `requestNextDirectionsFromModel`. |
 | `internal/react/next_directions.go` | `consumeNextDirections`, `promptDirectionChoice`, `waitForDirectionChoice`, `waitForDirectionText`, `applyDirectionOption`. |
-| `internal/react/shim.go` | Target top-level shim fields: `phase_plan`, `phase_progress`, `action.guide_progress`, `mutation_verification_result`, `final_report`, `next_directions`. |
+| `internal/react/shim.go` | Target shim fields: `phase_plan`, `phase_progress`, `guide_progress`, backward-compatible `action.guide_progress`, `mutation_verification_result`, `final_report`, `next_directions`. |
 | `prompts/default.tmpl`, `prompts/system_ko.tmpl` | Output schemas and model rules for phase planning, phase progress, nested guide progress, and final reporting. |
 
 ## Design constraints honored
@@ -292,7 +286,7 @@ New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirec
 - `mutationContinuationRequired` is set after `mutation_verification_result.status=progressing` or `unresolved`. It prevents `final_report`, `phase_progress`, and `next_directions` until at least one further ReAct action is taken.
 - `pendingDirectionPrompt` is non-nil only while in `StateWaitingDirectionChoice`. The user's `Choice` index is mapped back to a concrete `nextDirectionOption` (or the synthetic finalize / free-input rows) using `FreeInputIdx` and `FinalizeIdx`.
 - `phase_progress.phase_completed` is the model's self-report for the top-level phase. It is ignored when the corresponding observation is blocked, declined, failed, errored, or structurally unrelated to the active phase goal.
-- `action.guide_progress.step_completed` is the model's self-report, not enforced by command matching. It is ignored when the corresponding observation is blocked, declined, failed, or errored. Misreported indices on successful observations are accepted (the worst case is premature `final_report` instruction or a step staying open).
+- `guide_progress.step_completed` is the model's self-report, not enforced by command matching. It is ignored when the corresponding observation is blocked, declined, failed, or errored. Misreported indices on successful observations are accepted (the worst case is premature parent phase-progress/final-report instruction or a step staying open).
 - Internal schema/correction errors, including invalid `next_directions`, are runtime errors rather than Kubernetes incident evidence. They must not trigger incident guidance offers.
 
 ## TODO: Contract Hardening
@@ -340,7 +334,7 @@ Define:
 Suggested default:
 
 - Exact normalized rendered command match is the only automatic completion path.
-- Explicit `action.guide_progress.step_completed` is accepted only when the observation is useful and not blocked/declined/failed/error.
+- Explicit `guide_progress.step_completed` is accepted only when the observation is useful and not blocked/declined/failed/error.
 - Partial command matches do not complete a step unless explicitly documented for that guide.
 
 Acceptance criteria:
