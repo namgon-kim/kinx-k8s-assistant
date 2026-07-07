@@ -1704,6 +1704,8 @@ read-only gate는 최소 보안 필터가 아니라 command policy gate다.
 
 이 네 가지를 같은 blocked path로 합치면 안 된다.
 
+현재 lightweight mutation detector는 실제 실행 command 위치의 `kubectl`만 positive로 잡는다. `sudo kubectl ...`, `xargs kubectl ...` 같은 wrapper command는 후속 케이스로 두고, 향후 `Evaneos/kubectl-readonly` 기반 classifier로 대체/보강한다.
+
 ### 6. Verification lifecycle
 
 mutation verification은 단순 gate가 아니라 phase/step/control이 모두 엮인다.
