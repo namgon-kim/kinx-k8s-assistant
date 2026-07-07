@@ -18,6 +18,7 @@ type Registry struct {
 }
 
 func NewRegistry(ctx context.Context, executor sandbox.Executor, enableMCP bool) (*Registry, error) {
+	klog.V(0).InfoS("tool registry initializing", "mcp", enableMCP)
 	registry := &Registry{}
 	registry.Tools.Init()
 	registry.Tools.RegisterTool(tools.NewBashTool(executor))
@@ -32,14 +33,18 @@ func NewRegistry(ctx context.Context, executor sandbox.Executor, enableMCP bool)
 		registry.MCPManager = manager
 	}
 
+	klog.V(0).InfoS("tool registry ready", "tools", len(registry.Tools.Names()), "mcp", enableMCP)
+	klog.V(2).InfoS("registered tool names", "tools", registry.Tools.Names())
 	return registry, nil
 }
 
 func (r *Registry) loadCustomTools(executor sandbox.Executor) {
 	for _, path := range customToolConfigCandidates() {
 		if _, err := os.Stat(path); err != nil {
+			klog.V(2).InfoS("custom tool config not found", "path", path)
 			continue
 		}
+		klog.V(0).InfoS("loading custom tool config", "path", path)
 		if err := tools.LoadAndRegisterCustomTools(path); err != nil {
 			klog.Warningf("custom tool 설정 로드 일부 실패 (%s): %v", path, err)
 		}
@@ -50,6 +55,7 @@ func (r *Registry) loadCustomTools(executor sandbox.Executor) {
 				continue
 			}
 			r.Tools.RegisterTool(tool)
+			klog.V(1).InfoS("custom tool registered", "name", tool.Name(), "path", path)
 		}
 	}
 }
@@ -66,6 +72,7 @@ func customToolConfigCandidates() []string {
 }
 
 func RegisterMCPTools(ctx context.Context, registry *tools.Tools) (*mcp.Manager, error) {
+	klog.V(0).InfoS("MCP manager initializing")
 	manager, err := mcp.InitializeManager()
 	if err != nil {
 		return nil, err
@@ -81,6 +88,7 @@ func RegisterMCPTools(ctx context.Context, registry *tools.Tools) (*mcp.Manager,
 		schema.Name = mcpTool.UniqueToolName()
 		schema.Description = fmt.Sprintf("%s (from %s)", toolInfo.Description, serverName)
 		registry.RegisterTool(mcpTool)
+		klog.V(1).InfoS("MCP tool registered", "server", serverName, "tool", toolInfo.Name, "unique_name", mcpTool.UniqueToolName())
 		return nil
 	}); err != nil {
 		_ = manager.Close()

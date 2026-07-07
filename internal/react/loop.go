@@ -226,10 +226,13 @@ type directionPromptState struct {
 
 func New(cfg *config.Config) (*Loop, error) {
 	setupProviderEnv(cfg)
+	klog.V(0).InfoS("react loop creating", "provider", cfg.LLMProvider, "model", cfg.Model, "shim", cfg.EnableToolUseShim, "read_only", cfg.ReadOnly, "mcp", cfg.MCPClient)
 	llmClient, err := gollm.NewClient(context.Background(), cfg.LLMProvider)
 	if err != nil {
+		klog.ErrorS(err, "LLM client creation failed", "provider", cfg.LLMProvider)
 		return nil, fmt.Errorf("LLM 클라이언트 생성 실패 (%s): %w", cfg.LLMProvider, err)
 	}
+	klog.V(0).InfoS("react loop created", "provider", cfg.LLMProvider)
 	return &Loop{
 		cfg:    cfg,
 		llm:    llmClient,
@@ -242,9 +245,11 @@ func New(cfg *config.Config) (*Loop, error) {
 func (l *Loop) Start(ctx context.Context, initialQuery string) error {
 	loopCtx, cancel := context.WithCancel(ctx)
 	l.cancel = cancel
+	klog.V(0).InfoS("react loop starting", "initial_query", strings.TrimSpace(initialQuery) != "", "query_len", len(strings.TrimSpace(initialQuery)))
 
 	if err := l.init(loopCtx); err != nil {
 		cancel()
+		klog.ErrorS(err, "react loop init failed")
 		return err
 	}
 
@@ -257,8 +262,10 @@ func (l *Loop) Output() <-chan *api.Message {
 }
 
 func (l *Loop) SendInput(input any) {
+	klog.V(2).InfoS("react input enqueue requested", "type", fmt.Sprintf("%T", input))
 	select {
 	case l.input <- input:
+		klog.V(2).InfoS("react input enqueued", "type", fmt.Sprintf("%T", input))
 	default:
 		klog.Warningf("react loop input 채널이 가득 찼습니다. 입력 버림: %v", input)
 	}
@@ -266,6 +273,7 @@ func (l *Loop) SendInput(input any) {
 
 func (l *Loop) Close() {
 	l.once.Do(func() {
+		klog.V(0).InfoS("react loop closing", "state", logStateName(l.state), "work_dir", l.workDir)
 		if l.cancel != nil {
 			l.cancel()
 		}
@@ -336,14 +344,17 @@ func (l *Loop) init(ctx context.Context) error {
 	}
 	l.workDir = workDir
 	l.executor = sandbox.NewLocalExecutor()
+	klog.V(1).InfoS("react work directory created", "path", workDir)
 
 	registry, err := toolconnector.NewRegistry(ctx, l.executor, l.cfg.MCPClient)
 	if err != nil {
 		return fmt.Errorf("tool registry 초기화 실패: %w", err)
 	}
 	l.registry = registry
+	klog.V(0).InfoS("react registry initialized", "tools", len(registry.Tools.Names()))
 
 	l.lang = newLangTranslator(l.cfg)
+	klog.V(0).InfoS("language translator configured", "language", l.cfg.Lang.Language, "enabled", l.lang != nil && l.lang.enabled())
 
 	l.requestIntent = RequestIntentGeneral
 	l.toolProfile = selectToolProfile(registry.Tools, l.requestIntent, "")
@@ -355,6 +366,7 @@ func (l *Loop) init(ctx context.Context) error {
 func (l *Loop) resetChatSession() error {
 	systemPrompt, err := buildSystemPromptWithOptions(l.cfg.PromptTemplateFile, l.registry.Tools, l.promptOptions)
 	if err != nil {
+		klog.ErrorS(err, "system prompt build failed", "template", l.cfg.PromptTemplateFile)
 		return err
 	}
 	l.systemPrompt = systemPrompt
@@ -372,16 +384,22 @@ func (l *Loop) resetChatSession() error {
 	)
 	if !l.cfg.EnableToolUseShim {
 		defs := collectFunctionDefinitionsForProfile(l.registry.Tools, l.toolProfile, true)
+		klog.V(1).InfoS("setting function definitions", "count", len(defs), "tool_profile", l.toolProfile.Name)
 		if err := l.chat.SetFunctionDefinitions(defs); err != nil {
+			klog.ErrorS(err, "function definition injection failed")
 			return fmt.Errorf("tool function definition 주입 실패: %w", err)
 		}
 	}
+	klog.V(1).InfoS("chat session reset", "prompt_tokens_estimate", l.contextApproxTokens, "tool_profile", l.toolProfile.Name, "tools", len(l.toolProfile.ToolNames), "shim", l.cfg.EnableToolUseShim)
+	klog.V(2).InfoS("chat session tool profile", "tool_profile", l.toolProfile.Name, "tools", l.toolProfile.ToolNames)
 	return nil
 }
 
 func (l *Loop) run(ctx context.Context, initialQuery string) {
 	defer close(l.output)
 	defer l.Close()
+	defer klog.V(0).InfoS("react run loop stopped")
+	klog.V(0).InfoS("react run loop entered", "initial_query", initialQuery != "")
 
 	if initialQuery != "" {
 		if err := l.startQuery(initialQuery); err != nil {
@@ -445,6 +463,7 @@ func (l *Loop) waitForInput(ctx context.Context) bool {
 		return false
 	case raw := <-l.input:
 		if raw == io.EOF {
+			klog.V(0).InfoS("react waitForInput received EOF")
 			l.applyRuntimeCleanup(cleanupExitPolicy())
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "종료합니다.")
 			l.state = StateExited
@@ -456,9 +475,11 @@ func (l *Loop) waitForInput(ctx context.Context) bool {
 		}
 		query := strings.TrimSpace(input.Query)
 		if query == "" {
+			klog.V(1).InfoS("react waitForInput received empty query")
 			l.state = StateDone
 			return true
 		}
+		klog.V(0).InfoS("react waitForInput received query", "query_len", len(query))
 		if handled := l.handleMetaQuery(ctx, query); handled {
 			return true
 		}
@@ -477,6 +498,7 @@ func (l *Loop) waitForApproval(ctx context.Context) bool {
 		return false
 	case raw := <-l.input:
 		if raw == io.EOF {
+			klog.V(0).InfoS("react waitForApproval received EOF")
 			l.applyRuntimeCleanup(cleanupExitPolicy())
 			l.state = StateExited
 			return false
@@ -485,6 +507,7 @@ func (l *Loop) waitForApproval(ctx context.Context) bool {
 		if !ok {
 			return true
 		}
+		klog.V(0).InfoS("react approval choice received", "choice", choice.Choice)
 		if err := l.handleApproval(ctx, choice.Choice); err != nil {
 			l.state = StateDone
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
@@ -495,11 +518,13 @@ func (l *Loop) waitForApproval(ctx context.Context) bool {
 
 func (l *Loop) startQuery(query string) error {
 	intent := classifyRequestIntent(query)
+	klog.V(0).InfoS("query starting", "query_len", len(query), "intent", intent)
 	l.requestIntent = intent
 	l.captureConversationMemory()
 	priorState := l.priorConversationStateMessage()
 	l.toolProfile = selectToolProfile(l.registry.Tools, intent, query)
 	l.promptOptions = l.newPromptOptions(intent, false, false)
+	klog.V(1).InfoS("query prompt options selected", "intent", intent, "tool_profile", l.toolProfile.Name, "tools", len(l.toolProfile.ToolNames), "read_only", l.cfg.ReadOnly, "translate_output", l.promptOptions.TranslateOutput)
 	if err := l.resetChatSession(); err != nil {
 		return err
 	}
@@ -540,6 +565,7 @@ func (l *Loop) startQuery(query string) error {
 	l.mutationContinuationRequired = false
 	l.mutationContinuationAttempts = 0
 	l.state = StateRunning
+	klog.V(0).InfoS("query state initialized", "intent", intent, "state", logStateName(l.state))
 	return nil
 }
 
@@ -573,6 +599,7 @@ func (l *Loop) newPromptOptions(intent RequestIntent, includeGuidance bool, incl
 func (l *Loop) handleMetaQuery(ctx context.Context, query string) bool {
 	switch query {
 	case "clear", "reset":
+		klog.V(0).InfoS("react meta query handled", "query", query)
 		l.requestIntent = RequestIntentGeneral
 		l.toolProfile = selectToolProfile(l.registry.Tools, l.requestIntent, "")
 		l.promptOptions = l.newPromptOptions(l.requestIntent, false, false)
@@ -586,15 +613,18 @@ func (l *Loop) handleMetaQuery(ctx context.Context, query string) bool {
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "대화 컨텍스트를 초기화했습니다.")
 		return true
 	case "exit", "quit":
+		klog.V(0).InfoS("react meta query handled", "query", query)
 		l.applyRuntimeCleanup(cleanupExitPolicy())
 		l.state = StateExited
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "종료합니다.")
 		return true
 	case "model":
+		klog.V(1).InfoS("react meta query handled", "query", query, "model", l.cfg.Model)
 		l.state = StateDone
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Current model is `"+l.cfg.Model+"`")
 		return true
 	case "models":
+		klog.V(0).InfoS("react meta query handled", "query", query)
 		l.state = StateDone
 		models, err := l.llm.ListModels(ctx)
 		if err != nil {
@@ -604,6 +634,7 @@ func (l *Loop) handleMetaQuery(ctx context.Context, query string) bool {
 		}
 		return true
 	case "tools":
+		klog.V(0).InfoS("react meta query handled", "query", query, "tools", len(l.registry.Tools.Names()))
 		l.state = StateDone
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Available tools:\n\n  - "+strings.Join(l.registry.Tools.Names(), "\n  - "))
 		return true
@@ -701,7 +732,17 @@ func estimateTextTokens(text string) int {
 }
 
 func (l *Loop) runIteration(ctx context.Context) error {
+	snapshot := l.RuntimeSnapshot()
+	klog.V(1).InfoS("react iteration starting",
+		"iteration", l.currIteration+1,
+		"max_iterations", l.cfg.MaxIterations,
+		"state", logStateName(l.state),
+		"control", snapshot.Control,
+		"context_tokens_estimate", l.contextApproxTokens,
+		"chat_content_items", len(l.currChatContent),
+	)
 	if l.currIteration >= l.cfg.MaxIterations {
+		klog.V(0).InfoS("react max iterations reached", "max_iterations", l.cfg.MaxIterations)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Maximum number of iterations reached.")
 		l.currIteration = 0
 		l.currChatContent = nil
@@ -711,24 +752,34 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	if l.shouldCompactBeforeNextSend() {
+		klog.V(1).InfoS("context compaction triggered before send", "context_tokens_estimate", l.contextApproxTokens, "limit", l.contextLimitTokens())
 		l.compactBeforeNextIteration("Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it.")
 	}
 
 	sentContent := l.buildIterationSendContent()
+	klog.V(2).InfoS("sending model request", "content_items", len(sentContent), "content_tokens_estimate", estimateContextTokens(sentContent...))
+	sendStart := time.Now()
 	streamedText, functionCalls, err := l.sendAndCollectStreaming(ctx, sentContent)
 	if err != nil {
 		if !isContextLengthError(err) {
+			klog.ErrorS(err, "model streaming request failed", "duration", time.Since(sendStart))
 			return err
 		}
+		klog.V(0).InfoS("model streaming hit context length", "error", err.Error(), "duration", time.Since(sendStart))
 		if ok := l.compactAfterContextLengthError(err); !ok {
 			return err
 		}
 		sentContent = l.buildIterationSendContent()
+		klog.V(1).InfoS("retrying model request after context compaction", "content_items", len(sentContent), "content_tokens_estimate", estimateContextTokens(sentContent...))
+		sendStart = time.Now()
 		streamedText, functionCalls, err = l.sendAndCollectStreaming(ctx, sentContent)
 		if err != nil {
+			klog.ErrorS(err, "model streaming retry failed", "duration", time.Since(sendStart))
 			return err
 		}
 	}
+	klog.V(1).InfoS("model response received", "duration", time.Since(sendStart), "text_len", len(streamedText), "function_calls", len(functionCalls), "call_names", logFunctionCallNames(functionCalls))
+	klog.V(2).InfoS("model response call summaries", "calls", logFunctionCallSummaries(functionCalls))
 	l.noteContextContent(sentContent...)
 	l.currChatContent = nil
 	l.pendingResponseDirective = ""
@@ -752,6 +803,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 
 	if len(functionCalls) == 0 {
+		klog.V(1).InfoS("model response had no function calls", "text_len", len(streamedText))
 		if handled := l.rejectMissingMutationVerificationOnNoCalls(); handled {
 			return nil
 		}
@@ -772,6 +824,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 			displayText := l.translateModelText(ctx, rawModelText)
 			l.addMessage(api.MessageSourceModel, api.MessageTypeText, displayText)
 			l.lastAssistantText = rawModelText
+			klog.V(0).InfoS("plain model answer emitted", "raw_len", len(rawModelText), "display_len", len(displayText))
 		}
 		l.currIteration = 0
 		l.pendingCalls = nil
@@ -780,6 +833,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 	}
 	deferredProgressText := strings.TrimSpace(streamedText)
 	functionCalls = normalizeAssistantStructuredFunctionCalls(functionCalls)
+	klog.V(1).InfoS("normalized model function calls", "function_calls", len(functionCalls), "call_names", logFunctionCallNames(functionCalls))
 
 	if handled := l.rejectInvalidShimStructuredCalls(functionCalls); handled {
 		return nil
@@ -873,6 +927,7 @@ func (l *Loop) runIteration(ctx context.Context) error {
 
 	functionCalls = l.rejectAssistantManagedToolCalls(functionCalls)
 	if len(functionCalls) == 0 {
+		klog.V(1).InfoS("all function calls were handled internally or rejected")
 		l.currIteration++
 		return nil
 	}
@@ -883,25 +938,33 @@ func (l *Loop) runIteration(ctx context.Context) error {
 
 	pending, err := l.analyzeToolCalls(ctx, functionCalls)
 	if err != nil {
+		klog.ErrorS(err, "tool call analysis failed", "call_names", logFunctionCallNames(functionCalls))
 		return err
 	}
 	l.pendingCalls = pending
+	klog.V(1).InfoS("tool calls analyzed", "pending", len(pending), "summaries", logPendingCallSummaries(pending))
 
 	if handled := l.rejectInteractiveToolCalls(); handled {
+		klog.V(0).InfoS("interactive tool calls rejected")
 		return nil
 	}
 
 	if l.cfg.ReadOnly && l.hasModifyingCalls() {
+		klog.V(0).InfoS("read-only mode blocking modifying tool calls", "pending", len(l.pendingCalls))
+		klog.V(1).InfoS("read-only blocked call summaries", "pending", logPendingCallSummaries(l.pendingCalls))
 		l.rejectReadOnlyModifyingCalls()
 		return nil
 	}
 	if !l.skipPermissions && l.hasModifyingCalls() {
+		klog.V(0).InfoS("approval required for modifying tool calls", "pending", len(l.pendingCalls))
+		klog.V(1).InfoS("approval required call summaries", "pending", logPendingCallSummaries(l.pendingCalls))
 		l.emitAcceptedProgressText(ctx, deferredProgressText)
 		l.requestApproval()
 		return nil
 	}
 
 	l.emitAcceptedProgressText(ctx, deferredProgressText)
+	klog.V(1).InfoS("dispatching tool calls without approval", "pending", len(l.pendingCalls))
 	return l.dispatchToolCalls(ctx)
 }
 
@@ -1257,6 +1320,7 @@ func bareInternalCallName(name string) string {
 func (l *Loop) analyzeToolCalls(ctx context.Context, calls []gollm.FunctionCall) ([]PendingCall, error) {
 	pending := make([]PendingCall, len(calls))
 	for i, call := range calls {
+		klog.V(2).InfoS("parsing tool invocation", "name", call.Name, "argument_keys", logMapKeys(call.Arguments))
 		parsed, err := l.registry.Tools.ParseToolInvocation(ctx, call.Name, call.Arguments)
 		if err != nil {
 			return nil, fmt.Errorf("tool call 파싱 실패: %w", err)
@@ -1269,6 +1333,7 @@ func (l *Loop) analyzeToolCalls(ctx context.Context, calls []gollm.FunctionCall)
 			InteractiveError: interactiveErr,
 			ModifiesResource: l.modifiesResource(parsed, call),
 		}
+		klog.V(1).InfoS("tool invocation parsed", "name", call.Name, "modifies_resource", pending[i].ModifiesResource, "interactive", isInteractive)
 	}
 	return pending, nil
 }
@@ -1995,6 +2060,8 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 			"suggested_response": readOnlyBlockedSuggestedResponse(call.ModifiesResource, hasKnownMutation),
 		})
 	}
+	klog.V(0).InfoS("read-only modifying calls rejected", "has_unknown", hasUnknown, "has_known_mutation", hasKnownMutation, "calls", len(descriptions))
+	klog.V(1).InfoS("read-only rejected call summaries", "descriptions", maskedLogStrings(descriptions))
 	if len(descriptions) == 0 {
 		descriptions = append(descriptions, "안전성이 확인되지 않은 명령")
 	}
@@ -2059,6 +2126,8 @@ func (l *Loop) requestApproval() {
 	}
 	prompt := "다음 명령은 실행 전 승인이 필요합니다:\n* " + strings.Join(descriptions, "\n* ")
 	prompt += "\n\n진행할까요?"
+	klog.V(0).InfoS("approval requested", "calls", len(l.pendingCalls))
+	klog.V(1).InfoS("approval request call summaries", "descriptions", maskedLogStrings(descriptions))
 	l.state = StateWaitingApproval
 	l.refreshInputOwner()
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
@@ -2072,6 +2141,7 @@ func (l *Loop) requestApproval() {
 }
 
 func (l *Loop) handleApproval(ctx context.Context, choice int) error {
+	klog.V(0).InfoS("handling approval choice", "choice", choice, "pending", len(l.pendingCalls))
 	switch choice {
 	case 1:
 		if err := l.dispatchToolCalls(ctx); err != nil {
@@ -2079,10 +2149,12 @@ func (l *Loop) handleApproval(ctx context.Context, choice int) error {
 		}
 	case 2:
 		l.skipPermissions = true
+		klog.V(0).InfoS("approval granted with skip future permissions")
 		if err := l.dispatchToolCalls(ctx); err != nil {
 			return err
 		}
 	case 3:
+		klog.V(0).InfoS("approval declined", "pending", len(l.pendingCalls))
 		for _, call := range l.pendingCalls {
 			l.appendToolObservation(call, map[string]any{
 				"error":     "User declined to run this operation.",
@@ -2101,6 +2173,7 @@ func (l *Loop) handleApproval(ctx context.Context, choice int) error {
 }
 
 func (l *Loop) dispatchToolCalls(ctx context.Context) error {
+	klog.V(1).InfoS("tool dispatch starting", "pending", len(l.pendingCalls), "summaries", logPendingCallSummaries(l.pendingCalls))
 	l.toolDispatchInProgress = true
 	l.refreshInputOwner()
 	defer func() {
@@ -2110,6 +2183,8 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 	var failureOutcome *GateOutcome
 	for _, call := range l.pendingCalls {
 		description := call.ParsedToolCall.Description()
+		toolStart := time.Now()
+		klog.V(1).InfoS("tool invocation starting", "tool", call.FunctionCall.Name, "description", maskForSystemLog(description), "modifies_resource", call.ModifiesResource)
 		l.addMessage(api.MessageSourceModel, api.MessageTypeToolCallRequest, description)
 
 		output, err := call.ParsedToolCall.InvokeTool(ctx, tools.InvokeToolOptions{
@@ -2119,9 +2194,13 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 		})
 		if err != nil {
 			if ctx.Err() != nil {
+				klog.ErrorS(err, "tool invocation cancelled", "tool", call.FunctionCall.Name, "duration", time.Since(toolStart))
 				return err
 			}
 			result := toolFailureResultFromError(err)
+			status, errText, keys := logResultSummary(result)
+			klog.V(0).InfoS("tool invocation failed", "tool", call.FunctionCall.Name, "duration", time.Since(toolStart), "status", status, "error", errText)
+			klog.V(2).InfoS("tool failure result summary", "tool", call.FunctionCall.Name, "keys", keys)
 			if outcome, failed := l.annotateToolFailureResult(call, result); failed && failureOutcome == nil {
 				failureOutcome = &outcome
 			}
@@ -2133,6 +2212,9 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 		result, err := tools.ToolResultToMap(output)
 		if err != nil {
 			result = toolFailureResultFromMapError(err)
+			status, errText, keys := logResultSummary(result)
+			klog.V(0).InfoS("tool result conversion failed", "tool", call.FunctionCall.Name, "duration", time.Since(toolStart), "status", status, "error", errText)
+			klog.V(2).InfoS("tool conversion failure result summary", "tool", call.FunctionCall.Name, "keys", keys)
 			if outcome, failed := l.annotateToolFailureResult(call, result); failed && failureOutcome == nil {
 				failureOutcome = &outcome
 			}
@@ -2143,11 +2225,15 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 		if outcome, failed := l.annotateToolFailureResult(call, result); failed && failureOutcome == nil {
 			failureOutcome = &outcome
 		}
+		status, errText, keys := logResultSummary(result)
+		klog.V(1).InfoS("tool invocation completed", "tool", call.FunctionCall.Name, "duration", time.Since(toolStart), "status", status, "error", errText)
+		klog.V(2).InfoS("tool result summary", "tool", call.FunctionCall.Name, "keys", keys)
 		l.appendToolObservation(call, result)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, result)
 	}
 
 	if failureOutcome != nil {
+		klog.V(0).InfoS("tool dispatch produced failure outcome", "code", failureOutcome.Code, "kind", failureOutcome.Kind, "retryable", failureOutcome.Retryable)
 		l.applyGateOutcome(*failureOutcome)
 		return nil
 	}
@@ -2159,10 +2245,13 @@ func (l *Loop) dispatchToolCalls(ctx context.Context) error {
 		l.compactBeforeNextIteration("Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it.")
 	}
 	l.state = StateRunning
+	klog.V(0).InfoS("tool dispatch completed", "next_iteration", l.currIteration+1)
 	return nil
 }
 
 func (l *Loop) appendToolObservation(call PendingCall, result map[string]any) {
+	status, errText, keys := logResultSummary(result)
+	klog.V(2).InfoS("appending tool observation", "tool", call.FunctionCall.Name, "status", status, "error", errText, "keys", keys, "shim", l.cfg.EnableToolUseShim)
 	l.recordAction(call, result)
 	l.trackMutationVerification(call, result)
 	if l.cfg.EnableToolUseShim {
@@ -2196,6 +2285,7 @@ func (l *Loop) recordAction(call PendingCall, result map[string]any) {
 		record.Target = &target
 	}
 	l.completedActions = append(l.completedActions, record)
+	klog.V(1).InfoS("action recorded", "step", record.Step, "tool", record.Tool, "command", trimForLog(record.Command, 180), "result_hash", record.ResultHash)
 	if len(l.completedActions) > 12 {
 		l.completedActions = l.completedActions[len(l.completedActions)-12:]
 	}
@@ -2225,6 +2315,7 @@ func (l *Loop) consumeGuideProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 			return remaining, l.applyModelOutputCorrectionGate("invalid_guide_progress", "guide_progress 형식 오류가 반복되어 진단을 중단합니다.", "guide_progress payload was invalid. Return guide_progress with step_completed as a positive 1-based guide step index and evidence_useful=true only when live evidence advanced that step.")
 		}
 		completedAll := l.markGuideStepCompleted(step)
+		klog.V(0).InfoS("guide progress consumed", "step_completed", step, "completed_all", completedAll)
 		l.currChatContent = append(l.currChatContent, gollm.FunctionCallResult{
 			ID:   call.ID,
 			Name: call.Name,
@@ -2331,6 +2422,7 @@ func (l *Loop) translateModelText(ctx context.Context, text string) string {
 
 func (l *Loop) addMessage(source api.MessageSource, messageType api.MessageType, payload any) {
 	l.publishRuntimeSnapshot()
+	klog.V(2).InfoS("react output message queued", "source", source, "type", messageType, "payload_type", fmt.Sprintf("%T", payload))
 	l.output <- &api.Message{
 		ID:        uuid.NewString(),
 		Source:    source,

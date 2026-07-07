@@ -20,6 +20,7 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 		if call.Name != internalResourceGuideLookupCall {
 			continue
 		}
+		klog.V(0).InfoS("resource guide lookup requested")
 		if !l.phaseAllowsResourceGuideLookup() {
 			return l.applyModelOutputCorrectionGate("resource_guide_wrong_phase", "잘못된 phase의 resource_guide_lookup 요청이 반복되어 진단을 중단합니다.", "Resource guide lookup is only allowed from the guidance_lookup phase after observation evidence is available. Complete or advance the current phase with phase_progress, or continue the active phase with the next safest diagnostic.")
 		}
@@ -34,6 +35,7 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 		if l.resourceGuideQueryAlreadyUsed(query) {
 			return l.applyModelOutputCorrectionGate("duplicate_resource_guide_lookup", "중복 resource_guide_lookup 요청이 반복되어 진단을 중단합니다.", "That refined resource-guide lookup was already performed for the same problem focus and evidence. Do not repeat it; choose the next kubectl diagnostic or answer from the evidence.")
 		}
+		klog.V(0).InfoS("resource guide lookup accepted", "resource_family", request.ResourceFamily, "query_len", len(query))
 		l.searchAndInjectResourceGuide(ctx, request.ResourceFamily, query)
 		return true
 	}
@@ -78,6 +80,7 @@ func (l *Loop) phaseAllowsResourceGuideLookup() bool {
 }
 
 func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query string) {
+	klog.V(0).InfoS("resource guidance search starting", "resource", resource, "query_len", len(query))
 	client, err := guidance.NewResourceGuideClient(l.cfg)
 	if err != nil {
 		klog.Warningf("resource guidance client init failed: %v", err)
@@ -86,6 +89,7 @@ func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query
 		return
 	}
 	if client.KnowledgeProvider() != guidance.KnowledgeProviderQdrant {
+		klog.V(0).InfoS("resource guidance provider unsupported", "provider", client.KnowledgeProvider())
 		l.markResourceGuideQuery(query)
 		l.injectResourceGuideUnavailable(resource, "provider_not_implemented_for_resource_guides="+string(client.KnowledgeProvider()))
 		return
@@ -103,6 +107,7 @@ func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query
 	if found != nil {
 		originalCaseCount = len(found.Cases)
 	}
+	klog.V(0).InfoS("resource guidance search completed", "resource", resource, "cases", originalCaseCount)
 	found = l.filterResourceGuidesForRequest(found, query)
 	if originalCaseCount > 0 && (found == nil || len(found.Cases) == 0) {
 		l.markResourceGuideQuery(query)
@@ -131,6 +136,11 @@ func (l *Loop) markResourceGuideQuery(query string) {
 
 func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.GuideSearchResult) bool {
 	l.guideStepState = l.buildGuideStepState(found)
+	caseCount := 0
+	if found != nil {
+		caseCount = len(found.Cases)
+	}
+	klog.V(0).InfoS("injecting resource guide attempt", "resource", resource, "cases", caseCount, "has_steps", l.guideStepState != nil)
 	l.finalReportRequested = false
 	l.guidedPhaseProgressRequested = false
 	l.pendingResponseDirective = ""

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
+	"k8s.io/klog/v2"
 )
 
 type phaseStepState struct {
@@ -47,6 +48,7 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 		}
 		accepted = &plan
 		l.phaseStepState = newPhaseStepState(plan)
+		klog.V(1).InfoS("phase plan accepted", "request_goal", trimForLog(plan.RequestGoal, 160), "phase_steps", len(plan.PhaseSteps), "current_phase_index", plan.CurrentPhaseIndex)
 		continue
 	}
 	if accepted != nil {
@@ -136,6 +138,7 @@ func (l *Loop) consumePhaseProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 		if l.guideStepState != nil && strings.EqualFold(l.phaseStepState.phaseName(progress.PhaseCompleted), "guided_diagnosis") {
 			l.guideStepState = nil
 		}
+		klog.V(0).InfoS("phase progress accepted", "phase_completed", progress.PhaseCompleted, "current_phase", l.phaseStepState.CurrentPhaseIndex)
 		l.guidedPhaseProgressRequested = false
 		handled = true
 	}
