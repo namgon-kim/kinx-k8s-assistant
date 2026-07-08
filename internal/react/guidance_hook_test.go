@@ -11,34 +11,6 @@ import (
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/guidance"
 )
 
-func TestCustomResourceCandidateFromKubectl(t *testing.T) {
-	tests := []struct {
-		command string
-		want    string
-		ok      bool
-	}{
-		{command: "kubectl get cluster clst-a -n ns", want: "cluster", ok: true},
-		{command: "kubectl -n ns get cluster clst-a", want: "cluster", ok: true},
-		{command: "kubectl -n ns get cluster,openstackcluster clst-a", want: "cluster", ok: true},
-		{command: "kubectl get -n ns -o yaml machinedeployment md-a", want: "machinedeployment", ok: true},
-		{command: "kubectl describe machinedeployment md-a -n ns", want: "machinedeployment", ok: true},
-		{command: "kubectl get machines -n ns", want: "machines", ok: true},
-		{command: "kubectl get pods -n ns", ok: false},
-		{command: "kubectl get nodes", ok: false},
-		{command: "kubectl get hpa -n ns", ok: false},
-		{command: "kubectl get networkpolicies -n ns", ok: false},
-		{command: "kubectl get certificatesigningrequests", ok: false},
-		{command: "kubectl get volumeattachments", ok: false},
-		{command: "kubectl logs pod-a -n ns", ok: false},
-	}
-	for _, tt := range tests {
-		got, ok := customResourceCandidateFromKubectl(tt.command)
-		if ok != tt.ok || got != tt.want {
-			t.Fatalf("customResourceCandidateFromKubectl(%q) = (%q, %v), want (%q, %v)", tt.command, got, ok, tt.want, tt.ok)
-		}
-	}
-}
-
 func TestCommandStringAcceptsOnlyKubectlCommands(t *testing.T) {
 	if _, ok := commandString("kubectl get cluster c1 -n ns"); !ok {
 		t.Fatal("expected kubectl command to be accepted")
@@ -613,20 +585,20 @@ func TestMutationLifecycleRequiresExactReadOnlyVerification(t *testing.T) {
 			}},
 		},
 	}
-	if loop.mutationVerificationCallMatches(gollm.FunctionCall{
+	if _, ok := loop.mutationVerificationCallMatchID(gollm.FunctionCall{
 		Name: "kubectl",
 		Arguments: map[string]any{
 			"command": "kubectl get configmap app-config -n default -o yaml",
 		},
-	}) {
+	}); ok {
 		t.Fatal("verification with different namespace must not match")
 	}
-	if !loop.mutationVerificationCallMatches(gollm.FunctionCall{
+	if _, ok := loop.mutationVerificationCallMatchID(gollm.FunctionCall{
 		Name: "kubectl",
 		Arguments: map[string]any{
 			"command": "kubectl get configmap app-config -n web -o yaml",
 		},
-	}) {
+	}); !ok {
 		t.Fatal("expected exact read-only verification to match")
 	}
 }

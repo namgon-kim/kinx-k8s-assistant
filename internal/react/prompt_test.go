@@ -20,7 +20,7 @@ func TestBuildSystemPromptIncludesReadOnlyInstructions(t *testing.T) {
 
 	var registry tools.Tools
 	registry.Init()
-	prompt, err := buildSystemPrompt(templatePath, registry, false, true, "Korean", false)
+	prompt, err := buildSystemPromptForTest(templatePath, registry, false, true, "Korean", false)
 	if err != nil {
 		t.Fatalf("build prompt: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestBuildSystemPromptOmitsReadOnlyInstructions(t *testing.T) {
 
 	var registry tools.Tools
 	registry.Init()
-	prompt, err := buildSystemPrompt(templatePath, registry, false, false, "Korean", false)
+	prompt, err := buildSystemPromptForTest(templatePath, registry, false, false, "Korean", false)
 	if err != nil {
 		t.Fatalf("build prompt: %v", err)
 	}
@@ -57,13 +57,25 @@ func TestBuildSystemPromptIncludesTranslateOutputPolicy(t *testing.T) {
 	}
 
 	registry := tools.Tools{}
-	prompt, err := buildSystemPrompt(templatePath, registry, false, false, "Korean", true)
+	prompt, err := buildSystemPromptForTest(templatePath, registry, false, false, "Korean", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(prompt, "translate externally for Korean") {
 		t.Fatalf("expected translation policy in prompt: %q", prompt)
 	}
+}
+
+func buildSystemPromptForTest(templateFile string, registry tools.Tools, enableToolUseShim bool, readOnly bool, userLanguage string, translateOutput bool) (string, error) {
+	return buildSystemPromptWithOptions(templateFile, registry, promptOptions{
+		EnableToolUseShim:         enableToolUseShim,
+		ReadOnly:                  readOnly,
+		UserLanguage:              userLanguage,
+		TranslateOutput:           translateOutput,
+		IncludeGuidanceProtocol:   true,
+		IncludeManifestGuidelines: true,
+		ToolProfile:               selectToolProfile(registry, RequestIntentGeneral, ""),
+	})
 }
 
 func TestCollectFunctionDefinitionsIncludesInternalStructuredCalls(t *testing.T) {

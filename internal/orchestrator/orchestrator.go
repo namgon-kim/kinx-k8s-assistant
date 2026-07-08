@@ -117,7 +117,6 @@ type inputModel struct {
 	history      []string // 입력 히스토리
 	historyIdx   int      // 현재 히스토리 인덱스 (len(history) = 현재 입력)
 	originalText string   // 히스토리 네비게이션 시 원본 입력 보존
-	historyFile  string   // 히스토리 파일 경로
 	interrupted  bool     // Ctrl+C로 종료 요청
 }
 
@@ -130,10 +129,9 @@ func newInputModel(prompt, historyFile string) inputModel {
 	history := loadHistory(historyFile)
 
 	return inputModel{
-		textinput:   ti,
-		history:     history,
-		historyIdx:  len(history),
-		historyFile: historyFile,
+		textinput:  ti,
+		history:    history,
+		historyIdx: len(history),
 	}
 }
 
@@ -243,11 +241,7 @@ func clampSelection(idx, size int) int {
 	return idx
 }
 
-func getInputWithUI(prompt, historyFile string) (string, error) {
-	return getInputWithUIHistory(prompt, historyFile, true)
-}
-
-// getInputWithUI는 bubbletea를 사용해서 사용자 입력을 받습니다
+// getInputWithUIHistory는 bubbletea를 사용해서 사용자 입력을 받습니다
 func getInputWithUIHistory(prompt, historyFile string, saveToHistory bool) (string, error) {
 	m := newInputModel(prompt, historyFile)
 	p, err := tea.NewProgram(m).Run()
@@ -271,7 +265,7 @@ func getInputWithUIEcho(prompt, historyFile string) (string, error) {
 	return getInputWithUIEchoHistory(prompt, historyFile, true)
 }
 
-func getInputWithUIEchoNoHistory(prompt, historyFile string) (string, error) {
+func getInputWithUIEchoNoHistory(prompt string) (string, error) {
 	return getInputWithUIEchoHistory(prompt, "", false)
 }
 
@@ -441,7 +435,7 @@ func (o *Orchestrator) Run(ctx context.Context, initialQuery string) error {
 
 func (o *Orchestrator) readAndDispatchInput(ctx context.Context) error {
 	o.printStatusWarnings(true)
-	input, err := getInputWithUIEcho(o.buildPrompt(true), o.cfg.HistoryFile)
+	input, err := getInputWithUIEcho(o.buildPrompt(), o.cfg.HistoryFile)
 	if err != nil {
 		if err == io.EOF {
 			fmt.Println("👋 종료합니다.")
@@ -632,7 +626,7 @@ func (o *Orchestrator) handleAgentInputRequest() error {
 
 	for {
 		o.printStatusWarnings(true)
-		input, err := getInputWithUIEcho(o.buildPrompt(true), o.cfg.HistoryFile)
+		input, err := getInputWithUIEcho(o.buildPrompt(), o.cfg.HistoryFile)
 		if err != nil {
 			if err == io.EOF {
 				activeAgent.SendInput(io.EOF)
@@ -712,7 +706,7 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 	}
 
 	for {
-		input, err := getInputWithUIEchoNoHistory(inputPrompt, o.cfg.HistoryFile)
+		input, err := getInputWithUIEchoNoHistory(inputPrompt)
 		if err != nil {
 			if err == io.EOF {
 				activeAgent.SendInput(io.EOF)
@@ -872,7 +866,7 @@ func (o *Orchestrator) isAPIKeyAvailable() bool {
 }
 
 // buildPrompt는 현재 상태에 따른 프롬프트를 생성합니다
-func (o *Orchestrator) buildPrompt(hasAgent bool) string {
+func (o *Orchestrator) buildPrompt() string {
 	contextPart := "none"
 	if o.kubeconfigInfo != nil {
 		contextPart = o.kubeconfigInfo.CurrentContext
@@ -953,55 +947,6 @@ func (o *Orchestrator) showAgentRequirements() {
 // selectMetaCommand는 메타 명령을 실행합니다
 func (o *Orchestrator) selectMetaCommand(input string) error {
 	return o.handleMetaCommand(input)
-}
-
-// showMetaCommandMenu는 메타 명령 선택 메뉴를 표시합니다
-func (o *Orchestrator) showMetaCommandMenu() {
-	fmt.Println()
-	fmt.Printf("%s메타 명령:%s\n", colorBrightCyan, colorReset)
-
-	metaCmds := GetMetaCommands()
-	for i, c := range metaCmds {
-		fmt.Printf("  %s%d%s. %s%-20s%s %s\n", colorYellow, i+1, colorReset, colorBrightCyan, c.Name, colorReset, c.Description)
-	}
-	fmt.Println()
-
-	maxNum := len(metaCmds)
-	o.rl.SetPrompt(fmt.Sprintf("선택 (1-%d 또는 명령어 입력): ", maxNum))
-	choice, err := o.rl.Readline()
-	if err != nil {
-		return
-	}
-
-	choice = strings.TrimSpace(choice)
-	var cmd string
-
-	// 숫자 선택 처리
-	if num, err := strconv.Atoi(choice); err == nil {
-		if num >= 1 && num <= maxNum {
-			cmd = metaCmds[num-1].Name
-		} else {
-			fmt.Printf("%s❌ 범위를 벗어난 선택%s\n", colorBrightRed, colorReset)
-			return
-		}
-	} else {
-		// 직접 입력한 명령어 처리
-		if strings.HasPrefix(choice, "/") {
-			cmd = choice
-		} else {
-			fmt.Printf("%s❌ 잘못된 선택%s\n", colorBrightRed, colorReset)
-			return
-		}
-	}
-
-	if err := o.handleMetaCommand(cmd); err != nil {
-		fmt.Println(colorBrightMagenta + "❌ " + err.Error() + colorReset)
-	}
-
-	// 원래 프롬프트로 복원 (agent 있는지 없는지 판단)
-	hasAgent := o.agentWrap != nil
-	prompt := o.buildPrompt(hasAgent)
-	o.rl.SetPrompt(prompt)
 }
 
 // handleMetaCommand는 /config, /kube-context 등 메타 명령어를 처리합니다.
@@ -1210,7 +1155,7 @@ func (o *Orchestrator) switchContext(contextName string) error {
 	o.invalidateAgent("kube-context changed")
 
 	// prompt 업데이트
-	newPrompt := o.buildPrompt(o.agentWrap != nil)
+	newPrompt := o.buildPrompt()
 	o.rl.SetPrompt(newPrompt)
 
 	fmt.Println()
