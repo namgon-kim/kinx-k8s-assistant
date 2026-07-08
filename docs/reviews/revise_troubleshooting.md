@@ -1,33 +1,34 @@
-# Trouble-shooting Revise Notes
+# Guidance Revise Notes
 
 ## 목적
 
-현재 trouble-shooting 기능은 구현을 진행하면서 몇 가지 설계 쟁점이 남아 있다. 이 문서는 확정된 구현 사항과 아직 결정하지 않은 revise 논점을 분리해 정리한다.
+현재 guidance/log-analyzer 기능은 구현을 진행하면서 몇 가지 설계 쟁점이 남아 있다. 이 문서는 확정된 구현 사항과 아직 결정하지 않은 revise 논점을 분리해 정리한다.
 
 ## 현재 구현 기준
 
-- `log-analyzer`와 `trouble-shooting`은 별도 MCP 서버로 분리한다.
-- `log-analyzer`는 로그/이벤트/메트릭 관측과 패턴 분석을 담당한다.
-- `trouble-shooting`은 구조화 runbook 매칭, 운영 이슈 RAG 검색, 조치 계획 생성을 담당한다.
-- 실제 Kubernetes 명령 실행은 kubectl-ai가 담당한다.
+- `log-analyzer`와 `guidance`는 별도 도메인이다.
+- `log-analyzer`는 optional MCP 서버로 로그/이벤트/메트릭 관측과 패턴 분석을 담당한다.
+- `guidance`는 standalone MCP 서버가 아니라 `internal/guidance` 내장 client/package로 동작한다.
+- `guidance`는 resource guide 선행 검색, incident guide 매칭, 운영 이슈 RAG 검색, 조치 계획 생성을 담당한다.
+- 실제 Kubernetes 명령 실행은 k8s-assistant의 ReAct/tool loop와 승인 흐름이 담당한다.
 - k8s-assistant의 `--mcp-client`는 `~/.k8s-assistant/mcp.yaml`에 선언된 MCP 서버만 kubectl-ai MCP 설정으로 동기화한다.
-- `log-analyzer`와 `trouble-shooting`은 모두 선택 사항이다.
-- `trouble-shooting` 설정 기본 경로는 `~/.k8s-assistant/trouble-shooting.yaml`이다.
-- Qdrant runbook 업로드는 런타임 기능이 아니라 검증/초기 적재용 helper인 `troubleshooting-upload`가 수행한다.
+- `log-analyzer` MCP 서버는 선택 사항이다. `guidance`는 설정 파일이 없으면 embedded runbook/default로 동작한다.
+- `guidance` 설정 기본 경로는 `~/.k8s-assistant/guidance.yaml`이다.
+- Qdrant runbook 업로드는 런타임 기능이 아니라 검증/초기 적재용 helper인 `guidance-upload`가 수행한다.
 - Qdrant 업로드에는 runbook text를 vector로 저장해야 하므로 embedding endpoint가 필요하다.
 
 ## 미결정 논점
 
-### 1. trouble-shooting 호출 게이트
+### 1. incident guidance 호출 게이트
 
-간단하고 명확한 문제까지 항상 RAG를 검색하면 오버헤드가 크다. 반대로 kubectl-ai가 모든 해결책을 자체 판단하면 LLM의 사전 학습된 해결책과 runbook/RAG 결과가 충돌한다.
+간단하고 명확한 문제까지 항상 RAG를 검색하면 오버헤드가 크다. 반대로 ReAct loop가 모든 해결책을 자체 판단하면 LLM의 사전 학습된 해결책과 runbook/RAG 결과가 충돌한다.
 
 현재 논의된 방향:
 
 ```text
-kubectl-ai가 1차 진단과 확신도 판단을 수행한다.
-확신도가 높고 수정 대상/절차가 명확하면 trouble-shooting을 호출하지 않는다.
-확신도가 낮거나 조치 대상/절차가 불명확하면 trouble-shooting을 호출한다.
+k8s-assistant ReAct loop가 1차 진단과 evidence 수집을 수행한다.
+resource guide는 CRD-backed primary target과 guidance_lookup phase에서만 조회한다.
+incident guidance는 ReAct continuation choice에 명시적 runbook 검색 option이 있을 때만 실행한다.
 ```
 
 후보 self assessment:
@@ -37,7 +38,7 @@ self_assessment:
   issue_detected: true
   confidence: high | medium | low
   can_remediate_directly: true | false
-  needs_troubleshooting: true | false
+  needs_incident_guidance: true | false
   remediation_risk: low | medium | high
   reason: "<short Korean reason>"
 ```
@@ -45,34 +46,34 @@ self_assessment:
 검토할 점:
 
 - LLM이 `low` 또는 `unknown`을 잘 선택하지 않을 수 있다.
-- Orchestrator가 LLM 판단을 그대로 믿을지, heuristic으로 보정할지 결정해야 한다.
+- Orchestrator가 LLM 판단을 그대로 믿을지, runtime evidence/heuristic으로 보정할지 결정해야 한다.
 - RAG 호출 비용과 운영 안정성 사이의 기준선을 정해야 한다.
 
 ### 2. 최종 판단권
 
-명령 실행은 kubectl-ai가 담당하지만, 해결책을 다시 설계하면 trouble-shooting 계획과 충돌한다.
+명령 실행은 ReAct/tool loop가 담당하지만, 해결책을 다시 설계하면 guidance 계획과 충돌한다.
 
 논의된 선택지:
 
 | 선택지 | 설명 | 장점 | 위험 |
 |---|---|---|---|
-| kubectl-ai 중심 | kubectl-ai가 자체 판단으로 조치하고 trouble-shooting은 참고만 함 | 간단한 문제 처리 빠름 | RAG/runbook과 충돌, LLM 임의 해결 가능 |
-| trouble-shooting 중심 | trouble-shooting이 해결 방향을 결정하고 kubectl-ai는 실행만 함 | 일관된 runbook 기반 조치 | 간단한 문제에도 RAG/계획 생성 비용 발생 |
-| 하이브리드 | kubectl-ai가 고확신 단순 문제는 직접 처리, 불확실하면 trouble-shooting이 판단 | 비용과 안정성 균형 | confidence/게이트 설계 필요 |
+| ReAct 중심 | ReAct loop가 자체 판단으로 조치하고 guidance는 참고만 함 | 간단한 문제 처리 빠름 | RAG/runbook과 충돌, LLM 임의 해결 가능 |
+| guidance 중심 | guidance가 해결 방향을 결정하고 ReAct loop는 실행만 함 | 일관된 runbook 기반 조치 | 간단한 문제에도 RAG/계획 생성 비용 발생 |
+| 하이브리드 | ReAct loop가 고확신 단순 문제는 직접 처리, 불확실하면 guidance를 참고 | 비용과 안정성 균형 | confidence/게이트 설계 필요 |
 
-현재 선호 방향은 하이브리드다. 단, 하이브리드에서도 trouble-shooting 결과가 나온 뒤에는 kubectl-ai가 임의로 다른 해결책을 만들지 않도록 실행 프롬프트를 제한해야 한다.
+현재 구현은 하이브리드에 가깝다. 단, guidance 결과가 나온 뒤에도 Kubernetes 변경 실행은 반드시 ReAct/tool loop, approval, mutation verification lifecycle을 통과해야 한다.
 
-### 3. tool name과 MCP server name
+### 3. MCP server name과 tool name
 
-kubectl-ai는 MCP tool을 `<server_name>_<tool_name>` 형태로 등록한다. `trouble-shooting`처럼 server name에 hyphen이 들어가면 tool calling 구현에 따라 `trouble-shooting_match_runbook` 같은 이름이 안정적으로 호출되지 않을 수 있다.
+kubectl-ai는 MCP tool을 `<server_name>_<tool_name>` 형태로 등록한다. 현재 guidance는 MCP 서버가 아니므로 이 논점은 log-analyzer 같은 optional MCP 서버에만 적용된다.
 
 검토 방향:
 
-- `~/.k8s-assistant/mcp.yaml`의 server name을 `troubleshooting`으로 바꾸는 방안
-- prompt에서도 `troubleshooting_match_runbook`처럼 hyphen 없는 이름을 사용하는 방안
-- 더 좋은 방향은 prompt에 tool name을 하드코딩하지 않고 실제 등록된 tool 목록을 주입하는 방안
+- optional MCP server name에는 hyphen이 없는 이름을 권장한다.
+- prompt에는 특정 MCP tool name을 하드코딩하지 않고 실제 등록된 tool 목록을 주입한다.
+- guidance 관련 동작은 MCP tool name이 아니라 internal structured output과 client 호출 기준으로 문서화한다.
 
-현재 코드는 `trouble-shooting` 이름을 사용한다. 이 변경은 설정 호환성과 문서 변경을 동반하므로 별도 결정이 필요하다.
+현재 코드 기준으로 `trouble-shooting` MCP 서버는 존재하지 않는다.
 
 ### 4. 언어 출력 안정화
 
@@ -104,8 +105,8 @@ If a tool or model produces non-Korean text, translate it to Korean before answe
 ## 다음 revise 후보
 
 1. self assessment block을 system prompt에 추가한다.
-2. Orchestrator가 self assessment를 파싱해 trouble-shooting 호출 여부를 결정한다.
-3. trouble-shooting 결과가 tool call 실패 또는 빈 계획이면 자동 진행 질문을 표시하지 않는다.
-4. MCP server name을 `troubleshooting`으로 변경할지 결정한다.
-5. trouble-shooting 결과를 자유 텍스트가 아니라 decision contract 형태로 구조화할지 결정한다.
-6. delete/recreate 절차를 runbook/RAG에 반영하고, kubectl-ai 실행 prompt에는 복구 가능한 절차만 허용하도록 제한한다.
+2. Orchestrator가 self assessment를 파싱해 incident guidance 호출 여부를 결정한다.
+3. guidance 결과가 tool call 실패 또는 빈 계획이면 자동 진행 질문을 표시하지 않는다.
+4. optional MCP server name에는 hyphen 없는 이름을 권장한다.
+5. guidance 결과를 자유 텍스트가 아니라 decision contract 형태로 구조화할지 결정한다.
+6. delete/recreate 절차를 runbook/RAG에 반영하고, ReAct 실행 prompt에는 복구 가능한 절차만 허용하도록 제한한다.

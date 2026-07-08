@@ -24,12 +24,12 @@
 
 ## Current Evidence
 
-현재 코드에서 확인된 설계 흔들림:
+현재 코드에서 확인된 구현 상태:
 
 - `orchestrator.handleMessage`가 agent text/tool result를 보고 `IncidentGuidanceFlow`를 갱신한다.
-- `orchestrator.handleAgentInputRequest`는 ReAct input 요청 직전에 incident guidance를 처리할 수 있다.
-- `react.Loop`의 상태 의미가 `state` enum 하나가 아니라 `phaseStepState`, `guideStepState`, `finalReportRequested`, `guidedPhaseProgressRequested`, `pendingDirectionPrompt`, `resourceGuideInjected`, `pendingMutationVerification`, `mutationContinuationRequired` 조합에 의존한다.
-- `phase_plan`은 model이 제안하고 runtime은 형식/전이 일부만 검증한다.
+- `orchestrator.handleAgentInputRequest`는 ReAct-owned input을 incident guidance prompt로 선점하지 않고, `ControlState`와 input kind로 dispatch한다.
+- `react.Loop`는 `State` enum과 함께 `RuntimeSnapshot.Control`을 파생해 requirement/phase/guide/final/next/mutation/user-input 대기 상태를 구분한다.
+- `phase_plan`은 model이 제안하지만 runtime이 schema, forward-only transition, mutation verification phase, CRD guidance eligibility를 수용 전에 검증한다.
 
 최근 구현에서 반영된 부분:
 

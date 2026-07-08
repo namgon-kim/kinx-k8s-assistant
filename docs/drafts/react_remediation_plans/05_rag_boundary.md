@@ -1,5 +1,11 @@
 # Plan 05: RAG Boundary
 
+> 상태: 구현됨.
+>
+> Resource guide는 `internal/react`의 `guidance_lookup` phase와 CRD discovery gate를
+> 통해서만 진입한다. Incident guidance는 orchestrator continuation choice에서
+> 명시적으로 선택될 때만 `internal/guidance` client로 실행된다.
+
 ## Problem
 
 이 프로젝트에는 두 종류의 RAG/guidance가 있다.
@@ -25,6 +31,10 @@ resource guide는 비교적 phase contract 안에 들어와 있지만, incident 
   - keyword 기반으로 offer pending을 만든다.
   - ReAct continuation choice에 `[runbook 검색]` option으로만 노출된다.
   - 선택된 runbook/plan이 usable validation을 통과할 때만 summary로 출력한다.
+  - summary command는 confirmation-required step, 미완성 template placeholder, 불완전한 namespace/value가 있으면 표시하지 않는다.
+- `internal/guidance/client.go`
+  - `Analyze`는 runbook match 후 plan을 만들 때 `AllowMutation=true`, `RequireDryRun=true`, `RequireConfirmation=true` 제약을 사용한다.
+  - 이 plan은 orchestrator summary의 입력일 뿐이며 ReAct tool dispatch로 자동 주입되지 않는다.
 
 ## Desired Contract
 
@@ -69,6 +79,16 @@ func incidentGuidanceResultUsable(result *guidance.ClientResult) bool
 
 5. out-of-band runbook remediation prompt는 제거됐다. runbook summary는 evidence/provider output일 뿐이고 Kubernetes 변경 실행은 ReAct/tool loop 안에서만 이뤄진다.
 
+6. summary formatter는 unsafe/incomplete command를 숨긴다.
+
+숨김 조건:
+
+- `RequiresConfirmation=true`
+- rendered command에 `{{...}}` placeholder가 남아 있음
+- placeholder 대체값이 target/step variables에서 확인되지 않음
+- `-n`, `--namespace`, `--namespace=` 값이 비어 있음
+- rendered command에 incomplete marker인 ` / `가 남아 있음
+
 ## Example
 
 web-app deployment 문제인데 runbook 검색 결과가 `Node NotReady`이고 detection이 `Unknown`이면:
@@ -100,7 +120,7 @@ web-app deployment 문제인데 runbook 검색 결과가 `Node NotReady`이고 d
 
 - target compatibility는 resource kind 중심이다. namespace/name mismatch는 현재 incident client validation이 제공하는 `ValidationResult`를 신뢰한다.
 - runbook `related_objects`가 비어 있으면 target kind로 폐기하지 않는다. runbook metadata가 부족한 상태에서 정상 케이스를 과도하게 차단하지 않기 위한 fail-open 지점이다.
-- runbook summary는 remediation을 실행하지 않는다. 사용자가 실제 변경을 원하면 별도 ReAct 요청으로 들어가고, 그 이후는 approval과 mutation verification lifecycle을 따른다.
+- runbook summary는 remediation을 실행하지 않고 active ReAct loop에 remediation prompt도 주입하지 않는다. 사용자가 실제 변경을 원하면 별도 ReAct 요청으로 들어가고, 그 이후는 approval과 mutation verification lifecycle을 따른다.
 
 ## Regression Scenarios
 

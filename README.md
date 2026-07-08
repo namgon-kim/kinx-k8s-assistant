@@ -435,7 +435,8 @@ kinx-k8s-assistant/
 ├── cmd/
 │   ├── k8s-assistant/
 │   ├── log-analyzer-server/
-│   └── guidance-upload/
+│   ├── guidance-upload/
+│   └── test-banner/
 ├── config/
 │   ├── mcp.yaml
 │   ├── tools.yaml
@@ -443,18 +444,26 @@ kinx-k8s-assistant/
 ├── internal/
 │   ├── config/
 │   ├── diagnostic/
+│   ├── guidance/
+│   ├── k8s/
 │   ├── loganalyzer/
+│   ├── masking/
 │   ├── orchestrator/
 │   ├── react/
-│   ├── toolconnector/
-│   └── guidance/
+│   └── toolconnector/
 ├── prompts/
 │   ├── default.tmpl
 │   └── system_ko.tmpl
 ├── docs/
 │   ├── drafts/
+│   ├── rag/
+│   ├── rag_raws/
 │   ├── reviews/
+│   ├── README.md
+│   ├── TODO.md
+│   ├── architecture_orchestrator_react.md
 │   ├── requirement_analysis.md
+│   ├── request_processing_phases.md
 │   └── guide_progress_and_continuation.md
 ├── GUIDE.md
 ├── Makefile

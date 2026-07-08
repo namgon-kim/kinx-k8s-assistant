@@ -216,74 +216,22 @@ Some user terms are operational concepts rather than Kubernetes resource kinds.
 
 If a node-group question has no prior useful context and no namespace, cluster, resource, or object name is identifiable, classify the target as `unknown` and record the missing details in `ambiguities`.
 
-## TODO: Contract Hardening
+## Current Implementation Notes
 
-The current contract still leaves several runtime-critical details under-specified. Tighten these before adding more requirement-analysis features.
+The runtime implementation is in `internal/react/requirement_prompt.go`, `internal/react/request_context.go`, and `internal/react/context_state.go`.
 
-### TODO: Bound Conversation Memory
+Implemented behavior:
 
-Define the exact size and shape of the previous-context memory injected before requirement analysis.
+- The first model response for each query must be `requirement_analysis`; actions, answers, phase plans, and guide lookups before it are corrected.
+- Previous conversation memory is injected only as compact fields: `previous_original_query`, `previous_requirement_analysis`, `previous_request_context`, and `previous_diagnosis_summary`.
+- Previous memory is bounded by field-specific truncation helpers and hashes. Full raw YAML, logs, event lists, and guide bodies are not carried as follow-up memory.
+- Follow-up defaulting uses prior `request_context` only when the new analysis is diagnostic/remediation, `operational_focus.relationship_to_primary` is `same_primary` or `related_to_primary`, and no explicit current primary target overrides it.
+- `model_inference` primary candidates for related follow-ups are moved into `operational_focus.related_resource_hints` instead of replacing the previous primary target.
+- Placeholder namespace/name values such as unknown or explanatory phrases are normalized away; `unknown` is rejected as a Kubernetes resource kind.
+- Clarification is emitted for diagnostic/remediation requests when `target.category=unknown`, or when no primary resource is available and the target category is not a broad environment/log/event/metric category.
 
-- Set a maximum character or token budget for each memory field:
-  - `previous_original_query`
-  - `previous_requirement_analysis`
-  - `previous_request_context`
-  - `previous_diagnosis_summary`
-- Define the truncation policy for long values:
-  - preferred shape: `content_head`, `content_tail`, `content_hash`, `original_len`, `truncated`
-  - avoid raw full `kubectl` output in follow-up memory
-- Define which fields are allowed in `previous_diagnosis_summary`:
-  - allowed: compact command list, target, namespace, high-signal clues, final conclusion hash/summary
-  - disallowed: full YAML/JSON objects, full logs, full event lists, full guide bodies
-- Define whether memory survives:
-  - a normal new query
-  - `/clear` or `/reset`
-  - language/model/config changes
-  - a failed/incomplete ReAct loop
+Remaining contract details:
 
-Acceptance criteria:
-
-- A follow-up prompt cannot exceed a bounded memory budget because of previous tool output.
-- The model receives enough previous target/scope context without receiving full prior observations.
-- The document names the exact runtime fields that form this memory.
-
-### TODO: Separate LLM Guidance From Runtime Guarantees
-
-Split the contract into two tables:
-
-- Model guidance: values the model should prefer but runtime does not hard-enforce.
-- Runtime guarantees: values the runtime normalizes, rejects, or uses for fallback.
-
-The table should explicitly cover:
-
-- which `request_type` values are accepted as free-form strings
-- which `target.category` values are preferred but not enum-blocked
-- which fields may be omitted
-- which placeholder values are normalized to empty
-- which invalid values force clarification
-- which invalid values trigger correction and retry
-
-Acceptance criteria:
-
-- An implementer can tell whether a bad value should be corrected, normalized, clarified, or allowed.
-- New values can be added without guessing whether runtime validation must change.
-
-### TODO: Define Clarification Boundaries
-
-Clarification behavior is still implicit. Add a decision table for when the assistant should stop and ask the user instead of continuing.
-
-Cases to define:
-
-- no prior context + no concrete resource + diagnostic intent
-- prior context exists + follow-up wording + missing explicit target
-- explicit namespace but no resource target
-- explicit resource kind but no name
-- all-namespaces query without a named object
-- `target.category=unknown`
-- `resource_candidates` empty
-
-Acceptance criteria:
-
-- Follow-up questions do not accidentally clarify when prior context is sufficient.
-- New standalone questions do not silently inherit stale prior context.
-- The clarification message tells the user exactly which missing fields are needed.
+- The exact truncation shape is currently `head + truncated hash`, not a structured `{content_head, content_tail, original_len}` object. Adopt a richer shape only if consumers need it.
+- The runtime accepts preferred enum-like strings but does not hard-block every unlisted `request_type` or `target.category`; future docs should keep model guidance and runtime rejection rules separate.
+- Clarification boundaries are implemented for the high-risk cases above, but the documentation can still add a decision table for edge cases such as namespace-only diagnostic requests or all-namespaces discovery.

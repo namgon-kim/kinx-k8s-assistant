@@ -1,5 +1,11 @@
 # Plan 04: Namespace and Scope Invariant
 
+> 상태: 부분 구현됨.
+>
+> request context namespace와 mutating kubectl command/action target의 namespace
+> invariant는 구현되어 있다. `kubectl apply -f ...` manifest 내부 namespace 검증은
+> 아직 남아 있다.
+
 ## Problem
 
 사용자 요청이나 이전 evidence에서 namespace가 확정되었는데, model이 action target이나 command에서 namespace를 누락할 수 있다. 현재 검증은 `action.target.namespace`가 있을 때 command가 이를 포함하는지만 확인한다. `requestContext.Scope.Namespace`와 command를 직접 비교하는 invariant가 약하다.

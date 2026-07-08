@@ -1,5 +1,14 @@
 # 로그 분석 및 트러블슈팅 기능 개발 초안
 
+> 상태: Legacy 초안.
+>
+> 이 문서는 현재 구현 기준 문서가 아니다. 본문에는 `trouble_shooting` MCP/server,
+> `internal/troubleshooting`, `troubleshooting-upload`, kubectl-ai Agent 재주입 흐름처럼
+> 현재 repository 레이아웃과 다른 과거 설계가 많이 남아 있다.
+> 현재 기준은 `internal/guidance` 내장 client/package, `cmd/guidance-upload`,
+> optional `cmd/log-analyzer-server`, 그리고 k8s-assistant가 직접 소유하는
+> `internal/react` ReAct/tool loop다.
+
 ## 목표
 
 kubectl-ai가 Kubernetes 문제를 감지하거나 문제 원인을 출력한 뒤, 사용자에게 `해결 방법을 찾아볼까요?`라고 확인한다. 사용자가 동의하면 `trouble_shooting`에서 트러블슈팅 사례와 조치 절차를 조회해 출력하고, 다시 `자동으로 해결을 진행할까요?`를 확인한다. 사용자가 자동 해결을 승인하면 조치 계획을 kubectl-ai Agent에 다시 전달해 기존 kubectl-ai 도구/승인 흐름으로 해결 과정을 진행한다.

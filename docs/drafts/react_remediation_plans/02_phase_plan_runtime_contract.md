@@ -1,5 +1,10 @@
 # Plan 02: Phase Plan Runtime Contract
 
+> 상태: 구현됨.
+>
+> `phase_plan` 수용 전 schema/graph validation, mutation verification phase requirement,
+> guided diagnosis lookup requirement, CRD guidance eligibility gate가 적용되어 있다.
+
 ## Problem
 
 현재 phase plan은 model이 생성하고 runtime은 schema와 일부 전이 규칙만 검증한다. 이 구조에서는 model이 운영상 부적절한 phase를 만들거나, 해결 요청인데 검증 phase 없이 종료 가능한 plan을 만들 수 있다.
