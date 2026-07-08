@@ -59,18 +59,6 @@ type promptData struct {
 	IncludeClusterAPIGuardrail bool
 }
 
-func buildSystemPrompt(templateFile string, registry tools.Tools, enableToolUseShim bool, readOnly bool, userLanguage string, translateOutput bool) (string, error) {
-	return buildSystemPromptWithOptions(templateFile, registry, promptOptions{
-		EnableToolUseShim:         enableToolUseShim,
-		ReadOnly:                  readOnly,
-		UserLanguage:              userLanguage,
-		TranslateOutput:           translateOutput,
-		IncludeGuidanceProtocol:   true,
-		IncludeManifestGuidelines: true,
-		ToolProfile:               selectToolProfile(registry, RequestIntentGeneral, ""),
-	})
-}
-
 var promptCache = struct {
 	sync.Mutex
 	values map[string]string

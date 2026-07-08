@@ -22,34 +22,6 @@ func commandString(value any) (string, bool) {
 	return command, true
 }
 
-func customResourceCandidateFromKubectl(command string) (string, bool) {
-	fields := strings.Fields(strings.ToLower(strings.TrimSpace(command)))
-	if len(fields) < 3 || fields[0] != "kubectl" {
-		return "", false
-	}
-	verb, verbIndex, ok := kubectlVerbAndIndexFromFields(fields, 0)
-	if !ok {
-		return "", false
-	}
-	switch verb {
-	case "get", "describe":
-	default:
-		return "", false
-	}
-	resource, ok := firstKubectlResourceArg(fields, verbIndex+1)
-	if !ok {
-		return "", false
-	}
-	if strings.Contains(resource, ",") {
-		resource = strings.Split(resource, ",")[0]
-	}
-	resource = normalizeKubectlResource(resource)
-	if resource == "" || isBuiltinKubernetesResource(resource) {
-		return "", false
-	}
-	return resource, true
-}
-
 func firstKubectlResourceArg(fields []string, start int) (string, bool) {
 	for i := start; i < len(fields); i++ {
 		field := strings.Trim(fields[i], "'\"")

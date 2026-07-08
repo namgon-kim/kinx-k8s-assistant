@@ -417,11 +417,6 @@ func (l *Loop) mutationVerificationFromCall(call PendingCall) (pendingMutationVe
 	return verification, true
 }
 
-func (l *Loop) mutationVerificationCallMatches(call gollm.FunctionCall) bool {
-	_, ok := l.mutationVerificationCallMatchID(call)
-	return ok
-}
-
 func (l *Loop) mutationVerificationCallsMatch(calls []gollm.FunctionCall) bool {
 	if len(calls) == 0 || l.pendingMutationVerification == nil {
 		return false
