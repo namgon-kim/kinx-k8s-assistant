@@ -48,6 +48,7 @@
 | 문서 | 상태 |
 | --- | --- |
 | [`reviews/kubectl_ai_react_loop_review.md`](./reviews/kubectl_ai_react_loop_review.md) | Historical review. kubectl-ai ReAct loop 분리 근거로 보관한다. 현재 구현은 자체 `internal/react` loop를 사용하며, 문서 내 `troubleshooting_flow`, `internal/agent/setup.go`, `internal/react/approval.go` 같은 일부 제안 경로는 현재 파일 구조와 다르다. |
+| [`reviews/react_loop_structure_review.md`](./reviews/react_loop_structure_review.md) | Current structure review. 분산 플래그 상태, gate pipeline, phase/guidance 재진입, mutation verification lifecycle, liveness, protocol channel mixing 리스크를 정리한다. |
 | [`reviews/revise_troubleshooting.md`](./reviews/revise_troubleshooting.md) | guidance/log-analyzer 경계와 남은 revise 논점. 과거 `trouble-shooting` MCP 서버 가정은 현재 구현 기준으로 정리됐다. |
 
 ### RAG 자료
