@@ -1,5 +1,13 @@
 # kubectl-ai ReAct 루프 분리 상세 설계
 
+> 상태: Historical review.
+>
+> 이 문서는 kubectl-ai ReAct loop를 분석하고 k8s-assistant가 자체 loop를 갖게 된
+> 배경을 남긴 검토 문서다. 현재 구현은 이미 `internal/react`가 ReAct loop를 소유한다.
+> 본문 일부 제안 경로(`internal/agent/setup.go`, `internal/react/approval.go`,
+> `troubleshooting_flow.go`)와 troubleshooting 명칭은 현재 repository 레이아웃과
+> 다를 수 있으므로 구현 기준으로 직접 사용하지 않는다.
+
 ## 목적
 
 k8s-assistant가 kubectl-ai의 ReAct Loop를 직접 소유하고, kubectl-ai는 Tool 커넥터 계층(gollm + pkg/tools)으로만 사용한다. 이 문서는 kubectl-ai v0.0.31 소스를 직접 분석하여 루프 이식에 필요한 모든 세부 사항을 기술한다.

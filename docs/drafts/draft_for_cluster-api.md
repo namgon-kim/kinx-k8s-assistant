@@ -1,5 +1,13 @@
 # Cluster-API 기반 서비스 AIOps 설계 초안
 
+> 상태: 미적용 도메인 확장 초안.
+>
+> 이 문서는 Cluster API 도메인 확장 논의 기록이다. 초반부에는 `cluster-api-server`
+> MCP, `trouble-shooting` MCP, `internal/troubleshooting/runbooks` 같은 현재 구현과
+> 맞지 않는 과거 가정이 포함되어 있다. 후반부의 "설계 재검토: 최종 권장 방안"은
+> Kubernetes 데이터 수집을 ReAct/tool loop에 두고, guidance/RAG는 보조 근거로
+> 사용하는 현재 원칙과 더 가깝다.
+
 ## 목적
 
 cluster-api 기반으로 Kubernetes 위에서 운영되는 자체 서비스를 AIOps로 관리한다. 대상은 OpenStack provider 기반으로 프로비저닝되는 클러스터와 그 위에서 동작하는 자체 컨트롤러 및 CRD들이다. OpenStack 레이어 자체는 범위 밖이고, Kubernetes 리소스·자체 컨트롤러 상태·로그 분석이 핵심이다.

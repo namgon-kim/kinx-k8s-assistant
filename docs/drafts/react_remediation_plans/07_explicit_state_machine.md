@@ -1,5 +1,11 @@
 # Plan 07: Explicit State Machine
 
+> 상태: 부분 구현됨.
+>
+> `RuntimeSnapshot.Control`, input dispatch decision, runtime-state anchor, cleanup policy는
+> 현재 코드에 반영되어 있다. 다만 `inputOwner` compatibility field 제거와 일부
+> 요청 directive의 완전한 `ControlState` 파생화는 후속 cleanup으로 남아 있다.
+
 ## 목적
 
 이 문서는 `internal/react`의 implicit state machine을 명시적 state machine으로 바꾸기 전에 반드시 정의하고 점검해야 할 내용을 고정한다.

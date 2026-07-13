@@ -38,9 +38,9 @@ In particular:
 - Use logs only for explicit log/log-analysis requests, or after user input, live evidence, or guide context identifies a concrete log-bearing Pod, container, or controller.
 - Use RAG only when the accepted phase plan reaches a guidance phase, observed evidence exists, and runtime discovery confirms the relevant guide-supported resource family.
 
-## Resolution Strategy
+## Current Runtime Strategy
 
-The current implementation still has legacy guide-trigger behavior in some places. The target design is:
+The current implementation uses the phase-owned guide entry path:
 
 1. `requirement_analysis` classifies intent, target, scope, and operational focus.
 2. The model emits a `phase_plan` made of ordered `phase_step` entries.
@@ -48,7 +48,7 @@ The current implementation still has legacy guide-trigger behavior in some place
 4. The model emits one action or one response for the active phase.
 5. The model reports `phase_progress` when the active `phase_step` is complete.
 6. Runtime records that completion, advances to the next `phase_step`, and injects the next phase anchor.
-7. After an observation phase is completed, runtime may run Kubernetes discovery to confirm CRD/resource-family eligibility and expose that confirmation to the model.
+7. Runtime discovery classifies the accepted primary resource as built-in, CRD-backed, or unknown and exposes that eligibility to the model.
 8. The model decides whether to enter a guidance phase. Runtime does not automatically inject RAG only because a CRD was observed.
 9. If guidance is selected and injected, guide diagnostic steps become nested `guidance_step` entries inside the active `guided_diagnosis` phase.
 10. `final_report` closes the request after either ordinary phase completion or guided diagnosis completion.
@@ -67,7 +67,7 @@ observation phase complete -> runtime confirms CRD eligibility -> model enters g
 
 ## Phase Plan Contract
 
-The model should return a phase plan near the start of the request, after `requirement_analysis` and before ordinary kubectl actions. The exact transport can be a top-level internal function call or a field attached to the accepted request analysis; the contract is the same.
+The model should return a phase plan near the start of the request, after `requirement_analysis` and before ordinary kubectl actions. The runtime transport is a top-level internal structured call named `__phase_plan__`; shim mode accepts the equivalent top-level `phase_plan` object and normalizes it to that internal call.
 
 ```json
 {
@@ -402,9 +402,9 @@ RAG is useful when the assistant needs procedural operating knowledge beyond the
 - Guide progress begins only after a guide is injected and only inside the `guided_diagnosis` `phase_step`. Before that, observations belong to the default request-processing pipeline and are completed with `phase_progress`.
 - `resource guide injected...` style messages are internal logs, not user-facing output.
 
-## Open Design Items
+## Remaining Contract Details
 
-These items should be resolved before making guide lookup more automatic:
+The phase-owned guide path is implemented. The remaining work is contract hardening, not another guide-entry path:
 
 - Refine phase-progress validation beyond structural checks, especially for broad scans and ambiguous evidence.
 - Define when a broad scan becomes diagnostic evidence instead of target resolution.

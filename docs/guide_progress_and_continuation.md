@@ -11,11 +11,11 @@ Two patterns frequently regressed during long diagnoses:
 1. **Drift from the determined request.** The model's attention shifts to the most recent tool observation and stops serving the original `requirement_analysis`.
 2. **Drift from the RAG guide.** The injected resource-guide body becomes "old" chat history. The model collects evidence but never converges on the answer or sometimes invents new diagnostic targets disconnected from the guide.
 
-The runtime addresses both without forcibly blocking output. Two anchors are re-emitted on every iteration, and the loop has a defined exhaustion path that hands control back to the user.
+The runtime addresses both without relying only on prompt memory. Compact anchors are re-emitted on every iteration, and directive gates define the exhaustion path that hands control back to the user.
 
 ## Iteration anchors
 
-`Loop.buildIterationSendContent` prepends compact anchor messages before whatever the current iteration is sending. Order matters: `requirement_analysis` first (the user-level goal), then `phase_step` when a phase plan is active, then `guide_step` only while the active phase is `guided_diagnosis`, then the latest observations.
+`Loop.buildIterationSendContent` prepends compact anchor messages before whatever the current iteration is sending. Because each anchor is prepended, the model sees them in this effective order: `runtime_state`, `requirement_analysis`, `phase_step`, `guide_step`, `mutation_verification`, then the latest observations. `runtime_state` comes first so required/forbidden next outputs are visible before the model reads the older diagnostic context.
 
 ### requirement_analysis anchor
 
@@ -118,7 +118,7 @@ In native function-calling mode, guide progress is a separate runtime-internal f
 | `step_completed` | 1-based index of the guide step advanced by live evidence. Omit when no guide is active. |
 | `evidence_useful` | True when the previous observation moved diagnosis forward. Omit when no guide is active. |
 
-When this field is present and the referenced evidence is useful, `consumeGuideProgress` calls `markGuideStepCompleted(step)`. If the model omits explicit guide progress, the runtime may infer completion only for the current next guide step when the executed command matches that step's command template. Observations with explicit errors or statuses such as `blocked`, `declined`, `failed`, or `error` do not complete guide steps.
+When this field is present and the referenced evidence is useful, `consumeGuideProgress` calls `markGuideStepCompleted(step)`. If the model omits explicit guide progress, `recordAction` may infer completion only for the current next guide step when the executed command exactly matches the rendered guide command after whitespace normalization. Observations with explicit errors or statuses such as `blocked`, `declined`, `failed`, or `error` do not complete guide steps.
 
 When `guideStepState.allCompleted()` becomes true, the model should emit `phase_progress` for the parent `guided_diagnosis` phase and then proceed to `final_report`. Runtime may request a final report as a safety fallback, but the conceptual transition is phase-level, not guide-step-level.
 
@@ -270,6 +270,7 @@ New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirec
 ## Design constraints honored
 
 - **Directive gates for critical transitions.** When runtime has requested guide completion, final report, or mutation verification result, conflicting structured outputs are rejected instead of being silently executed or dropped. Anchors still provide context, but lifecycle safety no longer depends only on the model following a soft instruction.
+- **Conversation and observation gates.** Conversation/clarification requests cannot escape into `kubectl`/shell tool calls, and shell commands that only print or wait locally are rejected before dispatch because they do not produce cluster evidence.
 - **Single-case tracking.** Only the top guide case's `DiagnosticSteps` populates `guideStepState`. Multi-case progress is not tracked because the runtime only injects one case at a time.
 - **No MaxIteration coupling.** `MaxIterations` still ends the loop with the existing "Maximum number of iterations reached" message. Guide-exhaustion via `final_report` is independent and can fire well before `MaxIterations`.
 - **Phase owns guide.** `guideStepState` is subordinate to the active `guided_diagnosis` `phase_step`; guide completion should lead to parent `phase_progress`, not directly replace the phase workflow.
@@ -289,11 +290,11 @@ New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirec
 - `guide_progress.step_completed` is the model's self-report, not enforced by command matching. It is ignored when the corresponding observation is blocked, declined, failed, or errored. Misreported indices on successful observations are accepted (the worst case is premature parent phase-progress/final-report instruction or a step staying open).
 - Internal schema/correction errors, including invalid `next_directions`, are runtime errors rather than Kubernetes incident evidence. They must not trigger incident guidance offers.
 
-## TODO: Contract Hardening
+## Remaining Contract Hardening
 
-The current guide progress and continuation contract still has ambiguous areas that can cause premature conclusions or inconsistent fallback behavior. Tighten these before adding more continuation features.
+The current guide progress and continuation runtime is implemented, but a few semantic thresholds still need tighter documentation before adding more continuation features.
 
-### TODO: Define `final_report.conclusive` Evidence Levels
+### Define `final_report.conclusive` Evidence Levels
 
 The current text says a report is conclusive when the evidence is sufficient, but it does not define sufficient. Add an evidence-level table that separates symptoms, supported causes, and root causes.
 
@@ -318,31 +319,16 @@ Acceptance criteria:
 - A Cluster condition such as `WorkersAvailable=False` alone cannot produce a root-cause final report.
 - The final report can still be useful by saying what is known, what is missing, and what should be inspected next.
 
-### TODO: Specify Guide Step Completion Matching
+### Implemented: Guide Step Completion Matching
 
-The contract says the runtime may infer guide step completion when a command matches a step template, but the match semantics are not defined.
+Runtime supports two guide-step completion paths:
 
-Define:
+- Explicit `guide_progress.step_completed` is accepted only when `evidence_useful` is not false and the current tool observation succeeded.
+- Automatic inference is limited to the current next guide step and requires exact equality between the executed command and `GuideCase.DiagnosticSteps[].RenderedCommand` after whitespace normalization.
 
-- whether matching is exact normalized command equality or structured command matching
-- whether namespace, name, selectors, labels, and resource/name shorthand must match
-- whether a command that queries only part of a multi-resource template can complete the step
-- whether a command with extra resources can complete the step
-- whether a command with the same verb/resource but different selector can complete the step
-- whether a failed command can ever complete the step
+Partial command matches, selector-equivalent commands, extra-resource commands, failed observations, blocked read-only attempts, and declined approvals do not complete guide steps automatically.
 
-Suggested default:
-
-- Exact normalized rendered command match is the only automatic completion path.
-- Explicit `guide_progress.step_completed` is accepted only when the observation is useful and not blocked/declined/failed/error.
-- Partial command matches do not complete a step unless explicitly documented for that guide.
-
-Acceptance criteria:
-
-- An implementer does not have to guess whether `kubectl get cluster <name>` completes a step whose template queried `cluster/openstackcluster/kamajicontrolplane`.
-- Premature `final_report` requests cannot be caused by loose verb/resource matching.
-
-### TODO: Fully Catalog Runtime Fallbacks and Directive Gates
+### Catalog Runtime Fallbacks and Directive Gates
 
 The current design uses prompt-level guidance for ordinary reasoning, but runtime gates for schema, safety, and lifecycle transitions. Keep the boundary explicit so future changes do not reintroduce soft-only control for critical transitions.
 
@@ -361,6 +347,11 @@ Explicitly include:
 - requested `phase_progress`/`final_report` after guide completion
 - requested `mutation_verification_result` after mutation verification evidence is collected
 - `mutationContinuationRequired` after `progressing` or `unresolved`
+- conversation/clarification requests attempting tool calls
+- self-talk shell actions such as `echo`, `printf`, `sleep`, or `read`
+- assistant-managed guidance tool names emitted as model tool calls
+- interactive command blocks
+- classified tool failures: `command_syntax`, `rbac_forbidden`, `resource_not_found`, `timeout_or_api_unavailable`, `partial_success`, `unknown`
 - action target mismatch
 - read-only mutation block
 - approval decline
@@ -370,9 +361,9 @@ Acceptance criteria:
 - Directive gates are limited to schema, safety, and lifecycle-critical transitions.
 - Runtime fallback behavior is predictable and documented for every internal structured output.
 
-### TODO: Bound `next_directions` Fallback Directives
+### Bound `next_directions` Fallback Directives
 
-The fallback option built from `blockers` and `evidence_missing` can become vague or too long. Define how to create a safe generic `different_approach` directive.
+The runtime already falls back to a generic `different_approach` built from `blockers` and `evidence_missing` when repeated `next_directions` correction fails. The remaining contract work is bounding that generated directive.
 
 Rules to define:
 
@@ -389,18 +380,17 @@ Acceptance criteria:
 - Fallback directives cannot inject raw YAML/log blobs back into the model.
 - The user can still choose "직접 다른 방향 입력" or "여기서 진단 종료" when no safe generic option exists.
 
-### TODO: Document Internal Error Isolation
+### Document Internal Error Isolation
 
-The contract now states internal schema/correction errors are not incident evidence, but it does not define the full classification.
-
-Add a table of error classes:
+The runtime already filters internal runtime/schema/correction text out of incident guidance offers. The table below is the current classification boundary to preserve when new gates are added.
 
 | Error class | Examples | User-visible? | Incident guidance candidate? |
 |---|---|---|---|
-| Kubernetes observation error | `kubectl` not found, resource not found, API forbidden | Yes | Maybe, only if related to user diagnosis |
+| Kubernetes observation error | resource not found, API forbidden, timeout, partial result | Yes | Maybe, only if related to user diagnosis and the continuation choice UI is already shown |
+| Agent command error | command syntax, `kubectl` binary missing, self-talk shell action, interactive command | Yes as retry/correction context | No by itself |
 | Runtime schema error | invalid `next_directions`, invalid `final_report`, shim parse issue | No or compact message | No |
 | Provider error | LLM HTTP 500, context length, streaming error | Yes as assistant/runtime error | No |
-| User approval outcome | declined, read-only blocked | Yes | No |
+| User approval/policy outcome | declined, read-only blocked, RBAC blocker | Yes | No by itself |
 
 Acceptance criteria:
 

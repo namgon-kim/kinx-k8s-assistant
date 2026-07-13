@@ -1,5 +1,11 @@
 # Plan 01: User Input Ownership
 
+> 상태: 구현됨.
+>
+> `RuntimeSnapshot.Control` 기반 input dispatch와 orchestrator의 incident guidance
+> choice-gating이 반영되어 있다. ReAct-owned free text/approval/choice 입력은
+> incident side-flow가 선점하지 않는다.
+
 ## Problem
 
 ReAct loop가 사용자 입력을 기다리는 동안 orchestrator side-flow가 같은 입력 지점을 가로챌 수 있다. 실제 재현에서는 `next_directions`에서 "직접 다른 방향 입력"을 선택한 뒤, free-text 입력을 받아야 하는 순간에 incident guidance prompt가 먼저 나왔다.
