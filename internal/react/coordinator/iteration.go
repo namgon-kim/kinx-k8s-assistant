@@ -16,7 +16,12 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/guidance"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
+	directionflow "github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/direction"
+	gateflow "github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/gate"
+	guidanceflow "github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/guidance"
+	phaseflow "github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/phase"
 	reportflow "github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/report"
+	verificationflow "github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/verification"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/kube"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/protocol"
 	"k8s.io/klog/v2"
@@ -1078,13 +1083,7 @@ func phasePlanHasGuidedDiagnosis(plan phasePlan) bool {
 }
 
 func phasePlanHasPhase(plan phasePlan, name string) bool {
-	normalized := normalizedPhaseName(name)
-	for _, step := range plan.PhaseSteps {
-		if normalizedPhaseName(step.Name) == normalized {
-			return true
-		}
-	}
-	return false
+	return phaseflow.HasPhase(plan, name)
 }
 
 func normalizedPhaseName(name string) string {
@@ -1179,104 +1178,15 @@ func phaseExecutionStepsFromValue(value any) ([]phaseExecutionStep, bool) {
 }
 
 func phaseExecutionStepValid(step phaseExecutionStep) bool {
-	if strings.TrimSpace(step.ID) == "" && step.Index <= 0 {
-		return false
-	}
-	return strings.TrimSpace(step.Kind) != "" ||
-		strings.TrimSpace(step.Description) != "" ||
-		strings.TrimSpace(step.Command) != "" ||
-		strings.TrimSpace(step.ExpectedOutcome) != ""
+	return phaseflow.ExecutionStepValid(step)
 }
 
 func phaseExecutionStepsValid(steps []phaseExecutionStep) bool {
-	seenID := map[string]struct{}{}
-	seenIndex := map[int]struct{}{}
-	for _, step := range steps {
-		if !phaseExecutionStepValid(step) {
-			return false
-		}
-		if id := strings.ToLower(strings.TrimSpace(step.ID)); id != "" {
-			if _, ok := seenID[id]; ok {
-				return false
-			}
-			seenID[id] = struct{}{}
-		}
-		if step.Index > 0 {
-			if _, ok := seenIndex[step.Index]; ok {
-				return false
-			}
-			seenIndex[step.Index] = struct{}{}
-		}
-	}
-	return true
+	return phaseflow.ExecutionStepsValid(steps)
 }
 
 func phasePlanValid(plan phasePlan) bool {
-	if strings.TrimSpace(plan.RequestGoal) == "" || len(plan.PhaseSteps) == 0 {
-		return false
-	}
-	foundCurrent := false
-	seenIndex := make(map[int]struct{}, len(plan.PhaseSteps))
-	seenName := make(map[string]struct{}, len(plan.PhaseSteps))
-	indexByName := make(map[string]int, len(plan.PhaseSteps))
-	for _, step := range plan.PhaseSteps {
-		if step.Index == 0 || strings.TrimSpace(step.Name) == "" {
-			return false
-		}
-		if !phaseExecutionStepsValid(step.Steps) {
-			return false
-		}
-		if _, ok := seenIndex[step.Index]; ok {
-			return false
-		}
-		seenIndex[step.Index] = struct{}{}
-		name := strings.ToLower(strings.TrimSpace(step.Name))
-		if _, ok := seenName[name]; ok {
-			return false
-		}
-		seenName[name] = struct{}{}
-		indexByName[name] = step.Index
-		if step.Index == plan.CurrentPhaseIndex {
-			foundCurrent = true
-		}
-	}
-	for _, step := range plan.PhaseSteps {
-		if phaseStepHasLaterStep(plan.PhaseSteps, step.Index) && len(nonEmptyStrings(step.AllowedNext)) == 0 {
-			return false
-		}
-		for _, next := range step.AllowedNext {
-			nextName := strings.ToLower(strings.TrimSpace(next))
-			if nextName == "" {
-				continue
-			}
-			if _, ok := seenName[nextName]; !ok {
-				return false
-			}
-			if indexByName[nextName] <= step.Index {
-				return false
-			}
-		}
-	}
-	return foundCurrent
-}
-
-func phaseStepHasLaterStep(steps []phaseStep, index int) bool {
-	for _, step := range steps {
-		if step.Index > index {
-			return true
-		}
-	}
-	return false
-}
-
-func nonEmptyStrings(values []string) []string {
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			out = append(out, value)
-		}
-	}
-	return out
+	return phaseflow.Validate(plan)
 }
 
 func phaseProgressFromFunctionCall(call gollm.FunctionCall) (phaseProgress, bool) {
@@ -1392,7 +1302,7 @@ func (s *phaseStepState) acceptProgress(progress phaseProgress) bool {
 		return false
 	}
 	current := s.currentStep()
-	if current.Index == 0 || progress.PhaseCompleted != current.Index {
+	if !phaseflow.MatchesCurrent(current.Index, progress.PhaseCompleted) {
 		return false
 	}
 	if s.Completed == nil {
@@ -2613,111 +2523,57 @@ func normalizeGuideCommand(command string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(command)), " ")
 }
 
-type GateOutcomeKind string
+type GateOutcomeKind = gateflow.OutcomeKind
 
 const (
-	GateOutcomeModelOutputCorrection GateOutcomeKind = "model_output_correction"
-	GateOutcomeAgentCommandRetry     GateOutcomeKind = "agent_command_retry"
-	GateOutcomeUserRequestBlocked    GateOutcomeKind = "user_request_blocked"
-	GateOutcomePolicyBlock           GateOutcomeKind = "policy_block"
-	GateOutcomeToolExecutionFailure  GateOutcomeKind = "tool_execution_failure"
-	GateOutcomeRetrievalResultGate   GateOutcomeKind = "retrieval_result_gate"
-	GateOutcomeApprovalRequired      GateOutcomeKind = "approval_required"
-	GateOutcomeHumanInputRequired    GateOutcomeKind = "human_input_required"
-	GateOutcomeExternalStateWait     GateOutcomeKind = "external_state_wait"
-	GateOutcomeHardInvariant         GateOutcomeKind = "hard_invariant"
+	GateOutcomeModelOutputCorrection = gateflow.ModelOutputCorrection
+	GateOutcomeAgentCommandRetry     = gateflow.AgentCommandRetry
+	GateOutcomeUserRequestBlocked    = gateflow.UserRequestBlocked
+	GateOutcomePolicyBlock           = gateflow.PolicyBlock
+	GateOutcomeToolExecutionFailure  = gateflow.ToolExecutionFailure
+	GateOutcomeRetrievalResultGate   = gateflow.RetrievalResultGate
+	GateOutcomeExternalStateWait     = gateflow.ExternalStateWait
 )
 
-type RetryScope string
+type RetryScope = gateflow.RetryScope
 
 const (
-	RetryScopeNone          RetryScope = ""
-	RetryScopeCurrentStep   RetryScope = "current_step"
-	RetryScopeCurrentPhase  RetryScope = "current_phase"
-	RetryScopeAgentCommand  RetryScope = "agent_command"
-	RetryScopeUserRequest   RetryScope = "user_request"
-	RetryScopeExternalState RetryScope = "external_state"
+	RetryScopeNone          = gateflow.RetryNone
+	RetryScopeCurrentStep   = gateflow.RetryCurrentStep
+	RetryScopeCurrentPhase  = gateflow.RetryCurrentPhase
+	RetryScopeAgentCommand  = gateflow.RetryAgentCommand
+	RetryScopeUserRequest   = gateflow.RetryUserRequest
+	RetryScopeExternalState = gateflow.RetryExternalState
 )
 
-type CorrectionMode string
+type CorrectionMode = gateflow.CorrectionMode
 
 const (
-	CorrectionModeNone            CorrectionMode = "none"
-	CorrectionModeAppendCompacted CorrectionMode = "append_compacted"
-	CorrectionModeAppendPlain     CorrectionMode = "append_plain"
-	CorrectionModeUserMessageOnly CorrectionMode = "user_message_only"
+	CorrectionModeNone            = gateflow.CorrectionNone
+	CorrectionModeAppendCompacted = gateflow.CorrectionAppendCompacted
+	CorrectionModeAppendPlain     = gateflow.CorrectionAppendPlain
+	CorrectionModeUserMessageOnly = gateflow.CorrectionUserMessageOnly
 )
 
-type BranchPolicy string
+type BranchPolicy = gateflow.BranchPolicy
 
 const (
-	BranchStayCurrent      BranchPolicy = "stay_current"
-	BranchRetryStep        BranchPolicy = "retry_step"
-	BranchRecheckStep      BranchPolicy = "recheck_step"
-	BranchSkipStep         BranchPolicy = "skip_step"
-	BranchMovePhase        BranchPolicy = "move_phase"
-	BranchRewindPhase      BranchPolicy = "rewind_phase"
-	BranchBlockUserRequest BranchPolicy = "block_user_request"
+	BranchStayCurrent      = gateflow.StayCurrent
+	BranchRetryStep        = gateflow.RetryStep
+	BranchRecheckStep      = gateflow.RecheckStep
+	BranchSkipStep         = gateflow.SkipStep
+	BranchMovePhase        = gateflow.MovePhase
+	BranchRewindPhase      = gateflow.RewindPhase
+	BranchBlockUserRequest = gateflow.BlockUserRequest
 )
 
-type GateOutcome struct {
-	Allow bool
-	Kind  GateOutcomeKind
-	Code  string
-
-	ExpectedControl RuntimeControlState
-	TargetPhase     *PhaseRef
-	TargetStep      *StepRef
-
-	Retryable  bool
-	RetryScope RetryScope
-
-	UserVisible     bool
-	UserMessage     string
-	ModelCorrection string
-
-	CorrectionMode CorrectionMode
-	BranchPolicy   BranchPolicy
-}
+type GateOutcome gateflow.Outcome
 
 func (o GateOutcome) Validate(snapshot RuntimeSnapshot) error {
-	if o.Allow {
-		return nil
-	}
-	if o.TargetPhase != nil && !snapshot.hasPhaseRef(*o.TargetPhase) {
-		return fmt.Errorf("target phase does not exist: %s", o.TargetPhase.String())
-	}
-	if o.TargetStep != nil && !snapshot.hasStepRef(*o.TargetStep) {
-		return fmt.Errorf("target step does not exist: %s", o.TargetStep.String())
-	}
-	if o.BranchPolicy == BranchSkipStep {
-		if o.TargetStep == nil {
-			return fmt.Errorf("branch policy %s requires target step", o.BranchPolicy)
-		}
-		if err := validateSkippableStepRef(*o.TargetStep); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func validateSkippableStepRef(ref StepRef) error {
-	switch ref.Kind {
-	case StepResourceGuideDiagnostic:
-		if ref.Index <= 0 {
-			return fmt.Errorf("branch policy %s requires a positive guide step index", BranchSkipStep)
-		}
-		return nil
-	case StepMutationEvidenceRequirement:
-		if strings.TrimSpace(ref.ID) == "" {
-			return fmt.Errorf("branch policy %s requires a mutation evidence requirement id", BranchSkipStep)
-		}
-		return nil
-	case StepGeneralAction:
-		return fmt.Errorf("branch policy %s does not support general action steps", BranchSkipStep)
-	default:
-		return fmt.Errorf("branch policy %s does not support step kind %q", BranchSkipStep, ref.Kind)
-	}
+	return gateflow.Validate(gateflow.Outcome(o), gateflow.ValidationContext{
+		HasTargetPhase: o.TargetPhase == nil || snapshot.hasPhaseRef(*o.TargetPhase),
+		HasTargetStep:  o.TargetStep == nil || snapshot.hasStepRef(*o.TargetStep),
+	})
 }
 
 func (l *Loop) applyGateOutcome(outcome GateOutcome) bool {
@@ -2745,13 +2601,7 @@ func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repea
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime gate outcome이 현재 runtime snapshot과 맞지 않아 루프를 중단했습니다.\n"+err.Error())
 		return true
 	}
-	message := strings.TrimSpace(outcome.ModelCorrection)
-	if message == "" {
-		message = strings.TrimSpace(outcome.UserMessage)
-	}
-	if message == "" {
-		message = "Runtime gate blocked the previous model output. Choose a safe corrected next step."
-	}
+	message := gateflow.Message(strings.TrimSpace(outcome.ModelCorrection), strings.TrimSpace(outcome.UserMessage), "Runtime gate blocked the previous model output. Choose a safe corrected next step.")
 	code := strings.TrimSpace(outcome.Code)
 	if code == "" {
 		code = "runtime_gate_blocked"
@@ -2814,10 +2664,7 @@ func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repea
 }
 
 func (o GateOutcome) AssertExpectedControl(snapshot RuntimeSnapshot) error {
-	if o.ExpectedControl == "" || snapshot.Control == o.ExpectedControl {
-		return nil
-	}
-	return fmt.Errorf("expected control %s, got %s", o.ExpectedControl, snapshot.Control)
+	return gateflow.AssertExpectedControl(o.ExpectedControl, snapshot.Control)
 }
 
 func (l *Loop) applyGateBranch(outcome GateOutcome) error {
@@ -2845,6 +2692,9 @@ func (l *Loop) applyGateBranch(outcome GateOutcome) error {
 		}
 		if outcome.TargetStep.Kind == StepResourceGuideDiagnostic && l.guideStepState != nil && l.guideStepState.allCompleted() {
 			l.requestPostGuideCompletionDirective()
+		}
+		if outcome.TargetStep.Kind == StepMutationEvidenceRequirement {
+			l.transitionMutationVerification()
 		}
 		return nil
 	case BranchRewindPhase:
@@ -2944,6 +2794,7 @@ func (l *Loop) applyRecheckStepBranch(outcome GateOutcome) error {
 	attempt, exhausted := l.consumeMutationContinuationAttempt()
 	if exhausted {
 		l.transitionControl(RuntimeControlAwaitingFinalReport)
+		l.finalReportMustBeInconclusive = true
 		l.queueResponseDirective(fmt.Sprintf("External state recheck budget is exhausted after %d recheck attempts for source_gate=%s. Return final_report with conclusive=false, summarize the recheck attempts, and explain that the external state did not reach a resolved condition within the runtime budget.", attempt, strings.TrimSpace(outcome.Code)))
 		return nil
 	}
@@ -2989,6 +2840,9 @@ func (s RuntimeSnapshot) hasPhaseRef(ref PhaseRef) bool {
 }
 
 func (s RuntimeSnapshot) hasStepRef(ref StepRef) bool {
+	if ref.Kind == "" && ref.ID == "" && ref.Index == 0 {
+		return false
+	}
 	for _, step := range s.ActiveSteps {
 		if step.Ref.Matches(ref) {
 			return true
@@ -3152,6 +3006,7 @@ func (l *Loop) requestMutationContinuationOrBudgetReport(result mutationVerifica
 	attempt, exhausted := l.consumeMutationContinuationAttempt()
 	if exhausted {
 		l.transitionControl(RuntimeControlAwaitingFinalReport)
+		l.finalReportMustBeInconclusive = true
 		l.queueResponseDirective(mutationContinuationBudgetExhaustedDirective(result, attempt))
 		return
 	}
@@ -3325,7 +3180,11 @@ func (l *Loop) transitionMutationVerification() {
 	if l == nil || l.pendingMutationVerification == nil {
 		return
 	}
-	if l.pendingMutationVerification.AwaitingResult {
+	next := verificationflow.Next(
+		len(l.pendingMutationVerification.remainingRequirements()) > 0,
+		l.pendingMutationVerification.AwaitingResult,
+	)
+	if next == verificationflow.ContinueResult {
 		l.transitionControl(RuntimeControlAwaitingMutationVerificationResult)
 		return
 	}
@@ -3357,16 +3216,33 @@ func (l *Loop) mergeMutationVerification(next pendingMutationVerification) {
 	}
 	expanded := false
 	for _, req := range next.Requirements {
-		if !seen[req.ID] {
-			l.pendingMutationVerification.Requirements = append(l.pendingMutationVerification.Requirements, req)
-			seen[req.ID] = true
-			expanded = true
+		if seen[req.ID] || l.hasPendingEquivalentOutcomeEvidence(req) {
+			continue
 		}
+		l.pendingMutationVerification.Requirements = append(l.pendingMutationVerification.Requirements, req)
+		seen[req.ID] = true
+		expanded = true
 	}
 	if expanded {
 		l.mutationContinuationAttempts = 0
 		l.pendingMutationVerification.AwaitingResult = false
 	}
+}
+
+func (l *Loop) hasPendingEquivalentOutcomeEvidence(next mutationEvidenceRequirement) bool {
+	if l == nil || l.pendingMutationVerification == nil || next.Kind != "outcome_evidence" {
+		return false
+	}
+	verification := l.pendingMutationVerification
+	for _, existing := range verification.Requirements {
+		if existing.Kind != next.Kind || verification.Satisfied[existing.ID] || verification.Skipped[existing.ID] {
+			continue
+		}
+		if sameActionTarget(existing.Target, next.Target) {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *Loop) shouldStartMutationVerification(call PendingCall, result map[string]any) bool {
@@ -3566,16 +3442,16 @@ func sameActionTarget(a, b actionTarget) bool {
 
 func evidenceRequirementMatchesCommand(req mutationEvidenceRequirement, command string) bool {
 	target := req.Target
-	if target.Namespace != "" && (target.Resource == "" || kubectlResourceUsuallyNamespaced(target.Resource)) && !commandUsesNamespace(command, target.Namespace) {
-		return false
-	}
-	if target.Resource != "" && !commandMentionsResource(command, target.Resource) && !commandMentionsResourceKind(command, target.Resource) {
-		return false
-	}
-	if target.Name != "" && !commandMentionsToken(command, target.Name) && !commandUsesSelectorForName(command, target.Name) {
-		return false
-	}
-	return true
+	return verificationflow.Matches(
+		verificationflow.Requirement{ID: req.ID, Target: target},
+		verificationflow.MatchEvidence{
+			Namespace: target.Namespace == "" ||
+				(target.Resource != "" && !kubectlResourceUsuallyNamespaced(target.Resource)) ||
+				commandUsesNamespace(command, target.Namespace),
+			Resource: commandMentionsResource(command, target.Resource) || commandMentionsResourceKind(command, target.Resource),
+			Name:     commandMentionsToken(command, target.Name) || commandUsesSelectorForName(command, target.Name),
+		},
+	)
 }
 
 func evidenceRequirementSpecificity(req mutationEvidenceRequirement) int {
@@ -3710,14 +3586,14 @@ func (l *Loop) markGuideStepCompleted(stepIndex int) bool {
 	if guide == nil || stepIndex < 1 || stepIndex > guide.TotalSteps {
 		return false
 	}
-	if guide.Completed == nil {
-		guide.Completed = map[int]bool{}
-	}
-	if guide.Completed[stepIndex] || guide.Skipped[stepIndex] {
-		return false
-	}
-	guide.Completed[stepIndex] = true
-	return guide.allCompleted()
+	completed, changed, allCompleted := guidanceflow.MarkCompleted(
+		guide.Completed,
+		guide.Skipped,
+		stepIndex,
+		guide.TotalSteps,
+	)
+	guide.Completed = completed
+	return changed && allCompleted
 }
 
 func (l *Loop) requestPostGuideCompletionDirective() {
@@ -3781,6 +3657,11 @@ func (l *Loop) consumeFinalReport(ctx context.Context, calls []gollm.FunctionCal
 		report, ok := finalReportFromFunctionCall(call)
 		if !ok {
 			return nil, l.applyPlainModelOutputCorrectionGate("invalid_final_report", "final_report 형식 오류가 반복되어 진단을 중단합니다.", "final_report payload was invalid. Re-emit a final_report with required fields. Conclusive reports require attempted, evidence_known, most_likely_cause, and conclusion. Inconclusive reports require attempted, most_likely_cause, and at least one of evidence_known, evidence_missing, or blockers.")
+		}
+		if l.finalReportMustBeInconclusive && report.Conclusive {
+			message := "Mutation verification recheck budget was exhausted without a resolved result. Return exactly one final_report with conclusive=false, summarize the unresolved evidence and exhausted rechecks, and recommend the next manual or follow-up observation."
+			l.queueResponseDirective(message)
+			return nil, l.applyPlainModelOutputCorrectionGate("mutation_budget_final_report_must_be_inconclusive", "mutation verification budget 소진 후 conclusive=true 보고가 반복되어 진단을 중단합니다.", message)
 		}
 		l.pendingFinalReport = &report
 		l.emitFinalReportMessage(ctx, report)
@@ -4082,36 +3963,10 @@ func nextDirectionsFromFunctionCall(call gollm.FunctionCall) (nextDirections, bo
 	if err := json.Unmarshal(raw, &nd); err != nil {
 		return nextDirections{}, false
 	}
-	var clean []nextDirectionOption
-	for _, opt := range nd.Options {
-		kind := strings.ToLower(strings.TrimSpace(opt.Kind))
-		summary := strings.TrimSpace(opt.Summary)
-		if summary == "" {
-			continue
-		}
-		switch kind {
-		case "another_guide":
-			if strings.TrimSpace(opt.ResourceFamily) == "" || strings.TrimSpace(opt.ProblemFocus) == "" {
-				continue
-			}
-		case "different_approach":
-			if strings.TrimSpace(opt.Instruction) == "" {
-				continue
-			}
-		default:
-			continue
-		}
-		opt.Kind = kind
-		opt.Summary = summary
-		clean = append(clean, opt)
-		if len(clean) == 3 {
-			break
-		}
-	}
-	if len(clean) == 0 {
+	nd = directionflow.Normalize(nd)
+	if len(nd.Options) == 0 {
 		return nextDirections{}, false
 	}
-	nd.Options = clean
 	return nd, true
 }
 
@@ -4354,14 +4209,7 @@ func (l *Loop) investigationOptionsFromReport(report finalReport) []nextDirectio
 		if summary == "" {
 			summary = "문제 리소스 추가 조사"
 		}
-		options = append(options, nextDirectionOption{
-			Kind:         "investigate_resource",
-			Summary:      summary,
-			Why:          strings.TrimSpace(res.Reason),
-			ResourceKind: kind,
-			ResourceName: name,
-			Namespace:    strings.TrimSpace(res.Namespace),
-		})
+		options = append(options, directionflow.InvestigationOption(res, summary))
 		if len(options) == 3 {
 			break
 		}

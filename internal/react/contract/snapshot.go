@@ -67,7 +67,8 @@ func (r StepRef) Matches(other StepRef) bool {
 		!r.Phase.Matches(other.Phase) {
 		return false
 	}
-	return r.Kind != "" || r.ID != "" || r.Index != 0
+	return (r.Kind != "" || r.ID != "" || r.Index != 0) &&
+		(other.Kind != "" || other.ID != "" || other.Index != 0)
 }
 
 func (r PhaseRef) String() string {

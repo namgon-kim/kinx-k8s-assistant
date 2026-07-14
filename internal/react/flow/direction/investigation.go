@@ -1,18 +1,18 @@
 package direction
 
-import "github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
+import (
+	"strings"
 
-func InvestigationOptions(report contract.FinalReport) []contract.NextDirectionOption {
-	options := make([]contract.NextDirectionOption, 0, len(report.ProblematicResources))
-	for _, resource := range report.ProblematicResources {
-		options = append(options, contract.NextDirectionOption{
-			Kind:         "investigate_resource",
-			Summary:      resource.Kind + "/" + resource.Name,
-			Why:          resource.Reason,
-			ResourceKind: resource.Kind,
-			ResourceName: resource.Name,
-			Namespace:    resource.Namespace,
-		})
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
+)
+
+func InvestigationOption(resource contract.ProblematicResource, summary string) contract.NextDirectionOption {
+	return contract.NextDirectionOption{
+		Kind:         "investigate_resource",
+		Summary:      strings.TrimSpace(summary),
+		Why:          strings.TrimSpace(resource.Reason),
+		ResourceKind: strings.TrimSpace(resource.Kind),
+		ResourceName: strings.TrimSpace(resource.Name),
+		Namespace:    strings.TrimSpace(resource.Namespace),
 	}
-	return options
 }

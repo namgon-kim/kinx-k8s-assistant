@@ -9,9 +9,12 @@ const (
 	CorrectionUserMessageOnly CorrectionMode = "user_message_only"
 )
 
-func Correction(outcome Outcome) string {
-	if outcome.ModelCorrection != "" {
-		return outcome.ModelCorrection
+func Message(modelCorrection, userMessage, fallback string) string {
+	if modelCorrection != "" {
+		return modelCorrection
 	}
-	return outcome.UserMessage
+	if userMessage != "" {
+		return userMessage
+	}
+	return fallback
 }

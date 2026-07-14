@@ -8,8 +8,8 @@ const (
 	ContinueDone     Continuation = "done"
 )
 
-func Next(total, satisfied int, awaitingResult bool) Continuation {
-	if satisfied < total {
+func Next(hasRemaining, awaitingResult bool) Continuation {
+	if hasRemaining {
 		return ContinueEvidence
 	}
 	if awaitingResult {

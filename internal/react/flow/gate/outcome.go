@@ -16,10 +16,7 @@ const (
 	PolicyBlock           OutcomeKind = "policy_block"
 	ToolExecutionFailure  OutcomeKind = "tool_execution_failure"
 	RetrievalResultGate   OutcomeKind = "retrieval_result_gate"
-	ApprovalRequired      OutcomeKind = "approval_required"
-	HumanInputRequired    OutcomeKind = "human_input_required"
 	ExternalStateWait     OutcomeKind = "external_state_wait"
-	HardInvariant         OutcomeKind = "hard_invariant"
 )
 
 type RetryScope string
@@ -46,54 +43,71 @@ const (
 )
 
 type Outcome struct {
-	Allow           bool
-	Kind            OutcomeKind
-	Code            string
+	Allow bool
+	Kind  OutcomeKind
+	Code  string
+
 	ExpectedControl contract.RuntimeControlState
 	TargetPhase     *contract.PhaseRef
 	TargetStep      *contract.StepRef
-	Retryable       bool
-	RetryScope      RetryScope
+
+	Retryable  bool
+	RetryScope RetryScope
+
 	UserVisible     bool
 	UserMessage     string
 	ModelCorrection string
-	CorrectionMode  CorrectionMode
-	BranchPolicy    BranchPolicy
+
+	CorrectionMode CorrectionMode
+	BranchPolicy   BranchPolicy
 }
 
-func (o Outcome) Validate(snapshot contract.RuntimeSnapshot) error {
-	if o.Allow {
+type ValidationContext struct {
+	HasTargetPhase bool
+	HasTargetStep  bool
+}
+
+func Validate(outcome Outcome, context ValidationContext) error {
+	if outcome.Allow {
 		return nil
 	}
-	if o.TargetPhase != nil && !hasPhase(snapshot, *o.TargetPhase) {
-		return fmt.Errorf("target phase does not exist")
+	if outcome.TargetPhase != nil && !context.HasTargetPhase {
+		return fmt.Errorf("target phase does not exist: %s", outcome.TargetPhase.String())
 	}
-	if o.TargetStep != nil && !hasStep(snapshot, *o.TargetStep) {
-		return fmt.Errorf("target step does not exist")
+	if outcome.TargetStep != nil && !context.HasTargetStep {
+		return fmt.Errorf("target step does not exist: %s", outcome.TargetStep.String())
 	}
-	if o.BranchPolicy == SkipStep && o.TargetStep == nil {
-		return fmt.Errorf("skip_step requires target step")
+	if outcome.BranchPolicy != SkipStep {
+		return nil
 	}
-	return nil
+	if outcome.TargetStep == nil {
+		return fmt.Errorf("branch policy %s requires target step", outcome.BranchPolicy)
+	}
+	return validateSkippableStep(*outcome.TargetStep)
 }
 
-func hasPhase(snapshot contract.RuntimeSnapshot, target contract.PhaseRef) bool {
-	if snapshot.Phase == nil {
-		return false
-	}
-	for _, phase := range snapshot.Phase.Phases {
-		if phase.Ref.Index == target.Index || strings.EqualFold(phase.Ref.Name, target.Name) {
-			return true
+func validateSkippableStep(ref contract.StepRef) error {
+	switch ref.Kind {
+	case contract.StepResourceGuideDiagnostic:
+		if ref.Index <= 0 {
+			return fmt.Errorf("branch policy %s requires a positive guide step index", SkipStep)
 		}
+		return nil
+	case contract.StepMutationEvidenceRequirement:
+		if strings.TrimSpace(ref.ID) == "" {
+			return fmt.Errorf("branch policy %s requires a mutation evidence requirement id", SkipStep)
+		}
+		return nil
+	case contract.StepGeneralAction:
+		return fmt.Errorf("branch policy %s does not support general action steps", SkipStep)
+	default:
+		return fmt.Errorf("branch policy %s does not support step kind %q", SkipStep, ref.Kind)
 	}
-	return false
 }
 
-func hasStep(snapshot contract.RuntimeSnapshot, target contract.StepRef) bool {
-	for _, step := range snapshot.ActiveSteps {
-		if step.Ref.Kind == target.Kind && (target.ID == "" || step.Ref.ID == target.ID) && (target.Index == 0 || step.Ref.Index == target.Index) {
-			return true
-		}
+func AssertExpectedControl(expected, actual contract.RuntimeControlState) error {
+	if expected == "" || expected == actual {
+		return nil
 	}
-	return false
+	return fmt.Errorf("expected control %s, got %s", expected, actual)
 }

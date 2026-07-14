@@ -1,19 +1,21 @@
 package phase
 
-import "github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
+import (
+	"strings"
 
-func Start(plan contract.PhasePlan) contract.PhaseRef {
-	if len(plan.PhaseSteps) == 0 {
-		return contract.PhaseRef{}
-	}
-	index := plan.CurrentPhaseIndex
-	if index == 0 {
-		index = plan.PhaseSteps[0].Index
-	}
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
+)
+
+func HasPhase(plan contract.PhasePlan, name string) bool {
+	want := normalizeName(name)
 	for _, step := range plan.PhaseSteps {
-		if step.Index == index {
-			return contract.PhaseRef{Index: step.Index, Name: step.Name}
+		if normalizeName(step.Name) == want {
+			return true
 		}
 	}
-	return contract.PhaseRef{}
+	return false
+}
+
+func normalizeName(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
 }

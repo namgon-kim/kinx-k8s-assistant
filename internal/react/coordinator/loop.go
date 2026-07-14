@@ -21,6 +21,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
 	reactcontract "github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
+	guidanceflow "github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/guidance"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/request"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/kube"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/language"
@@ -78,13 +79,14 @@ type Loop struct {
 	resourceGuideEvidence   []string
 	resourceGuideQueries    map[string]struct{}
 
-	guideStepState               *guideStepState
-	pendingResponseDirective     string
-	pendingFinalReport           *finalReport
-	pendingNextDirections        *nextDirections
-	pendingDirectionPrompt       *directionPromptState
-	pendingMutationVerification  *pendingMutationVerification
-	mutationContinuationAttempts int
+	guideStepState                *guideStepState
+	pendingResponseDirective      string
+	pendingFinalReport            *finalReport
+	pendingNextDirections         *nextDirections
+	pendingDirectionPrompt        *directionPromptState
+	pendingMutationVerification   *pendingMutationVerification
+	mutationContinuationAttempts  int
+	finalReportMustBeInconclusive bool
 
 	cancel context.CancelFunc
 	once   sync.Once
@@ -336,6 +338,7 @@ func (l *Loop) startQuery(query string) error {
 	l.pendingDirectionPrompt = nil
 	l.pendingMutationVerification = nil
 	l.mutationContinuationAttempts = 0
+	l.finalReportMustBeInconclusive = false
 	l.transitionControl(RuntimeControlAwaitingRequirementAnalysis)
 	klog.V(0).InfoS("query lifecycle initialized", "intent", intent, "lifecycle", logStateName(l.loopLifecycle()))
 	return nil
@@ -450,6 +453,7 @@ func (l *Loop) clearConversationState() {
 	l.pendingDirectionPrompt = nil
 	l.pendingMutationVerification = nil
 	l.mutationContinuationAttempts = 0
+	l.finalReportMustBeInconclusive = false
 }
 
 func (l *Loop) executeIteration(ctx context.Context) error {
@@ -809,6 +813,16 @@ func (l *Loop) enforceRequestedStructuredDirective(calls []gollm.FunctionCall) b
 	}
 	snapshot := l.RuntimeSnapshot()
 	switch {
+	case (snapshot.Control == RuntimeControlAwaitingResourceGuideLookup || snapshot.RequiresResourceGuideLookupNow) && !onlyFunctionCall(calls, internalResourceGuideLookupCall):
+		message := "The active guidance_lookup phase requires exactly one resource_guide_lookup object. Do not emit an action, phase_progress, guide_progress, final_report, next_directions, or any other structured output until the lookup result is observed."
+		l.queueResponseDirective(message)
+		return l.applyModelOutputCorrectionGate("resource_guide_lookup_required", "resource_guide_lookup 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
+	case (snapshot.Control == RuntimeControlAwaitingGuidedDiagnosisStep ||
+		(snapshot.requiresGuidedDiagnosisStepNow() && !snapshot.FinalReportMustBeInconclusive)) &&
+		hasAnyFunctionCall(calls, internalFinalReportCall, internalNextDirectionsCall):
+		message := "The active guided_diagnosis phase still has incomplete resource-guide steps. Continue with one action for the next guide step, or return guide_progress after useful evidence completes that step. Do not emit final_report or next_directions yet."
+		l.queueResponseDirective(message)
+		return l.applyModelOutputCorrectionGate("guided_diagnosis_step_required", "남은 guide step이 있는데 final_report 또는 next_directions가 반복되어 진단을 중단합니다.", message)
 	case snapshot.Control == RuntimeControlAwaitingNextDirections && !onlyFunctionCall(calls, internalNextDirectionsCall):
 		message := "The previous final_report was inconclusive and the runtime requested `next_directions`. Return only a next_directions object with concrete continuation options; do not emit action, final_report, phase_progress, or a plain answer yet."
 		l.queueResponseDirective(message)
@@ -821,6 +835,17 @@ func (l *Loop) enforceRequestedStructuredDirective(calls []gollm.FunctionCall) b
 		message := "The runtime already requested `final_report` after completing the resource-guide diagnostic steps. Do not emit another action. Return only a final_report object."
 		l.queueResponseDirective(message)
 		return l.applyModelOutputCorrectionGate("final_report_required", "final_report 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
+	}
+	return false
+}
+
+func hasAnyFunctionCall(calls []gollm.FunctionCall, names ...string) bool {
+	for _, call := range calls {
+		for _, name := range names {
+			if call.Name == name {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -1109,6 +1134,9 @@ func (l *Loop) transitionControl(next RuntimeControlState) {
 	if l == nil {
 		return
 	}
+	if next != RuntimeControlAwaitingFinalReport {
+		l.finalReportMustBeInconclusive = false
+	}
 	l.mutableSession().Transition(next)
 	l.control = next
 }
@@ -1266,6 +1294,7 @@ type RuntimeSnapshot struct {
 	PendingCalls                   []PendingCall
 	PendingMutationVerification    *pendingMutationVerification
 	MutationContinuationAttempts   int
+	FinalReportMustBeInconclusive  bool
 	PendingFinalReport             *finalReport
 	PendingNextDirections          *nextDirections
 	PendingDirectionPrompt         *directionPromptState
@@ -1291,6 +1320,7 @@ func (l *Loop) RuntimeSnapshot() RuntimeSnapshot {
 		PendingCalls:                   append([]PendingCall(nil), l.pendingCalls...),
 		PendingMutationVerification:    l.pendingMutationVerification,
 		MutationContinuationAttempts:   l.mutationContinuationAttempts,
+		FinalReportMustBeInconclusive:  l.finalReportMustBeInconclusive,
 		PendingFinalReport:             l.pendingFinalReport,
 		PendingNextDirections:          l.pendingNextDirections,
 		PendingDirectionPrompt:         l.pendingDirectionPrompt,
@@ -1430,6 +1460,12 @@ func (s RuntimeSnapshot) ActiveGate() string {
 	case RuntimeControlAwaitingResourceGuideLookup:
 		return "resource_guide_lookup_required"
 	default:
+		if s.RequiresResourceGuideLookupNow {
+			return "resource_guide_lookup_required"
+		}
+		if s.requiresGuidedDiagnosisStepNow() {
+			return "guided_diagnosis_step_required"
+		}
 		return "none"
 	}
 }
@@ -1445,6 +1481,9 @@ func (s RuntimeSnapshot) RequiredNextOutput() string {
 	case RuntimeControlAwaitingGuidedPhaseProgress:
 		return "phase_progress"
 	case RuntimeControlAwaitingFinalReport:
+		if s.FinalReportMustBeInconclusive {
+			return "final_report with conclusive=false"
+		}
 		return "final_report"
 	case RuntimeControlAwaitingNextDirections:
 		return "next_directions"
@@ -1457,6 +1496,12 @@ func (s RuntimeSnapshot) RequiredNextOutput() string {
 	case RuntimeControlAwaitingGuidedDiagnosisStep:
 		return "action for the next guide step, or guide_progress after useful evidence is already observed"
 	default:
+		if s.RequiresResourceGuideLookupNow {
+			return "resource_guide_lookup"
+		}
+		if s.requiresGuidedDiagnosisStepNow() {
+			return "action for the next guide step, or guide_progress after useful evidence is already observed"
+		}
 		if s.Phase != nil {
 			return "action or phase_progress according to the current phase completion condition"
 		}
@@ -1485,8 +1530,21 @@ func (s RuntimeSnapshot) ForbiddenNextOutputs() []string {
 	case RuntimeControlAwaitingResourceGuideLookup:
 		return []string{"action", "phase_progress", "guide_progress", "final_report", "next_directions", "answer"}
 	default:
+		if s.RequiresResourceGuideLookupNow {
+			return []string{"action", "phase_progress", "guide_progress", "final_report", "next_directions", "answer"}
+		}
+		if s.requiresGuidedDiagnosisStepNow() {
+			return []string{"final_report", "next_directions", "answer"}
+		}
 		return nil
 	}
+}
+
+func (s RuntimeSnapshot) requiresGuidedDiagnosisStepNow() bool {
+	if s.Phase == nil || s.Guide == nil || len(s.Guide.remainingSteps()) == 0 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(s.Phase.currentStep().Name), "guided_diagnosis")
 }
 
 func (s RuntimeSnapshot) NestedStateName() string {
@@ -1668,13 +1726,15 @@ func (s RuntimeSnapshot) writeRuntimeNestedStateSummary(b *strings.Builder) {
 }
 
 func (l *Loop) phaseStepRequiresResourceGuideLookup() bool {
-	if l.phaseStepState == nil || l.resourceGuideInjected {
+	if l.phaseStepState == nil || l.resourceClassification == nil {
 		return false
 	}
 	current := l.phaseStepState.currentStep()
-	return strings.EqualFold(strings.TrimSpace(current.Name), "guidance_lookup") &&
-		l.resourceClassification != nil &&
-		l.resourceClassification.Kind == resourceClassificationCRD
+	return guidanceflow.LookupRequired(
+		string(l.resourceClassification.Kind),
+		l.resourceGuideInjected,
+		current.Name,
+	)
 }
 
 func (s *phaseStepState) completedPhaseIndices() []int {
@@ -1738,6 +1798,7 @@ func (l *Loop) applyRuntimeCleanup(policy runtimeCleanupPolicy) {
 	}
 	if policy.ClearMutationContinuation {
 		l.mutationContinuationAttempts = 0
+		l.finalReportMustBeInconclusive = false
 	}
 	if policy.ClearMutationVerification {
 		l.pendingMutationVerification = nil
@@ -1789,6 +1850,7 @@ func (l *Loop) resetPhaseScopedState(from PhaseRef, policy phaseScopedResetPolic
 	if policy.ResetMutationVerification {
 		l.pendingMutationVerification = nil
 		l.mutationContinuationAttempts = 0
+		l.finalReportMustBeInconclusive = false
 	}
 	if policy.ClearResponseDirectives {
 		l.pendingResponseDirective = ""
@@ -1888,7 +1950,7 @@ func (l *Loop) appendContextBlock(kind, content string, preserve bool) bool {
 }
 
 func (l *Loop) appendCorrection(code, message string) bool {
-	if l.lastContextError != nil && l.lastContextError.Code == code && l.lastContextError.Message == message {
+	if l.lastContextError != nil && l.lastContextError.Code == code {
 		return false
 	}
 	l.lastContextError = &contextError{
@@ -1900,7 +1962,7 @@ func (l *Loop) appendCorrection(code, message string) bool {
 }
 
 func (l *Loop) appendCorrectionWithCompaction(code, message string) bool {
-	if l.lastContextError != nil && l.lastContextError.Code == code && l.lastContextError.Message == message {
+	if l.lastContextError != nil && l.lastContextError.Code == code {
 		return false
 	}
 	l.lastContextError = &contextError{

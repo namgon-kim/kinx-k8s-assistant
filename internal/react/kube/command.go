@@ -16,7 +16,7 @@ func CommandString(value any) (string, bool) {
 		return "", false
 	}
 	command = strings.TrimSpace(command)
-	if !strings.HasPrefix(strings.ToLower(command), "kubectl ") {
+	if !IsKubectlCommand(command) {
 		return "", false
 	}
 	return command, true
@@ -24,5 +24,5 @@ func CommandString(value any) (string, bool) {
 
 func IsKubectlCommand(command string) bool {
 	command = strings.TrimSpace(strings.ToLower(command))
-	return command == "kubectl" || strings.HasPrefix(command, "kubectl ")
+	return strings.HasPrefix(command, "kubectl ")
 }

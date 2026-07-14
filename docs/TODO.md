@@ -9,7 +9,7 @@
 | Requirement analysis | aggregate previous-context budget/structured truncation shape, runtime guarantee table, clarification boundary table |
 | Request phases | phase completion semantic validation, `-A` discovery context promotion, observation convergence rules |
 | Guide/continuation | final-report evidence levels, bounded fallback/directive/error catalog |
-| Gate/state cleanup | production gate target mapping, pure decision/apply split, correction counter review |
+| Flow/gate extraction | production gate target mapping, consume/enforce ordering의 pure decision/apply split, correction counter review |
 | Namespace/mutation policy | `kubectl apply -f ...` manifest namespace validation, wrapped kubectl mutation classifier |
 | State/session ownership cleanup | remove coordinator compatibility state, make `session.State.Control` and nested session state the only mutable source, derive directives/snapshots from it |
 

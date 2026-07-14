@@ -573,11 +573,11 @@ func actionTargetFromFunctionCall(call gollm.FunctionCall) (actionTarget, bool) 
 	resource, _ := raw["resource"].(string)
 	namespace, _ := raw["namespace"].(string)
 	name, _ := raw["name"].(string)
-	target := actionTarget{
+	target := kube.NormalizeTarget(actionTarget{
 		Resource:  strings.TrimSpace(resource),
 		Namespace: cleanUnknownPlaceholder(namespace),
 		Name:      cleanUnknownPlaceholder(name),
-	}
+	})
 	if target.Resource == "" && target.Namespace == "" && target.Name == "" {
 		return actionTarget{}, false
 	}

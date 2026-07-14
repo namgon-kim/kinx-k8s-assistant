@@ -2,7 +2,7 @@ package contract
 
 type RequirementAnalysis struct {
 	RequestType      string                       `json:"request_type"`
-	Action           string                       `json:"Action"`
+	Action           string                       `json:"action"`
 	Target           RequirementAnalysisTarget    `json:"target"`
 	Scope            RequirementScope             `json:"scope,omitempty"`
 	Resources        []RequirementResource        `json:"resource_candidates,omitempty"`

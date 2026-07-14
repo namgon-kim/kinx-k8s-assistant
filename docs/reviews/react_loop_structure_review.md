@@ -1,6 +1,7 @@
 # ReAct Loop Structure Review
 
-> 상태: 리팩터링 전 구조 리뷰, 새 패키지 기준 재검증 필요.
+> 상태: 리팩터링 전 구조 리뷰. 아래 Refactor Status만 현재 package 연결 상태로 갱신했으며,
+> 본문 시나리오와 과거 파일 참조는 별도 동작 재검증이 필요하다.
 >
 > 이 문서는 개별 버그 목록이 아니라 `internal/react` ReAct loop의 구조적 리스크를
 > 정리한다. 본문의 파일/라인 참조는 package split 이전 위치다. 현재 대응 위치는
@@ -12,9 +13,9 @@
 | Review area | Current package boundary | Status |
 | --- | --- | --- |
 | State management | `contract/enums.go`, `session/*`, `contract/snapshot.go` | enum과 mutable-state container는 도입됨. `coordinator.Loop` compatibility 필드가 남아 단일 source of truth는 미완료. |
-| Gate pipeline | `flow/gate`, `coordinator/iteration.go` | outcome/correction 규칙은 분리됨. consume/enforce 순서 문제의 해소 여부는 별도 동작 재검증 필요. |
-| Phase/guidance | `flow/phase`, `flow/guidance`, `session/phase.go` | 책임은 분리됨. rewind/re-entry 의미가 바뀌었다고 간주하지 않음. |
-| Verification | `flow/verification`, `session/verification.go` | requirement/matching/continuation 타입은 분리됨. 반복 lifecycle과 target 추출 이슈는 재검증 필요. |
+| Gate pipeline | `flow/gate`, `coordinator/iteration.go` | outcome 계약/target validation과 correction message 선택은 production 경로에 연결됨. consume/enforce 순서와 decision/apply 전체 추출은 미완료. |
+| Phase/guidance | `flow/phase`, `flow/guidance`, `session/phase.go` | phase validation/progress와 guide lookup/progress 규칙은 production 경로에 연결됨. rewind/re-entry 의미가 바뀌었다고 간주하지 않음. |
+| Verification | `flow/verification`, `session/verification.go` | 구조화된 namespace/resource/name match evidence와 continuation 규칙은 production 경로에 연결됨. requirement 생성, 반복 lifecycle, mutable state 단일화는 미완료. |
 | Input/liveness | `coordinator/input.go`, `session/control.go` | 입력 위치는 분리됨. no-progress 감지 도입은 확인되지 않음. |
 | Protocol | `protocol/*`, `coordinator/iteration.go` | call/schema/shim parser는 분리됨. structured call과 action의 turn-level 혼합 정책은 coordinator에서 계속 통합됨. |
 

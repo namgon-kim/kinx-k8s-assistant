@@ -45,25 +45,24 @@ const (
 	RuntimeControlExited                               = coordinator.RuntimeControlExited
 
 	// Compatibility aliases preserve the facade used before the package split.
-	ControlIdle                                                     = RuntimeControlUnset
-	ControlAwaitingUserQuery                                        = RuntimeControlAwaitingUserQuery
-	ControlAwaitingRequirementAnalysis                              = RuntimeControlAwaitingRequirementAnalysis
-	ControlAwaitingPhasePlan                                        = RuntimeControlAwaitingPhasePlan
-	ControlAwaitingModelStep                                        = RuntimeControlAwaitingModelStep
-	ControlAwaitingResourceGuideLookup                              = RuntimeControlAwaitingResourceGuideLookup
-	ControlAwaitingGuidedDiagnosisStep                              = RuntimeControlAwaitingGuidedDiagnosisStep
-	ControlAwaitingGuidedPhaseProgress                              = RuntimeControlAwaitingGuidedPhaseProgress
-	ControlAwaitingFinalReport                                      = RuntimeControlAwaitingFinalReport
-	ControlAwaitingNextDirections                                   = RuntimeControlAwaitingNextDirections
-	ControlAwaitingContinuationChoice                               = RuntimeControlAwaitingContinuationChoice
-	ControlAwaitingContinuationText                                 = RuntimeControlAwaitingContinuationText
-	ControlAwaitingApproval                                         = RuntimeControlAwaitingApproval
-	ControlExecutingTool                                            = RuntimeControlExecutingTool
-	ControlAwaitingMutationVerificationEvidence                     = RuntimeControlAwaitingMutationVerificationEvidence
-	ControlAwaitingMutationVerificationResult                       = RuntimeControlAwaitingMutationVerificationResult
-	ControlAwaitingMutationContinuation                             = RuntimeControlAwaitingMutationContinuation
-	ControlComplete                             RuntimeControlState = "complete"
-	ControlExited                                                   = RuntimeControlExited
+	ControlIdle                                 = RuntimeControlUnset
+	ControlAwaitingUserQuery                    = RuntimeControlAwaitingUserQuery
+	ControlAwaitingRequirementAnalysis          = RuntimeControlAwaitingRequirementAnalysis
+	ControlAwaitingPhasePlan                    = RuntimeControlAwaitingPhasePlan
+	ControlAwaitingModelStep                    = RuntimeControlAwaitingModelStep
+	ControlAwaitingResourceGuideLookup          = RuntimeControlAwaitingResourceGuideLookup
+	ControlAwaitingGuidedDiagnosisStep          = RuntimeControlAwaitingGuidedDiagnosisStep
+	ControlAwaitingGuidedPhaseProgress          = RuntimeControlAwaitingGuidedPhaseProgress
+	ControlAwaitingFinalReport                  = RuntimeControlAwaitingFinalReport
+	ControlAwaitingNextDirections               = RuntimeControlAwaitingNextDirections
+	ControlAwaitingContinuationChoice           = RuntimeControlAwaitingContinuationChoice
+	ControlAwaitingContinuationText             = RuntimeControlAwaitingContinuationText
+	ControlAwaitingApproval                     = RuntimeControlAwaitingApproval
+	ControlExecutingTool                        = RuntimeControlExecutingTool
+	ControlAwaitingMutationVerificationEvidence = RuntimeControlAwaitingMutationVerificationEvidence
+	ControlAwaitingMutationVerificationResult   = RuntimeControlAwaitingMutationVerificationResult
+	ControlAwaitingMutationContinuation         = RuntimeControlAwaitingMutationContinuation
+	ControlExited                               = RuntimeControlExited
 
 	InputOwnerOrchestrator = coordinator.InputOwnerOrchestrator
 	InputOwnerReactChoice  = coordinator.InputOwnerReactChoice

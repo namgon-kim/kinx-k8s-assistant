@@ -1,10 +1,13 @@
 package verification
 
-import "strings"
+type MatchEvidence struct {
+	Namespace bool
+	Resource  bool
+	Name      bool
+}
 
-func MatchesCommand(command string, requirement Requirement) bool {
-	command = strings.ToLower(command)
-	return strings.Contains(command, strings.ToLower(requirement.Target.Resource)) &&
-		(requirement.Target.Name == "" || strings.Contains(command, strings.ToLower(requirement.Target.Name))) &&
-		(requirement.Target.Namespace == "" || strings.Contains(command, strings.ToLower(requirement.Target.Namespace)))
+func Matches(requirement Requirement, evidence MatchEvidence) bool {
+	return (requirement.Target.Namespace == "" || evidence.Namespace) &&
+		(requirement.Target.Resource == "" || evidence.Resource) &&
+		(requirement.Target.Name == "" || evidence.Name)
 }
