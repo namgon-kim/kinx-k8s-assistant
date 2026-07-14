@@ -312,7 +312,7 @@ func TestIncidentGuidanceFlowTransitionsFromEvidenceToOffer(t *testing.T) {
 		t.Fatalf("phase = %v, want offer pending", flow.phase)
 	}
 	if flow.problemText == "" || len(flow.evidence) != 1 {
-		t.Fatalf("unexpected captured state: problem=%q evidence=%#v", flow.problemText, flow.evidence)
+		t.Fatalf("unexpected captured lifecycle: problem=%q evidence=%#v", flow.problemText, flow.evidence)
 	}
 
 	flow.deferOffer()

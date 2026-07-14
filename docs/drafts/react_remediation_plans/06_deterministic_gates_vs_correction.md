@@ -5,6 +5,8 @@
 > `GateOutcome`, `RetryScope`, `CorrectionMode`, `BranchPolicy`가 공통 gate 모델로
 > 적용되어 있다. 일부 gate의 pure decision/apply 분리와 code별 correction counter는
 > 후속 cleanup으로 남아 있다.
+> 현재 공통 모델은 `internal/react/flow/gate`, snapshot/refs는 `contract`와 `session`,
+> 적용 pipeline은 `coordinator/iteration.go`에 있다. 아래 옛 루트 파일 경로는 구현 이력이다.
 
 ## Problem
 
@@ -23,15 +25,15 @@
 
 현재 반영된 deterministic gate:
 
-- `internal/react/gate_outcome.go`
+- `internal/react/flow/gate`
   - `GateOutcome`, `RetryScope`, `CorrectionMode`, `BranchPolicy`를 공통 gate outcome 모델로 사용한다.
   - gate는 먼저 allow/block/retry/wait/rebranch 의미를 결정하고, correction은 block 이후 모델을 재유도하는 보조 수단으로만 사용한다.
-- `internal/react/phase_plan.go`
+- `internal/react/coordinator/iteration.go`, `internal/react/flow/phase`
   - `validatePhasePlanForRequest`가 phase plan을 수용하기 전에 mutation verification/guidance eligibility를 결정한다.
   - gate에 막힌 phase plan은 `phaseStepState`로 수용되지 않으므로 이후 action dispatch로 내려가지 않는다.
-- `internal/react/loop.go`
+- `internal/react/coordinator/loop.go`, `internal/react/coordinator/execution.go`, `internal/react/coordinator/iteration.go`
   - self-talk shell action, read-only unknown command, read-only known mutation, interactive command, target/resource validation, requested structured output enforcement가 `GateOutcome` correction/apply 경로를 사용한다.
-- `internal/react/tool_failure.go`
+- `internal/react/coordinator/output.go`, `internal/react/coordinator/iteration.go`
   - tool execution failure를 `command_syntax`, `rbac_forbidden`, `resource_not_found`, `timeout_or_api_unavailable`, `partial_success`, `unknown`으로 분류한다.
   - 각 failure class는 `retryable`, `retry_scope`, `suggested_response`를 observation에 붙이고 `GateOutcomeToolExecutionFailure`로 이어진다.
 - `internal/orchestrator/incident_guidance_flow.go`

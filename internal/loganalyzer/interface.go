@@ -68,9 +68,9 @@ type AnalyzePatternRequest struct {
 
 // AnalyzePatternResult는 패턴 분석 결과입니다.
 type AnalyzePatternResult struct {
-	Patterns  []DetectedPattern
-	Severity  string // critical, warning, info
-	Summary   string
+	Patterns []DetectedPattern
+	Severity string // critical, warning, info
+	Summary  string
 }
 
 // DetectedPattern은 탐지된 이상 패턴입니다.

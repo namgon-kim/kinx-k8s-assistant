@@ -1,829 +1,283 @@
-# Orchestrator와 ReAct Loop 구조
-
-이 문서는 현재 코드 기준으로 `k8s-assistant`의 실행 구조를 설명한다. 중심 범위는 `cmd/k8s-assistant`, `internal/orchestrator`, `internal/react`이며, 도구 등록, guidance, prompt, config는 이 흐름을 이해하는 데 필요한 만큼만 연결해서 다룬다.
-
-관련 상세 계약 문서:
-
-- [`request_processing_phases.md`](./request_processing_phases.md): 자연어 요청을 `requirement_analysis`, `phase_plan`, `phase_progress`로 처리하는 phase 계약.
-- [`guide_progress_and_continuation.md`](./guide_progress_and_continuation.md): resource guide 주입 이후 `guide_step`, `final_report`, `next_directions` 흐름.
-- [`requirement_analysis.md`](./requirement_analysis.md): 요구사항 분석 구조.
-
-## 1. 전체 구조
-
-`k8s-assistant`는 `kubectl-ai`의 Agent를 그대로 실행하지 않는다. 이 프로젝트가 ReAct loop, 승인 UX, read-only enforcement, prompt rendering, output formatting, guidance orchestration을 직접 소유하고, `kubectl-ai`는 `gollm`, `pkg/tools`, `pkg/sandbox`, `pkg/mcp` 같은 라이브러리 계층으로 사용한다.
-
-```mermaid
-flowchart TB
-    User["User / Terminal"]
-    CLI["cmd/k8s-assistant\nCobra CLI, config/env preload, signal"]
-    Orch["internal/orchestrator\ninteractive UX, meta commands, formatting, incident guidance"]
-    React["internal/react\nowned ReAct loop, prompt, state machine, validation, approval gate"]
-    Prompt["prompts/default.tmpl\nproduction runtime prompt"]
-    Config["internal/config\nconfig.yaml, env override, runtime flags"]
-    Registry["internal/toolconnector\nkubectl-ai tool registry, optional MCP sync"]
-    Guidance["internal/guidance\nresource guide, incident guide, RAG client"]
-    Kube["Kubernetes cluster\nthrough kubectl/tool execution"]
-    LLM["LLM provider\ngollm client"]
-    KubectlAI["kubectl-ai libraries\ngollm, tools, sandbox, mcp"]
-
-    User --> CLI
-    CLI --> Config
-    CLI --> Orch
-    Orch --> React
-    Orch --> Guidance
-    React --> Prompt
-    React --> Registry
-    React --> Guidance
-    React --> LLM
-    Registry --> KubectlAI
-    React --> KubectlAI
-    KubectlAI --> Kube
-```
-
-핵심 패턴:
-
-- **Layered architecture**: CLI, orchestration, ReAct runtime, tool connector, guidance가 계층별 책임을 가진다.
-- **Mediator**: `Orchestrator`가 사용자 입력, agent output, formatter, logger, guidance flow 사이를 중재한다.
-- **State machine**: `react.Loop`는 명시적 상태 enum으로 ReAct 진행, 승인 대기, 후속 방향 선택을 관리한다.
-- **Adapter/facade**: `internal/toolconnector.Registry`가 kubectl-ai tool system과 MCP tool 등록을 k8s-assistant 경계 안으로 감싼다.
-- **Presenter**: `Formatter`가 agent message를 CLI 표시용 문자열로 변환한다.
-- **Policy gate**: read-only, approval, target validation, guidance phase validation은 tool 실행 전 runtime에서 강제된다.
-
-## 2. CLI 부트스트랩
-
-CLI 진입점은 `cmd/k8s-assistant/main.go`이다. 이 계층은 실제 ReAct 판단을 하지 않고 실행 환경을 준비한 뒤 `orchestrator`로 넘긴다.
-
-```mermaid
-sequenceDiagram
-    participant P as Process
-    participant C as Config
-    participant Cobra as Cobra command
-    participant O as Orchestrator
-
-    P->>P: preloadEnvFromConfig()
-    alt config API key was loaded into env
-        P->>P: syscall.Exec(current binary)
-    end
-    P->>C: config.NewConfig()
-    P->>Cobra: define root command and flags
-    Cobra->>P: setupKlog(cfg)
-    Cobra->>P: context.WithCancel + SIGINT/SIGTERM
-    Cobra->>O: orchestrator.New(cfg)
-    O->>O: Run(ctx, initialQuery)
-```
-
-중요한 동작:
-
-- `preloadEnvFromConfig`는 `~/.k8s-assistant/config.yaml`에서 provider별 API key와 endpoint를 읽어 환경변수로 넣고, 값이 새로 설정되면 같은 바이너리를 `syscall.Exec`로 재실행한다.
-- 이 재실행은 `gollm`이 일부 provider 환경변수를 `init()` 시점에 읽는 문제를 피하기 위한 부트스트랩 전략이다.
-- `config.NewConfig`는 기본값, config file, env override를 적용한다. CLI flag는 Cobra flag binding으로 이후 덮어쓴다.
-- `setupKlog`는 기본적으로 콘솔 로그를 숨기고 `~/.k8s-assistant/logs/k8s-assistant-YYYYMMDD.log`에 시스템 로그를 쓴다.
-- `run()`은 `cfg.PromptTemplateFile`이 비어 있을 때 바이너리 기준 `../prompts/default.tmpl`을 찾아 채운 뒤 `orchestrator.New`를 호출한다.
-
-CLI 계층의 책임은 여기까지다. 사용자와 agent 사이의 대화 흐름은 `Orchestrator.Run`이 소유한다.
-
-## 3. Orchestrator 책임
-
-`internal/orchestrator.Orchestrator`는 CLI UX와 `react.Loop` 사이의 중재자다. Kubernetes tool 실행 판단은 하지 않지만, 사용자 입력, 출력 표시, 메타 명령, incident guidance offer, agent lifecycle을 관리한다.
-
-주요 필드:
-
-| 필드 | 책임 |
-|---|---|
-| `cfg` | 전체 runtime config 참조. 메타 명령이 이 값을 변경할 수 있다. |
-| `agentWrap` | 현재 활성 `*react.Loop`. 필요할 때만 생성하는 lazy agent이다. |
-| `outputCh` | `react.Loop.Output()`에서 받은 `api.Message` stream. |
-| `agentInitErr` | agent 초기화 실패 원인 보관. |
-| `ctx` | tool result ref 저장용 최근 대화 context. |
-| `incidentGuidance` | agent text/tool evidence를 관찰해 incident guidance offer를 관리. |
-| `formatter` | Markdown rendering, tool result 표시 여부, propose block 등 CLI presenter. |
-| `logger` | 선택적 대화 로그. |
-| `rl` | 일부 meta command에서 쓰는 readline instance. |
-| `kubeconfigInfo` | prompt prefix와 context 변경에 쓰는 kubeconfig metadata. |
-
-### 3.1 Orchestrator 실행 루프
-
-`Run(ctx, initialQuery)`는 두 모드가 섞인 event loop다.
-
-- `agentWrap == nil`: agent가 없는 상태다. 직접 사용자 입력을 받고, 일반 쿼리면 `startAgent`로 loop를 만든다.
-- `agentWrap != nil`: agent output channel을 읽고 `handleMessage`로 분배한다.
-
-```mermaid
-flowchart TD
-    Start["Orchestrator.Run"]
-    Banner["PrintBanner"]
-    MCP["optional PrepareKinxMCPClient"]
-    Initial{"initialQuery?"}
-    ReadInput["readAndDispatchInput"]
-    StartAgent["startAgent(ctx, query)"]
-    WaitOutput["wait outputCh"]
-    Handle["handleMessage(api.Message)"]
-    Closed{"outputCh closed?"}
-    Clear["clearAgent"]
-    Done["return"]
-
-    Start --> Banner --> MCP --> Initial
-    Initial -- yes --> StartAgent --> WaitOutput
-    Initial -- no --> ReadInput
-    ReadInput --> StartAgent
-    ReadInput --> ReadInput
-    StartAgent --> WaitOutput
-    WaitOutput --> Handle --> WaitOutput
-    WaitOutput --> Closed
-    Closed -- yes --> Clear --> ReadInput
-    WaitOutput -- ctx done / EOF --> Done
-```
-
-### 3.2 사용자 입력과 meta command
-
-일반 입력은 `getInputWithUIEcho`를 통해 받는다. slash command는 항상 `orchestrator.handleMetaCommand`가 소유하고 agent로 보내지 않는다. ReAct loop가 `StateWaitingDirectionText`에서 후속 진단 방향 free-text를 기다리는 동안에도 `/help`, `/clear`, `/reset`, `/readonly` 같은 meta command는 orchestrator가 처리한다. 단, 처리 결과를 빈 `UserInputResponse`로 loop에 보내지 않는다. 출력형 meta command는 같은 입력 prompt를 다시 표시하고, `/clear`/`/reset`처럼 active agent를 제거하는 command는 대기 중인 loop를 종료한다.
-
-현재 user-facing meta command:
-
-| 명령 | 처리 |
-|---|---|
-| `/help` | 도움말 출력 |
-| `/config` | 현재 설정 출력 |
-| `/kubeconfig` | kubeconfig 경로 설정 |
-| `/kube-context` | context 조회, 선택, 변경 |
-| `/model` | 모델 변경 |
-| `/lang` | 출력 언어 조회/변경 |
-| `/readonly` | read-only 모드 조회/변경 |
-| `/save` | config 저장 |
-| `/clear`, `/reset` | active agent와 orchestrator conversation/guidance 상태 초기화 |
-| `/exit`, `/quit` | process 종료 |
-
-agent invalidation이 필요한 변경:
-
-- `/kubeconfig`
-- `/kube-context switch`
-- `/model`
-- `/lang Korean|English`
-- `/readonly on|off`
-
-이 변경들은 기존 `react.Loop`의 prompt, tool registry, language translator, read-only policy, kubeconfig 실행 환경에 영향을 주므로 `invalidateAgent(reason)`으로 loop를 닫고 다음 쿼리에서 새로 만든다.
-
-command argument로 전달된 initial query는 run-once로 처리한다. 해당 query가 끝나고 agent가 다음 `MessageTypeUserInputRequest`를 보내면 orchestrator는 interactive continuation을 열지 않고 agent를 닫아 프로세스를 종료한다.
-
-### 3.3 Agent message 처리
-
-`react.Loop`와 orchestrator 사이의 protocol은 kubectl-ai의 `api.Message` 타입이다. Orchestrator는 message type별로 UI 표시, masking, logging, guidance observation을 수행한다.
-
-| Message type | Orchestrator 동작 |
-|---|---|
-| `MessageTypeText` | agent/model text를 sanitize, masking, Markdown rendering 후 출력. incident guidance offer 후보로 관찰. |
-| `MessageTypeError` | error formatter로 출력하고 로그 기록. |
-| `MessageTypeToolCallRequest` | 실행 중인 tool 설명을 출력. |
-| `MessageTypeToolCallResponse` | tool result를 sanitize/masking하고 `ConversationContext`에 `ref_N`으로 저장. 필요하면 화면에 출력. incident evidence로 기록. |
-| `MessageTypeUserInputRequest` | 사용자 입력을 받아 `api.UserInputResponse`로 active agent에 전달. |
-| `MessageTypeUserChoiceRequest` | 승인 또는 direction choice를 번호 선택 UX로 렌더링하고 `api.UserChoiceResponse` 전달. |
-
-이 구조 때문에 `react.Loop`는 터미널 UX를 몰라도 되고, `Orchestrator`는 LLM/tool 판단을 몰라도 된다.
-
-## 4. ReAct Loop lifecycle
-
-`internal/react.Loop`는 이 프로젝트가 직접 소유하는 runtime이다. `New(cfg)`는 LLM client와 input/output channel만 만든다. 실제 tool registry, executor, prompt, chat session은 `Start(ctx, initialQuery)` 이후 `init(ctx)`에서 준비된다.
-
-```mermaid
-sequenceDiagram
-    participant O as Orchestrator
-    participant L as react.Loop
-    participant R as toolconnector.Registry
-    participant P as Prompt
-    participant Chat as gollm.Chat
-
-    O->>L: react.New(cfg)
-    O->>L: Start(ctx, initialQuery)
-    L->>L: init(ctx)
-    L->>L: os.MkdirTemp(workDir)
-    L->>L: sandbox.NewLocalExecutor()
-    L->>R: NewRegistry(ctx, executor, cfg.MCPClient)
-    R->>R: register bash, kubectl, custom tools, optional MCP
-    L->>P: buildSystemPromptWithOptions(...)
-    L->>Chat: llm.StartChat(systemPrompt, cfg.Model)
-    L->>Chat: SetFunctionDefinitions unless shim
-    L->>L: go run(ctx, initialQuery)
-```
-
-`Close()`는 cancel, input EOF signal, registry close, executor close, llm close, temp workdir removal을 한 번만 수행한다. Orchestrator는 agent invalidation이나 process 종료 시 이 lifecycle을 닫는다.
-
-## 5. ReAct 상태 머신
-
-`Loop.run`은 명시적인 state machine이다.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-    Idle --> Running: UserInputResponse(query)
-    Done --> Running: UserInputResponse(query)
-    Running --> WaitingApproval: mutating calls need approval
-    WaitingApproval --> Running: yes / no observation appended
-    Running --> WaitingDirectionChoice: next_directions or problematic_resources
-    WaitingDirectionChoice --> Running: option selected
-    WaitingDirectionChoice --> WaitingDirectionText: free input selected
-    WaitingDirectionText --> Running: user directive
-    Running --> Done: plain answer or conclusive final_report
-    Running --> Done: max iterations or repeated invalid correction
-    Idle --> Exited: EOF / ctx done
-    Done --> Exited: EOF / ctx done
-    WaitingApproval --> Exited: EOF / ctx done
-    WaitingDirectionChoice --> Exited: EOF / ctx done
-    WaitingDirectionText --> Exited: EOF / ctx done
-```
-
-상태별 책임:
-
-| 상태 | 의미 |
-|---|---|
-| `StateIdle` | 아직 active query가 없고 사용자 입력을 기다린다. |
-| `StateRunning` | LLM 호출, structured output 처리, tool 분석과 실행을 진행한다. |
-| `StateWaitingApproval` | mutating tool call에 대한 사용자 승인 대기. |
-| `StateWaitingDirectionChoice` | inconclusive report 이후 후속 진단 방향 또는 관련 리소스 조사 선택 대기. |
-| `StateWaitingDirectionText` | 사용자가 직접 후속 진단 방향을 입력하는 단계. |
-| `StateDone` | 현재 query 처리 완료. 다음 사용자 입력을 기다릴 수 있다. |
-| `StateExited` | loop 종료. |
-
-## 6. Query 시작과 context 초기화
-
-`startQuery(query)`는 매 요청의 시작점이다.
-
-주요 순서:
-
-1. `classifyRequestIntent(query)`로 manifest/general 등 요청 의도를 분류한다.
-2. 이전 요청의 state가 있으면 `captureConversationMemory()`로 compact memory를 보존한다.
-3. 새 tool profile과 prompt options를 만들고 `resetChatSession()`으로 system prompt와 chat session을 재생성한다.
-4. user message를 output으로 보낸다.
-5. `priorConversationStateMessage()`가 있으면 현재 LLM content 앞에 넣는다.
-6. `requirementAnalysisPrompt()`와 `requirementAnalysisDefinitionPrompt()`를 먼저 넣고, 마지막에 user query를 넣는다.
-7. 현재 request state, phase state, guide state, action record, final report state를 초기화한다.
-8. state를 `StateRunning`으로 전환한다.
-
-이 설계의 핵심은 매 query마다 model에게 바로 tool action을 허용하지 않고, 먼저 structured `requirement_analysis`를 통과시키는 것이다.
-
-## 7. runIteration 파이프라인
-
-`runIteration(ctx)`는 ReAct loop의 핵심이다. 현재 구현은 단순히 "LLM이 tool을 고르면 실행"이 아니라, 여러 structured output gate를 순서대로 통과시키는 runtime pipeline이다.
-
-```mermaid
-flowchart TD
-    A["runIteration"]
-    Max{"currIteration >= MaxIterations?"}
-    Compact{"context near limit?"}
-    Send["buildIterationSendContent\nrequirement anchor, phase anchor, guide anchor, currChatContent"]
-    Stream["sendAndCollectStreaming"]
-    CtxErr{"context length error?"}
-    Parse["streamedText + functionCalls"]
-    NoCalls{"functionCalls empty?"}
-    NeedReq["requireRequirementAnalysisBeforeAction"]
-    NeedPhase["requirePhasePlanBeforeAction"]
-    Plain["plain answer allowed?"]
-    Normalize["normalize internal structured calls"]
-    Invalid["rejectInvalidShimStructuredCalls"]
-    Req["consumeRequestContext\nrequirement_analysis/request_context"]
-    PhasePlan["consumePhasePlan"]
-    MutVerifyGate["enforce pending\nmutation verification"]
-    MutContinue["enforce mutation\ncontinuation"]
-    MutResult["consumeMutationVerificationResult"]
-    GuideProg["consumeGuideProgress"]
-    PhaseProg["consumePhaseProgress"]
-    Guide["handleRequestedResourceGuideLookup"]
-    GuideGate["rejectActionDuringGuidanceLookupWithoutGuide"]
-    ConvGate["reject conversational\ntool calls"]
-    Enforce["enforce requested\nphase_progress/final_report"]
-    Final["consumeFinalReport"]
-    Next["consumeNextDirections"]
-    Target["target/resource validation"]
-    AssistantTools["reject guidance_* tool names"]
-    NonObs["reject self-talk\nshell actions"]
-    Analyze["analyzeToolCalls"]
-    Interactive{"interactive?"}
-    ReadOnly{"read-only and modifying?"}
-    Approval{"modifying and approval needed?"}
-    Dispatch["dispatchToolCalls"]
-    Done["StateDone or StateRunning"]
-
-    A --> Max
-    Max -- yes --> Done
-    Max -- no --> Compact
-    Compact --> Send --> Stream --> CtxErr
-    CtxErr -- yes --> Compact
-    CtxErr -- no --> Parse
-    Parse --> NoCalls
-    NoCalls -- yes --> NeedReq --> NeedPhase --> Plain --> Done
-    NoCalls -- no --> Normalize --> Invalid --> Req --> PhasePlan --> MutVerifyGate --> MutContinue --> MutResult --> GuideProg --> PhaseProg --> Guide --> GuideGate --> ConvGate --> Enforce --> Final --> Next --> Target --> AssistantTools --> NonObs --> Analyze
-    Analyze --> Interactive
-    Interactive -- yes --> Done
-    Interactive -- no --> ReadOnly
-    ReadOnly -- yes --> Done
-    ReadOnly -- no --> Approval
-    Approval -- yes --> Done
-    Approval -- no --> Dispatch --> Done
-```
-
-### 7.1 Iteration anchors
-
-`buildIterationSendContent()`는 `currChatContent` 앞에 compact anchor를 붙인다.
-
-실제 prepend 순서:
-
-1. `mutationVerificationAnchor()`
-2. `guideStepAnchor()`
-3. `phaseStepAnchor()`
-4. `requirementAnalysisAnchor()`
-5. `runtimeStateAnchor()`
-
-최종 slice에서는 마지막에 prepend된 `runtime_state` anchor가 가장 앞에 온다. 즉 model은 현재 control state와 required next output을 먼저 보고, 그 다음 original request와 accepted analysis, active phase, active guide step, mutation verification obligation, 최신 observation 순으로 문맥을 받는다.
-
-anchor의 목적:
-
-- `runtimeStateAnchor`: `RuntimeSnapshot`에서 계산한 `control_state`, `active_gate`, `required_next_output`, `forbidden_next_outputs`를 보여준다.
-- `requirementAnalysisAnchor`: follow-up이나 긴 진단에서 원래 target/scope가 drift하지 않게 한다.
-- `phaseStepAnchor`: model-declared top-level phase plan을 계속 따르게 한다.
-- `guideStepAnchor`: guide가 주입된 뒤 nested diagnostic step 진행률과 다음 step을 유지한다.
-- `mutationVerificationAnchor`: mutation 이후 남은 verification evidence 또는 `mutation_verification_result` 요구를 유지한다.
-
-### 7.1.1 RuntimeSnapshot and input dispatch
-
-`RuntimeSnapshot`은 `Loop`의 여러 flag 조합을 하나의 `ControlState` projection으로 해석한다. 이 snapshot은 LLM anchor, input dispatch, diagnostic/audit에 사용하는 runtime-visible state다.
-
-주요 control state:
-
-- `awaiting_requirement_analysis`
-- `awaiting_phase_plan`
-- `awaiting_model_step`
-- `awaiting_resource_guide_lookup`
-- `awaiting_guided_diagnosis_step`
-- `awaiting_guided_phase_progress`
-- `awaiting_final_report`
-- `awaiting_next_directions`
-- `awaiting_mutation_verification_evidence`
-- `awaiting_mutation_verification_result`
-- `awaiting_mutation_continuation`
-- `awaiting_continuation_choice`
-- `awaiting_continuation_text`
-
-입력 처리는 단일 `InputOwner`만 보지 않고 다음 순서로 판단한다.
-
-1. raw input을 `choice_number`, `approval`, `slash_meta`, `free_text`, `empty`로 분류한다.
-2. 현재 `ControlState`와 input kind를 `DecideInputDispatch`로 비교한다.
-3. 허용되면 `orchestrator_meta`, `react_choice`, `react_text`, `react_approval`, `user_query` handler 중 하나로 보낸다.
-4. 허용되지 않으면 loop에 빈 응답을 보내지 않고 현재 prompt를 유지한다.
-
-정책:
-
-- continuation choice는 표시된 입력 방식만 받는다. `선택 (번호)`는 숫자만, `선택 (y/n)`은 `y/n/yes/no/예/아니오`만 허용한다. `/help` 같은 slash meta는 처리하지 않고 invalid choice다.
-- continuation free text는 slash meta를 orchestrator가 처리하고, 일반 텍스트는 ReAct loop로 전달한다.
-- approval prompt도 표시된 입력 방식만 받는다. 현재 기본 승인 UI는 번호 선택지를 출력하므로 번호만 허용한다.
-- 일반 user query prompt는 slash meta와 natural-language query를 모두 받을 수 있다.
-
-### 7.2 Native function calling과 shim mode
-
-두 실행 모드를 모두 지원한다.
-
-| 모드 | 동작 |
-|---|---|
-| Native function calling | `chat.SetFunctionDefinitions`로 실제 tool schemas와 runtime-internal structured function schemas를 provider에 주입하고, response part의 function calls를 수집한다. |
-| Shim mode | prompt에 tool schema JSON을 넣고, model은 단일 `json` code block을 출력한다. `candidateToShimCandidate`가 text를 `reActResponse`로 parse한 뒤 synthetic function call로 변환한다. |
-
-native mode에서 provider에 등록되는 runtime-internal structured calls:
+# Orchestrator and ReAct Architecture
+
+이 문서는 현재 코드 기준으로 CLI 입력부터 ReAct model turn, Kubernetes tool 실행,
+사용자 출력까지의 구조를 설명한다. 안정된 외부 경계와 내부 package 분리를 다루며,
+아직 이전 중인 compatibility state도 구분해서 기록한다.
+
+## Scope
+
+주요 실행 경계는 다음과 같다.
+
+| 위치 | 책임 |
+| --- | --- |
+| `cmd/k8s-assistant` | config/flag/env를 읽고 interactive CLI를 시작한다. |
+| `internal/orchestrator` | readline, meta command, active agent 교체, formatter, incident-guidance side-flow를 소유한다. |
+| `internal/react/react.go` | 외부 facade다. `New`, `Loop`, runtime snapshot/input 관련 공개 alias를 제공한다. |
+| `internal/react/coordinator` | model/input/tool/output I/O와 한 iteration의 실행 순서를 조정한다. |
+| `internal/react/session` | control, phase, verification, compact context mutable state의 목표 소유자다. |
+| `internal/react/flow` | I/O 없는 request/phase/guidance/verification/report/direction/gate 규칙을 둔다. |
+| `internal/react/contract` | enum, event/effect, structured payload, snapshot처럼 공유되는 immutable 계약을 둔다. |
+| `internal/react/protocol` | runtime internal call 이름, schema, native/shim normalization을 담당한다. |
+| `internal/react/kube` | kubectl command/resource/target 파싱과 read-only 판정을 담당한다. |
+| `internal/react/prompt` | prompt template rendering과 requirement-analysis prompt 조립을 담당한다. |
+| `internal/react/provider` | main LLM provider setup을 담당한다. |
+| `internal/react/language` | 선택형 user-facing translation client를 담당한다. |
+| `internal/toolconnector` | kubectl-ai tool registry와 선택형 MCP tool을 연결한다. |
+| `internal/guidance` | resource/incident guide 검색과 planning을 담당하며 Kubernetes 명령을 직접 실행하지 않는다. |
+
+## Current Package Layout
 
 ```text
-__requirement_analysis__, __request_context__, __phase_plan__, __phase_progress__,
-__guide_progress__, __resource_guide_lookup__, __final_report__, __next_directions__,
-__mutation_verification_result__
+internal/react/
+├── react.go
+├── coordinator/
+│   ├── loop.go
+│   ├── iteration.go
+│   ├── input.go
+│   ├── execution.go
+│   ├── output.go
+│   └── dependencies.go
+├── session/
+│   ├── state.go
+│   ├── control.go
+│   ├── phase.go
+│   ├── verification.go
+│   ├── context.go
+│   ├── snapshot.go
+│   └── cleanup.go
+├── flow/
+│   ├── request/
+│   ├── phase/
+│   ├── guidance/
+│   ├── verification/
+│   ├── report/
+│   ├── direction/
+│   └── gate/
+├── contract/
+│   ├── enums.go
+│   ├── events.go
+│   ├── effects.go
+│   ├── structured.go
+│   ├── action.go
+│   └── snapshot.go
+├── protocol/
+├── kube/
+├── prompt/
+├── provider/
+└── language/
 ```
 
-이 call들은 Kubernetes tool이 아니라 ReAct runtime state를 갱신하는 structured outputs다. 특히 `__guide_progress__`는 native mode에서 `kubectl`/`bash` arguments에 섞지 않고 별도 function call로 처리한다. `__guide_progress__`가 마지막 nested guide step을 완료하면 runtime은 즉시 `guided_diagnosis` phase completion을 위한 `__phase_progress__` 또는 guide 밖의 `__final_report__` directive를 queue한다.
+외부 package는 `internal/react/coordinator`를 직접 의존하지 않고 `internal/react` facade를
+사용한다. 이 규칙은 내부 디렉터리를 다시 정리해도 orchestrator의 호출 계약이 흔들리지
+않게 한다.
 
-`__mutation_verification_result__`는 Kubernetes 변경 후 runtime이 요구한 검증 evidence가 모두 관찰된 뒤에만 허용되는 내부 call이다. 모델은 검증 evidence를 보고 `resolved`, `progressing`, `unresolved` 중 하나를 보고해야 하며, `progressing`/`unresolved`이면 다음 read-only observation 또는 추가 remediation 방향을 함께 제시해야 한다.
+## Dependency Direction
 
-shim parser는 `requirement_analysis`, `phase_plan`, `phase_progress`, `resource_guide_lookup`, `final_report`, `next_directions`, `mutation_verification_result`, `action`, `answer`를 구분한다. runtime은 이 structured output을 내부 call name인 `__phase_plan__` 같은 이름으로 normalize한다. shim mode의 tool JSON listing에는 runtime-internal calls를 섞지 않아 기존 JSON code block protocol을 유지한다.
-
-### 7.3 Requirement analysis gate
-
-`requireRequirementAnalysisBeforeAction`은 accepted `requirement_analysis` 없이 action, answer, guide lookup, phase plan 이후 작업으로 넘어가는 것을 막는다.
-
-`consumeRequestContext`는 다음을 수행한다.
-
-- `requirement_analysis` schema와 semantic validity를 확인한다.
-- follow-up이면 이전 `request_context`를 적용해 target/scope defaulting을 수행한다.
-- clarification이 필요하면 user-facing 질문을 내고 request를 종료한다.
-- accepted analysis 이후 `resetChatSessionAfterRequirementAnalysis()`로 prompt를 재구성한다.
-- concrete primary target이 있으면 Kubernetes discovery로 built-in/CRD/unknown을 분류한다.
-
-### 7.4 Phase plan and phase progress gate
-
-`requirePhasePlanBeforeAction`은 accepted requirement analysis 이후 `phase_plan` 없이 tool action이나 answer로 가는 것을 막는다.
-
-`phasePlan`은 다음 조건을 만족해야 한다.
-
-- `request_goal`이 있어야 한다.
-- `phase_steps` 또는 backward-compatible `phases`가 있어야 한다.
-- 각 step은 `index`, `name`, `goal`, `completion_condition`이 필요하다.
-- `allowed_next`에 들어간 이름은 같은 plan의 `phase_steps[].name`으로 선언되어야 한다.
-- `allowed_next`는 forward-only edge여야 한다. 같은 index 또는 이전 index의 phase로 되돌아가는 back-edge/cycle은 validation에서 거부된다.
-- 뒤에 더 큰 index의 step이 있는 non-terminal step은 적어도 하나의 `allowed_next`가 필요하다.
-- 각 `phase_steps[]`는 optional `steps[]`를 가질 수 있다. 이 필드는 phase 내부의 선언형 execution/evidence step을 runtime snapshot과 anchor에 보존하기 위한 것이며, 없으면 기존 implicit phase mode로 동작한다. 현재 explicit phase step에는 직접 완료/재시도/skip helper를 적용하지 않고, phase 완료는 여전히 tool observation과 `phase_progress`로 판정한다. 공통 `SkipStep` branch helper는 persistent terminal state가 있는 guide step과 mutation evidence requirement에만 적용된다.
-
-schema/graph validation 이후에는 `validatePhasePlanForRequest`가 request-aware runtime contract를 검증한다.
-
-- mutation request 또는 mutation/remediation execution phase가 있는 plan은 `mutation_verification`, `verification_observation`, `post_mutation_verification` 같은 verification phase가 필요하다.
-- `guidance_lookup`/`guided_diagnosis`는 runtime discovery가 primary target을 CRD로 확인한 뒤에만 허용된다.
-- `guided_diagnosis`는 `guidance_lookup` 없이 선언할 수 없다.
-- 이 gate에 막힌 plan은 `phaseStepState`로 수용되지 않으므로 action dispatch로 내려가지 않는다.
-
-예외적으로 single-step `lightweight_lookup` phase는 `phase_plan`과 첫 `action`을 같은 응답에 포함할 수 있다. 그 외에는 `phase_plan`만 먼저 받아들인다.
-
-`guide_progress`는 `phase_progress`보다 먼저 소비된다. 따라서 native model이 같은 응답에 `guide_progress`와 `phase_progress`를 함께 내면 guide step completion을 먼저 기록한 뒤 parent phase completion을 검증할 수 있다. `guide_progress` 뒤에 trailing call이 있으면 silently drop하지 않고 남은 pipeline으로 넘긴다.
-
-`phase_progress`는 active phase만 완료할 수 있다. `next_phase`가 있으면 현재 step의 `allowed_next`에 포함된 이름이어야 한다. 생략되면 첫 번째 allowed next phase로 진행한다.
-
-guide 완료 후 runtime이 `phase_progress` 또는 `final_report`를 이미 요청한 상태라면, 이후 응답은 해당 requested structured call 하나만 허용된다. 기대한 call과 다른 action/tool call이 함께 있으면 correction을 다시 queue해 동반 call이 조용히 버려지거나 실행되지 않게 한다.
-
-대화/clarification 요청으로 확정된 `requirement_analysis`는 Kubernetes 관찰 단계로 내려가지 않는다. `rejectConversationalToolCalls`는 conversation/clarification 상태에서 `kubectl`, `bash`, `shell`, `echo` 같은 tool call이 나오면 실행하지 않고, plain answer/question 또는 clarification phase completion을 다시 요구한다.
-
-### 7.5 Mutation verification gate
-
-Kubernetes 변경은 approval 통과와 tool 성공만으로 완료되지 않는다. `appendToolObservation()` 이후 `trackMutationVerification()`이 성공한 mutating action을 관찰하고, 현재 request 목표 기준으로 검증 evidence requirement를 만든다.
-
-현재 runtime state는 다음 의미를 가진다.
-
-| State | 의미 |
-|---|---|
-| `pendingMutationVerification.Requirements` | 변경 목표를 검증하기 위해 필요한 read-only evidence 목록. 직접 변경 대상과 request primary target의 outcome evidence가 분리될 수 있다. |
-| `pendingMutationVerification.Satisfied` | 각 requirement가 성공한 read-only observation으로 충족됐는지 기록한다. |
-| `pendingMutationVerification.AwaitingResult` | 모든 requirement가 관찰됐고, 이제 model이 `mutation_verification_result`로 판정해야 하는 상태. |
-| `mutationContinuationRequired` | `progressing` 또는 `unresolved` 판정 이후 final report/phase completion으로 바로 닫지 못하게 하는 상태. |
-
-동작 규칙:
-
-- 하나의 user 목표 안에서 순차 mutation이 여러 번 성공하면 같은 verification contract에 requirement를 누적한다. 개별 command line을 독립된 완료 단위로 보지 않는다.
-- verification action은 read-only kubectl observation이어야 하며, 남은 requirement와 맞으면 여러 개를 같은 iteration에서 실행할 수 있다.
-- 모든 requirement가 충족되면 runtime은 다음 응답을 `mutation_verification_result` 하나로 제한한다.
-- `resolved`이면 pending verification을 닫고, 그 evidence를 근거로 `phase_progress` 또는 `final_report`가 가능하다.
-- `progressing`이면 pending verification을 닫되 `mutationContinuationRequired`를 켜서 wait/recheck 같은 추가 ReAct action을 강제한다.
-- `unresolved`이면 pending verification을 닫되 `mutationContinuationRequired`를 켜서 다른 진단이나 다른 remediation을 강제한다.
-- target을 추출하지 못한 successful `kubectl apply -f ...`는 apply output이 모두 성공인 경우 그 output 자체를 적용 evidence로 보고 추가 generic verification을 만들지 않는다. command에서 명시적 target을 추출할 수 있으면 그 target 기준의 verification은 계속 만들 수 있다.
-
-## 8. Tool 실행과 승인 흐름
-
-tool call은 structured validation을 통과한 뒤에만 `analyzeToolCalls`로 들어간다.
-
-```mermaid
-flowchart TD
-    Calls["functionCalls"]
-    Parse["registry.Tools.ParseToolInvocation"]
-    Interactive["GetTool().IsInteractive"]
-    Modifies["modifiesResource"]
-    ReadOnly{"cfg.ReadOnly && modifies?"}
-    Approval{"!skipPermissions && modifies?"}
-    Choice["UserChoiceRequest\nyes / yes_and_dont_ask / no"]
-    Invoke["ParsedToolCall.InvokeTool"]
-    Result["ToolResultToMap"]
-    Observe["appendToolObservation"]
-    MutTrack["trackMutationVerification"]
-    Output["MessageTypeToolCallResponse"]
-
-    Calls --> Parse --> Interactive --> Modifies --> ReadOnly
-    ReadOnly -- blocked --> Observe
-    ReadOnly -- allowed --> Approval
-    Approval -- yes --> Choice --> Invoke
-    Approval -- no --> Invoke
-    Invoke --> Result --> Observe --> MutTrack --> Output
-```
-
-실행 전 gate:
-
-| Gate | 처리 |
-|---|---|
-| Assistant-managed guidance tool name | 모델이 `guidance_*` 류 tool을 직접 호출하면 실행하지 않고, guidance는 k8s-assistant가 별도 runtime 경계에서 처리한다는 observation만 돌려준다. |
-| Self-talk shell action | `echo`, `printf`, `true`, `false`, `sleep`, `read`만 수행하는 shell command는 cluster observation이 아니므로 실행 전 correction으로 재시도시킨다. |
-| Interactive command | stdin/TTY prompt가 필요한 command는 실행하지 않고 non-interactive 대안을 요구한다. |
-| Read-only mutation/unknown | read-only 모드에서는 명확한 mutation은 사용자 요청 차단으로, 안전성이 불명확한 command는 agent command retry로 처리한다. |
-| Approval | read-only가 아니더라도 mutating call은 사용자 승인 전에는 dispatch되지 않는다. |
-
-`requestApproval()`는 pending call descriptions를 보여주고 세 선택지를 제공한다.
-
-- `예`: 이번 pending calls만 실행한다.
-- `예, 이후 묻지 않기`: `skipPermissions=true`로 두고 이후 mutating calls의 승인 prompt를 생략한다.
-- `아니오`: 각 pending call에 declined observation을 append하고 loop를 계속한다.
-
-중요한 예외: `read-only` 모드는 `skipPermissions`보다 강하다. 사용자가 이전에 "이후 묻지 않기"를 선택했더라도 `cfg.ReadOnly`가 켜져 있으면 mutating call은 `rejectReadOnlyModifyingCalls()`에서 차단된다.
-
-tool 실행 결과가 실패로 돌아오면 `annotateToolFailureResult`가 observation에 실패 분류와 retry policy를 붙이고 `GateOutcomeToolExecutionFailure`로 다음 분기를 결정한다.
-
-| Failure class | 주요 감지 예 | Retry scope | Runtime 지시 |
-|---|---|---|---|
-| `command_syntax` | command not found, unknown flag, usage, invalid argument | `agent_correct_command` | 같은 evidence를 관찰하는 corrected non-interactive command로 재시도 |
-| `rbac_forbidden` | forbidden, unauthorized, permission denied, RBAC | `user_request` | 같은 금지 command 반복 금지, 가능한 대체 evidence 또는 blocker 보고 |
-| `resource_not_found` | not found, NotFound | `current_phase` | target name/namespace/kind 재확인 후 재시도 또는 clarification |
-| `timeout_or_api_unavailable` | timeout, deadline exceeded, connection refused, API unavailable | `external_state` | 더 좁은 read-only observation 또는 wait/recheck 경로 |
-| `partial_success` | 일부 성공 payload와 errors가 함께 있음 | `current_step` | 성공 evidence는 보존하고 누락 evidence만 추가 수집 |
-| `unknown` | 실패 상태이지만 세부 분류 불가 | `agent_correct_command` | 더 안전한 대체 diagnostic command 또는 phase가 허용할 때 blocker 설명 |
-
-retryable failure만으로는 `final_report`를 닫지 않는다. runtime은 active phase를 계속 진행하거나 phase completion 조건이 충족됐을 때만 `phase_progress`/report로 넘어가도록 correction을 붙인다.
-
-## 9. Read-only enforcement
-
-read-only enforcement는 prompt instruction만이 아니라 runtime policy다.
-
-`modifiesResource` 판정 순서:
-
-0. `echo`, `printf`, `sleep`, `read`처럼 클러스터 상태를 관찰하지 않는 shell action은 tool 실행/read-only 판정 전에 correction으로 재시도시킨다. planning이 완료됐으면 `phase_progress`, 추가 증거가 필요하면 실제 read-only `kubectl` action을 요구한다.
-1. observation tool name이면 `no`.
-2. kubectl-ai tool의 `CheckModifiesResource`가 `yes`이거나 runtime이 실제 실행 위치의 kubectl mutation verb/subcommand를 확인하면 `yes`.
-3. kubectl invocation에 read-only fast path에서 금지된 shell evaluation syntax 또는 안전성이 확인되지 않은 command shape가 있으면 `unknown`.
-4. kubectl invocation이 read-only pipeline이면 `no`.
-5. 그 외에는 kubectl-ai tool의 `CheckModifiesResource` 결과를 사용한다.
-
-`unknown`은 mutating command와 다르게 취급한다. read-only mode에서 명확한 mutation은 사용자의 변경 요청이 read-only 정책에 막힌 것이므로 반복하지 않는다. 반면 안전한 diagnostic인지 확인하지 못한 `unknown` command는 agent가 잘못된 command를 고른 것이므로 `retryable=true`, `retry_scope=agent_correct_command` observation을 남기고, final report를 강제하지 않고 더 구체적인 read-only `kubectl` command 또는 `phase_progress`로 재시도시킨다.
-
-명확한 mutation과 `unknown`이 같은 batch에 섞이면 전체 gate outcome은 사용자 요청 차단으로 취급한다. 이때 unknown command의 개별 observation도 agent retry가 아니라 `user_request_blocked_by_read_only` scope를 따른다.
-
-read-only kubectl pipeline으로 인정되려면:
-
-- command list의 각 segment가 read-only kubectl pipeline이어야 한다.
-- 첫 pipeline segment가 `kubectl`이고 verb가 허용 목록이어야 한다.
-- 이후 pipeline segment는 safe local text processor여야 한다.
-- shell redirection은 금지된다.
-- command substitution `$()`, backtick substitution, heredoc, process substitution은 금지된다.
-- 어느 segment 안에도 mutating kubectl verb가 있으면 금지된다.
-
-현재 read-only verb:
+의도한 의존 방향은 다음과 같다.
 
 ```text
-get, describe, logs, top, api-resources, api-versions, version, config, auth
+cmd/k8s-assistant
+        |
+        v
+internal/orchestrator ---> internal/react (facade)
+                                |
+                                v
+                        react/coordinator
+                         /      |       \
+                        v       v        v
+                    session    flow   protocol/kube
+                       \        |       /
+                        v       v      v
+                         react/contract
 ```
 
-`kubectl auth`는 verb만으로 허용하지 않는다. read-only fast path에서는 `auth can-i`, `auth whoami`만 allowlist로 허용한다. `auth reconcile`은 안전성 미확인이 아니라 명확한 mutation으로 분류하고, 그 밖의 인식되지 않은 auth shape는 read-only로 허용하지 않는다.
+- `contract`는 다른 ReAct package의 구체 구현을 의존하지 않는다.
+- `flow`는 Kubernetes I/O나 model client를 호출하지 않는 규칙 계층이다.
+- `session`은 mutable 값을 보관하지만 model/tool I/O를 수행하지 않는다.
+- `coordinator`만 이 규칙과 상태를 실제 provider/tool/input/output에 연결한다.
+- `guidance`는 진단 정보를 반환할 뿐 변경 명령을 직접 실행하지 않는다.
 
-현재 mutating verb:
+## State Boundaries
+
+상태 이름은 서로 다른 축을 섞지 않는다.
+
+| State axis | 의미 | 예 |
+| --- | --- | --- |
+| `LoopLifecycleState` | goroutine/UI 실행 형태 | model turn, approval 대기, continuation 입력 대기, 종료 |
+| `RuntimeControlState` | runtime이 다음에 받아야 하는 obligation | requirement analysis, phase plan, tool approval, verification result |
+| `PhaseStatus` | model-declared top-level phase의 진행 상태 | pending, active, completed, skipped |
+| `StepStatus` | phase 아래 실제 실행/guide/verification step 상태 | pending, active, completed, retrying |
+| `InputOwner` | 현재 사용자 입력을 소비할 계층 | orchestrator, ReAct choice/text, approval |
+
+`RuntimeControlState`는 phase 이름이 아니다. 예를 들어
+`awaiting_mutation_verification_result`는 현재 phase가 무엇이든 runtime이 먼저 해결해야 할
+검증 obligation이다. 반대로 `guided_diagnosis`는 model plan의 phase이며 그 내부의 다음
+guide action은 `awaiting_guided_diagnosis_step` control로 나타날 수 있다.
+
+현재 control enum과 lifecycle projection은 `contract/enums.go`와 `session/control.go`에 있다.
+`session.State`는 다음 mutable 영역을 묶는다.
 
 ```text
-apply, delete, patch, replace, edit, scale, autoscale, set, create,
-annotate, label, cordon, uncordon, drain, taint, expose, run, exec,
-debug, attach, cp
+State
+├── Control
+├── Phase
+├── Verification
+└── Context
 ```
 
-현재 mutating subcommand:
+`session.State.Snapshot()`은 외부에서 읽을 immutable `contract.RuntimeSnapshot`을 만든다.
+orchestrator는 snapshot의 `Control`과 `InputOwner`를 사용해 입력을 agent에 보낼지, meta
+command로 처리할지 결정한다.
+
+## Migration Status
+
+package split은 완료됐지만 state ownership 이전은 아직 완전히 끝나지 않았다.
+
+| 항목 | 상태 |
+| --- | --- |
+| facade와 implementation 분리 | 완료 |
+| enum/structured payload/snapshot의 `contract` 분리 | 완료 |
+| `session.State`와 control/phase/verification/context container 도입 | 완료 |
+| request/phase/guidance/verification/report/direction/gate 규칙 package 도입 | 완료 |
+| phase validation/progress, guidance lookup/progress, verification matching/continuation, report/direction normalization의 production 경로 연결 | 완료 |
+| gate outcome 계약/target validation과 correction message 선택의 production 경로 연결 | 완료 |
+| protocol, kube, prompt, provider, language 분리 | 완료 |
+| `coordinator.Loop`의 기존 mutable compatibility 필드 제거 | 미완료 |
+| 모든 transition이 `session.State`만 변경하도록 단일화 | 미완료 |
+| gate consume/enforce 순서와 decision/apply 전체의 reducer 위임 | 미완료 |
+
+따라서 현재 `session.State`는 목표 source of truth지만, 코드 전체가 이미 그 상태만 사용한다고
+간주하면 안 된다. `coordinator.Loop`에는 request/phase/guide/verification 관련 기존 필드와
+package-local compatibility control이 남아 있다. 이 중복은 [`TODO.md`](./TODO.md)의
+state/session ownership cleanup에서 추적한다.
+
+## Runtime Flow
+
+### 1. Query start
+
+1. CLI가 일반 입력과 meta command를 구분한다.
+2. 일반 query는 `react.New`로 만든 facade `Loop`에 전달된다.
+3. coordinator가 provider, tool registry, sandbox executor, prompt, guidance client를 준비한다.
+4. request context를 초기화하고 control을 `awaiting_requirement_analysis`로 전환한다.
+
+예: 사용자가 `tests 네임스페이스의 실패한 pod를 확인해줘`라고 입력하면 orchestrator는
+이를 `/config` 같은 meta command로 처리하지 않고 active ReAct loop에 전달한다.
+
+### 2. Requirement and phase setup
 
-```text
-rollout pause/restart/resume/undo, auth reconcile, certificate approve/deny
-```
-
-현재 lightweight detector는 실제 실행 command 위치의 `kubectl`만 positive mutation으로 본다. `sudo kubectl ...`, `xargs kubectl ...`처럼 wrapper 뒤에 오는 kubectl 실행은 후속 과제로 남기며, 향후 `Evaneos/kubectl-readonly` 기반 command classifier로 대체/보강할 예정이다.
-
-safe local pipeline command:
-
-```text
-tail, head, grep, egrep, fgrep, awk, sed, sort, uniq, wc, cut, jq, yq, column
-```
-
-예시:
-
-```bash
-kubectl get pods -n app | tail -20
-```
-
-위 command는 첫 segment가 read-only kubectl이고 뒤가 safe local processor라 허용된다.
-
-```bash
-kubectl get pod app -o yaml | kubectl apply -f -
-```
-
-위 command는 pipeline 안에 mutating kubectl verb가 있으므로 차단된다.
-
-## 10. Guidance 경계
-
-이 프로젝트에는 두 종류의 guidance 흐름이 있다.
-
-```mermaid
-flowchart LR
-    UserQuery["User query"]
-    React["react.Loop"]
-    Phase["phase_plan reaches guidance_lookup"]
-    Discovery["runtime CRD discovery"]
-    RGLookup["resource_guide_lookup structured output"]
-    RGClient["guidance.NewResourceGuideClient"]
-    GuideAnchor["guideStepState + guide_step anchor"]
-    Orch["orchestrator.IncidentGuidanceFlow"]
-    TextEvidence["agent text / tool evidence"]
-    Choice["continuation choice option:\nrunbook 검색"]
-    IncidentClient["guidance.NewIncidentClient"]
-    Summary["validated runbook summary\nor no usable runbook"]
-
-    UserQuery --> React --> Phase --> Discovery --> RGLookup --> RGClient --> GuideAnchor --> React
-    TextEvidence --> Orch --> Choice --> IncidentClient --> Summary
-```
-
-### 10.1 Resource guide
-
-resource guide는 `react.Loop` 안에서 model-selected structured output으로만 진입한다.
-
-진입 조건:
-
-- active top-level phase가 `guidance_lookup`이어야 한다.
-- runtime discovery가 primary target을 CRD로 확인해야 한다.
-- 동일 refined query를 반복하지 않아야 한다.
-
-`searchAndInjectResourceGuide`는 `guidance.NewResourceGuideClient`를 만들고 Qdrant provider일 때만 guide search를 수행한다. provider가 Qdrant가 아니거나 search 실패, filter 결과 없음이면 unavailable observation을 주입하고 일반 진단을 계속하게 한다.
-
-guide가 있으면:
-
-- `buildGuideStepState`로 top guide case의 diagnostic steps를 runtime state로 저장한다.
-- accepted `phase_plan`에 `guided_diagnosis` phase가 있는지 확인하고 그 phase로 진입한다.
-- prompt options에 guidance protocol과 필요 시 Cluster API guardrail을 포함한다.
-- context size에 따라 compact 후 guide observation을 넣거나 현재 content를 보존한 채 chat session을 reset한다.
-
-guide step은 top-level phase가 아니다. `guide_progress`는 active phase가 `guided_diagnosis`일 때 nested guidance step 완료만 표시한다. 모든 guide step이 완료되면 runtime은 먼저 `guided_diagnosis` phase를 `phase_progress`로 완료하도록 요구하고, 이후 `final_report`로 넘어간다. 모델이 이 directive를 무시하고 다른 action을 반복하면 runtime은 correction과 directive를 다시 queue해 MaxIterations까지 표류하지 않게 한다.
-
-resource guide provider 정책은 타입별로 분리되어 있다. 현재 ReAct resource guide lookup은 Qdrant provider만 구현한다. endpoint/local provider가 설정되어 있으면 `provider_not_implemented_for_resource_guides=<provider>` unavailable observation을 주입하고 일반 진단을 계속한다.
-
-### 10.2 Incident guidance
-
-incident guidance는 `orchestrator`가 관리한다. model이 tool로 호출하는 구조가 아니다.
-
-흐름:
-
-1. `ObserveUserInput`이 최근 user query를 저장한다.
-2. `AfterAgentText`와 `RecordEvidence`가 장애 징후 텍스트를 관찰한다.
-3. generic lookup/summary 요청은 offer 대상에서 제외한다.
-4. concrete failure signal이 있더라도 ReAct-owned input 중간에 별도 prompt를 띄우지 않는다.
-5. ReAct continuation choice가 free-input/finalize를 포함할 때만 `[runbook 검색] 감지된 문제의 해결 방법 검색` option을 추가한다.
-6. 사용자가 그 option을 선택하면 `guidance.NewIncidentClient`로 runbook summary를 만든다.
-7. 검색 결과 없음, detection unknown, validation invalid, selected runbook `match_types` 불일치, target kind 불일치이면 "검색된 runbook이 없음"으로 종료한다.
-
-incident guidance도 Kubernetes 변경을 직접 실행하지 않는다. 현재 incident runbook summary는 evidence/provider output일 뿐이며, summary 출력 뒤 임의 remediation prompt를 ReAct loop에 주입하지 않는다. 사용자가 실제 변경을 요청하면 별도 ReAct 요청으로 들어가고, 이후 Kubernetes 변경은 approval과 mutation verification lifecycle을 따른다.
-
-`guidance.Client.Analyze`는 runbook 기반 remediation plan을 만들 때 `AllowMutation=true`, `RequireDryRun=true`, `RequireConfirmation=true` 제약을 사용한다. 하지만 orchestrator summary formatter는 plan을 실행하지 않고, command가 confirmation-required step이거나 template placeholder/namespace가 완성되지 않은 경우 command 표시도 숨긴다. 따라서 incident guidance 결과는 사용자에게 보여주는 참고 summary이며 ReAct tool dispatch 경로가 아니다.
-
-## 11. Final report와 continuation
-
-`final_report`는 guide 진단이 끝났거나 model이 충분한 evidence를 확보했다고 판단할 때 request를 닫는 structured output이다.
-
-conclusive report:
-
-- `attempted`, `evidence_known`, `most_likely_cause`, `conclusion`이 필요하다.
-- `problematic_resources`가 없으면 report를 출력하고 `StateDone`으로 간다.
-- `problematic_resources`가 있으면 runtime이 관련 리소스 추가 조사 선택지를 만든다.
-
-inconclusive report:
-
-- `attempted`, `most_likely_cause`, 그리고 `evidence_known`, `evidence_missing`, `blockers` 중 하나가 필요하다.
-- report 출력 후 runtime은 model에게 `next_directions`를 요구한다.
-- `next_directions`는 1-3개 option을 제안한다.
-- runtime은 "직접 다른 방향 입력"과 "여기서 진단 종료"를 user choice에 추가한다.
-
-선택지 종류:
-
-| kind | 의미 | runtime 처리 |
-|---|---|---|
-| `another_guide` | 다른 resource family/problem focus로 guide angle 재시도 | guide state를 reset하고 pre-guidance phase로 되감은 뒤, phase workflow가 다시 `guidance_lookup`에 도달하게 한다. |
-| `different_approach` | guide가 아닌 다른 진단 지시 | user-approved directive를 `currChatContent`에 넣고 `StateRunning`으로 재개한다. |
-| `investigate_resource` | conclusive report의 관련 문제 리소스 추가 조사 | 새 query처럼 `startQuery`를 호출해 requirement analysis부터 다시 시작한다. |
-
-## 12. Prompt와 language policy
-
-production prompt는 `prompts/default.tmpl`이다. `prompts/system_ko.tmpl`는 Korean reference/convenience prompt이며 기본 경로라고 가정하지 않는다.
-
-CLI flag parsing 이후에는 provider-specific credential aggregation을 다시 수행한다. 이로써 config/env로 만들어진 `cfg.APIKey`가 CLI `--llm-provider` 변경 뒤에도 이전 provider 값으로 남지 않는다. `/save`는 runtime aggregate인 generic `apikey`/`endpoint`를 저장하지 않고 provider-specific configured fields만 보존한다.
-
-`buildSystemPromptWithOptions`는 다음 입력으로 prompt를 만든다.
-
-- tool definitions JSON
-- tool names
-- shim enabled 여부
-- read-only 여부
-- user language
-- translation runtime 사용 여부
-- guidance protocol 포함 여부
-- manifest guideline 포함 여부
-- Cluster API guardrail 포함 여부
-- tool profile
-
-prompt cache key는 template path, prompt profile hash, tool profile hash, shim/read-only/language/translate option을 포함한다.
-
-tool profile은 현재 conservative하게 모든 registered tool을 유지한다. 의도 기반 tool pruning은 하지 않고, stable hash와 prompt caching을 위한 profile name/hash만 제공한다.
-
-language policy:
-
-- `lang.language=English`: model-facing/user-facing 자연어는 English.
-- `lang.language=Korean`이고 translation model이 설정되지 않음: main model이 Korean으로 응답한다.
-- `lang.language=Korean`이고 `lang.model`과 `lang.endpoint`가 설정됨: main model은 English로 reasoning/answer를 만들고, user-facing text만 `langTranslator`가 Korean으로 번역한다.
-- translation은 OpenAI-compatible chat completions endpoint만 사용한다.
-- Kubernetes resource names, commands, flags, JSON/YAML, field names, raw command output은 번역하거나 변형하지 않아야 한다.
-
-## 13. Context compaction
-
-`react.Loop`는 대화가 길어질 때 전체 raw history를 계속 들고 가지 않는다.
-
-관리 대상:
-
-- original query
-- accepted requirement analysis
-- request context
-- resource classification
-- last correction
-- injected guide references
-- completed action summaries
-- last assistant text
-- prior conversation memory
-
-compaction trigger:
-
-- 다음 send 전에 estimated context가 model limit의 약 80%에 도달한 경우.
-- context length error가 발생한 경우.
-- correction이나 guide injection처럼 state rewrite가 필요한 경우.
-
-compacted state는 `compactedStateMessage(nextInstruction)`으로 만들어지며, original request, accepted analysis, compacted clues, guide refs, last answer 등을 요약해 새 chat session에 넣는다.
-
-## 14. Tool connector와 MCP 경계
-
-`internal/toolconnector.Registry`는 kubectl-ai tool system을 감싼다.
-
-등록 순서:
-
-1. `tools.Tools.Init()`
-2. `tools.NewBashTool(executor)`
-3. `tools.NewKubectlTool(executor)`
-4. `~/.config/kubectl-ai/tools.yaml` 또는 `XDG_CONFIG_HOME/kubectl-ai/tools.yaml` custom tools
-5. `--mcp-client`가 켜진 경우 MCP tools
-
-MCP config는 k8s-assistant의 명시적 config만 사용한다.
-
-- source: `~/.k8s-assistant/mcp.yaml`
-- destination for kubectl-ai library: kubectl-ai default MCP config path
-- URL server는 간단한 TCP dial check를 수행한다.
-- 이 파일에 없는 MCP server는 로딩하지 않는다.
-
-guidance는 MCP server가 아니다. resource guide와 incident guide는 `internal/guidance` client/service로 직접 호출된다.
-
-## 15. 개발 작업 가이드
-
-### 15.1 Meta command 추가
-
-수정 지점:
-
-- `GetMetaCommands`
-- `filterMetaCommands`가 prefix matching에 사용하므로 command name만 추가하면 autocomplete 대상이 된다.
-- `handleMetaCommand`에 실제 dispatch 추가.
-- runtime behavior가 바뀌는 command면 `invalidateAgent(reason)` 호출 여부를 검토한다.
-- config persistence가 필요하면 `/save`와 `Config.Save()` field tag를 확인한다.
-
-### 15.2 ReAct structured output 추가
-
-수정 지점:
-
-- `shim.go`: response struct, parsing, shim part conversion.
-- `loop.go`: internal call constant, normalization, `runIteration` consume order.
-- 별도 파일에 `consumeX`와 validation 구현.
-- `prompts/default.tmpl`: native/shim 양쪽 contract 업데이트.
-- tests: shim parsing, runIteration gate, invalid schema correction.
-
-주의점:
-
-- structured output은 "tool name"이 아니라 runtime protocol이다.
-- `action.name`에 내부 call name이 들어오면 correction해야 한다.
-- 한 iteration에서 허용할 수 있는 output 조합을 명확히 해야 한다.
-
-### 15.3 Tool 또는 MCP 변경
-
-수정 지점:
-
-- built-in/custom/MCP 등록은 `internal/toolconnector` 경계를 우선 사용한다.
-- model prompt에 tool schema가 들어가는 방식은 `prompt.go`와 `default.tmpl`을 함께 확인한다.
-- read-only 정책에 영향을 주는 tool이면 `modifiesResource`, `isObservationToolName`, `CheckModifiesResource` 경계를 검토한다.
-
-### 15.4 Guidance 변경
-
-원칙:
-
-- resource guide는 `guidance_lookup` phase와 `resource_guide_lookup` structured output을 통해 들어가야 한다.
-- incident guidance는 orchestrator offer flow를 통해 들어가야 한다.
-- guidance가 직접 Kubernetes 변경을 실행하지 않는다.
-- 변경 실행은 항상 ReAct/tool loop와 approval/read-only gate를 통과해야 한다.
-
-### 15.5 Prompt 변경
-
-원칙:
-
-- `prompts/default.tmpl`가 primary production prompt다.
-- Korean convenience prompt를 production default로 가정하지 않는다.
-- shim mode와 native mode를 모두 유지한다.
-- JSON schema, command, resource names, raw output 보존 규칙을 깨지 않는다.
-
-## 16. 테스트 기준
-
-문서 변경만이면 build는 필요 없다. 코드 변경이 있으면 변경 영역에 맞는 focused test를 우선 실행한다.
-
-관련 테스트 예:
-
-```bash
-go test ./internal/react ./internal/orchestrator ./internal/config -count=1
-```
-
-문서만 변경한 이번 작업의 verification은 다음으로 충분하다.
-
-```bash
-git diff --check
-```
+1. model은 먼저 structured `requirement_analysis`를 반환한다.
+2. `contract.RequirementAnalysis`로 정규화하고 `flow/request` 규칙으로 intent/context를 만든다.
+3. accepted request context는 session context에 보관된다.
+4. 다음 model turn은 `phase_plan`을 요구한다.
+5. `flow/phase.Validate`가 plan graph를 검증하고 session phase state가 current/completed 상태를 보관한다.
+
+예: 직전 query가 `tenant-a`의 Deployment를 대상으로 했다면 `그럼 rollout은?` 같은
+follow-up은 이전 target/scope를 기본값으로 사용할 수 있다. 새 query가 명시적으로 다른
+namespace나 all-namespaces를 지정하면 새 값이 우선해야 한다.
+
+### 3. Model step and gate
+
+coordinator는 model 응답을 native function calls 또는 shim JSON에서 공통 call 형태로
+정규화한다. 이후 runtime obligation, phase, safety, correction 규칙을 적용한다.
+
+- runtime internal call: requirement, phase plan/progress, guide progress, verification result,
+  final report, next directions
+- real action: kubectl, bash, configured MCP/tool call
+- user-facing text: answer, progress, correction
+
+한 응답이 internal structured call과 real action을 동시에 포함할 수 있으므로 최종 허용/차단은
+coordinator의 iteration pipeline이 결정한다. `flow/gate`는 outcome/correction 값을 제공하지만,
+consume/enforce 순서 전체가 순수 reducer로 이전된 상태는 아니다.
+
+### 4. Approval and execution
+
+1. `kube` helper가 kubectl command, target, mutation/read-only 특성을 판정한다.
+2. read-only 위반은 실행 전에 차단한다.
+3. mutation은 필요한 경우 user approval을 요청한다.
+4. 승인된 call만 `toolconnector.Registry`와 executor로 실행한다.
+5. raw observation은 model history와 runtime progress에 기록한다.
+
+예: `kubectl scale deployment api --replicas=3 -n prod`는 mutation이므로 approval 없이는
+실행하지 않는다. `--read-only`가 켜져 있으면 이전에 사용자가 권한 확인을 생략하도록
+선택했더라도 실행을 차단해야 한다.
+
+### 5. Mutation verification
+
+mutation이 성공하면 coordinator가 action target과 command에서 evidence requirement 및
+namespace/resource/name match evidence를 만든다. `flow/verification`은 이 구조화된 evidence의
+matching과 evidence/result continuation을 판단한다. 현재 mutable requirement/attempt의 실제
+판단 경로에는 coordinator의 compatibility 필드가 남아 있다. 이를
+`session.VerificationState`만 사용하도록 단일화하는 작업은 후속 범위다.
+
+이름을 label/field selector에서 확인할 때는 selector flag를 파싱한 뒤 key/value를 완전
+일치로 비교한다. 예를 들어 target `web`은 `metadata.name=web-prod`와 일치하지 않는다.
+
+예: Deployment replicas를 변경한 뒤에는 변경 command의 성공 출력만으로 종료하지 않고
+read-only rollout/status 관찰과 `mutation_verification_result`를 거쳐 resolved/progressing/
+unresolved를 판단한다. progressing/unresolved recheck budget이 소진되면 runtime은 다음
+`final_report`를 `conclusive=false`로 제한하며, 모델 지시가 아니라 payload validation으로
+이를 강제한다. 같은 pending verification에 여러 mutation이 포함되면 아직 충족되지 않은
+동일 target의 `outcome_evidence`는 한 번만 요구한다.
+
+### 6. Guidance and report
+
+resource guide는 `flow/guidance`가 accepted phase, runtime resource classification, 기존 guide
+주입 여부를 확인해 lookup이 필요하다고 판단한 경우에만 사용한다. guide step은 top-level
+phase가 아니라 `guided_diagnosis` 아래 nested step이며 완료/skip 진행도 역시
+`flow/guidance` 규칙을 거친다. 결과는 `flow/report`와 `flow/direction` 규칙을 거쳐 final
+report 또는 사용자 continuation choice로 연결된다.
+
+`guidance_lookup` 결과가 관찰되기 전에는 `resource_guide_lookup`만 허용한다. 또한
+`guided_diagnosis`에 남은 guide step이 있으면 `final_report`와 `next_directions`를 수락하지
+않는다. 이 검사는 control 값뿐 아니라 현재 phase와 nested guide 진행 상태를 함께 사용한다.
+
+incident guidance는 orchestrator side-flow다. 구체적 실패 신호가 있을 때만 제안하며,
+검색 결과의 summary를 보여줄 수 있지만 ReAct loop를 건너뛰어 Kubernetes 변경을 실행하지
+않는다.
+
+예: CRD Cluster의 status와 관련 객체를 관찰한 뒤 guide lookup phase에 들어가면 resource
+guide를 사용할 수 있다. 단순히 `이벤트를 요약해줘`라고 요청했고 장애 신호가 없다면 incident
+runbook 검색을 자동 제안하지 않는다.
+
+## Native and Shim Protocol
+
+- native mode는 provider의 function call을 사용한다.
+- shim mode는 하나의 `json` code block 안 JSON object를 받는다.
+- `protocol/shim.go`가 JSON 문자열을 추출/복구한다.
+- `protocol/calls.go`가 internal call 이름을 정규화한다.
+- `protocol/schema.go`가 runtime structured call 목록을 제공한다.
+- coordinator가 normalized call을 실제 lifecycle에 적용한다.
+
+shim/native 차이는 transport에만 있어야 한다. phase, approval, read-only, verification,
+guidance 규칙은 두 모드에서 동일해야 한다.
+
+## Read-Only Boundary
+
+`internal/react/kube/readonly.go`는 현재 local classifier를 보유한다. 허용되는 pipeline은 첫
+segment가 read-only kubectl이고 이후 segment가 `grep`, `jq`, `head` 같은 안전한 local text
+processor인 경우다. mutating kubectl, shell evaluation, unsafe redirection은 실행 전에
+거부해야 한다.
+
+read-only classifier의 알려진 리스크와 `kubectl-readonly` 대체 대상은 최상위
+[`bug.md`](../bug.md)를 기준으로 추적한다. package 이동만으로 해당 리스크가 해결됐다고
+간주하지 않는다.
+
+## Documentation Map
+
+| 주제 | 문서 |
+| --- | --- |
+| requirement classification/context | [`requirement_analysis.md`](./requirement_analysis.md) |
+| model phase plan과 guidance 진입 | [`request_processing_phases.md`](./request_processing_phases.md) |
+| guide progress, report, continuation | [`guide_progress_and_continuation.md`](./guide_progress_and_continuation.md) |
+| 명시적 state machine 설계 이력 | [`drafts/react_remediation_plans/07_explicit_state_machine.md`](./drafts/react_remediation_plans/07_explicit_state_machine.md) |
+| 구조적 리스크 | [`reviews/react_loop_structure_review.md`](./reviews/react_loop_structure_review.md) |
+| 재현 가능한 bug backlog | [`../bug.md`](../bug.md) |
+
+## Maintenance Rules
+
+- 외부 호출 계약은 `internal/react/react.go`에서 유지한다.
+- 새 mutable workflow state는 `session`에 두고 coordinator에 별도 source of truth를 추가하지 않는다.
+- 새 shared enum/payload는 `contract`에 두되 provider/tool 구현 타입을 끌어오지 않는다.
+- model/tool/input/output I/O가 없는 판단은 해당 `flow` package로 이동한다.
+- Kubernetes command policy는 `kube`, transport/shim 규칙은 `protocol`에 둔다.
+- package 이동과 behavior fix를 구분한다. 이동만 한 경우 bug/review 항목을 완료 처리하지 않는다.

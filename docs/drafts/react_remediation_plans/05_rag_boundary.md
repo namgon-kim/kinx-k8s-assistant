@@ -2,9 +2,11 @@
 
 > 상태: 구현됨.
 >
-> Resource guide는 `internal/react`의 `guidance_lookup` phase와 CRD discovery gate를
+> Resource guide는 `internal/react/flow/guidance` 규칙과 coordinator의
+> `guidance_lookup` phase/CRD discovery gate를
 > 통해서만 진입한다. Incident guidance는 orchestrator continuation choice에서
 > 명시적으로 선택될 때만 `internal/guidance` client로 실행된다.
+> 아래 옛 루트 파일 경로는 구현 이력이다.
 
 ## Problem
 
@@ -19,7 +21,7 @@ resource guide는 비교적 phase contract 안에 들어와 있지만, incident 
 
 ### Resource Guide
 
-- `internal/react/resource_guidance.go`
+- `internal/react/coordinator/iteration.go`, `internal/react/flow/guidance`
   - `resource_guide_lookup` internal call로 진입한다.
   - `guidance_lookup` phase에서만 허용한다.
   - CRD 확인 전에는 차단한다.

@@ -9,7 +9,12 @@
 | 구성 | 역할 |
 | --- | --- |
 | `cmd/k8s-assistant` | 메인 CLI |
-| `internal/react` | ReAct loop, structured output, read-only/mutation/guidance gate |
+| `internal/react/react.go` | 외부 facade. `New`, `Loop`, runtime snapshot/input type을 노출 |
+| `internal/react/coordinator` | model turn, 입력, tool 실행, 출력 등 ReAct I/O orchestration |
+| `internal/react/session` | control/phase/verification/context mutable session state |
+| `internal/react/flow` | request, phase, guidance, verification, report, direction, gate 규칙 |
+| `internal/react/contract` | package 간 immutable enum, event/effect, structured payload |
+| `internal/react/protocol`, `internal/react/kube` | native/shim 호출 규약과 kubectl command/read-only 정책 |
 | `internal/orchestrator` | interactive CLI, meta command, formatter, incident guidance side-flow |
 | `internal/guidance` | resource guide, incident guide, RAG/runbook client |
 | `cmd/log-analyzer-server` | 선택형 log/event/metric 분석 MCP 서버 |
@@ -125,6 +130,7 @@ lang:
 Interactive meta command:
 
 ```text
+/help
 /config
 /model
 /lang Korean|English|status
@@ -132,9 +138,15 @@ Interactive meta command:
 /kubeconfig
 /kube-context
 /save
+/clear
+/reset
+/exit
+/quit
 ```
 
 `/readonly` 같은 runtime 설정 변경은 `/save`를 실행해야 config 파일에 저장됩니다.
+`/clear`와 `/reset`은 현재 대화/agent 상태를 초기화하며 config 파일은 변경하지 않습니다.
+`/exit`와 `/quit`은 동일하게 CLI를 종료합니다.
 
 ## 선택 기능
 
@@ -201,7 +213,15 @@ cmd/
   log-analyzer-server/    # optional log analyzer MCP server
   guidance-upload/        # Qdrant upload helper
 internal/
-  react/                  # ReAct loop and runtime gates
+  react/
+    react.go              # public facade
+    coordinator/          # model/input/tool/output orchestration
+    session/              # mutable control/phase/verification/context state
+    flow/                 # request/phase/guidance/verification/report/gate rules
+    contract/             # shared enum, event/effect, structured payload
+    protocol/, kube/      # native/shim protocol and kubectl policy
+    prompt/, provider/    # prompt rendering and LLM setup
+    language/             # user-facing translation
   orchestrator/           # CLI interaction and meta commands
   guidance/               # resource/incident guide client
   loganalyzer/            # log/event/metric analysis domain

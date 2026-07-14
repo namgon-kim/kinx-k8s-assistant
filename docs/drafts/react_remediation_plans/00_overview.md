@@ -27,8 +27,10 @@
 현재 코드에서 확인된 구현 상태:
 
 - `orchestrator.handleMessage`가 agent text/tool result를 보고 `IncidentGuidanceFlow`를 갱신한다.
-- `orchestrator.handleAgentInputRequest`는 ReAct-owned input을 incident guidance prompt로 선점하지 않고, `ControlState`와 input kind로 dispatch한다.
-- `react.Loop`는 `State` enum과 함께 `RuntimeSnapshot.Control`을 파생해 requirement/phase/guide/final/next/mutation/user-input 대기 상태를 구분한다.
+- `orchestrator.handleAgentInputRequest`는 ReAct-owned input을 incident guidance prompt로 선점하지 않고, `RuntimeControlState`와 input kind로 dispatch한다.
+- `internal/react/react.go`는 facade, `coordinator`는 I/O orchestration, `contract`는 enum/payload, `session`은 mutable state, `flow`는 업무 규칙으로 분리됐다.
+- `session.State.Control`과 `RuntimeSnapshot.Control`이 requirement/phase/guide/final/next/mutation/user-input obligation을 표현한다.
+- `coordinator.Loop`에는 이전 구조의 compatibility state가 남아 있어 session 단일 source-of-truth 이전은 완료되지 않았다.
 - `phase_plan`은 model이 제안하지만 runtime이 schema, forward-only transition, mutation verification phase, CRD guidance eligibility를 수용 전에 검증한다.
 
 최근 구현에서 반영된 부분:

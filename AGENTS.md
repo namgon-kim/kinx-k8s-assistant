@@ -9,7 +9,11 @@ The project intentionally owns the ReAct loop, approval UX, prompt rendering, ou
 ## Core Architecture
 
 - `cmd/k8s-assistant`: main CLI entrypoint and flags.
-- `internal/react`: k8s-assistant-owned ReAct loop, prompt rendering, shim parser, read-only enforcement, language translation.
+- `internal/react/react.go`: public ReAct facade. Callers should not import implementation subpackages directly.
+- `internal/react/coordinator`: ReAct model/input/tool/output orchestration.
+- `internal/react/session`: mutable control, phase, verification, and context state.
+- `internal/react/flow`, `contract`: I/O-free workflow rules and immutable shared contracts.
+- `internal/react/protocol`, `internal/react/kube`, `internal/react/prompt`, `internal/react/provider`, `internal/react/language`: transport, Kubernetes policy, prompt, provider, and translation boundaries.
 - `internal/toolconnector`: kubectl-ai tool registry integration and MCP config sync.
 - `internal/orchestrator`: interactive CLI, meta commands, output formatting, guidance flow coordination.
 - `internal/guidance`: internal resource-guide/incident-guide RAG client and planning logic. This is not a standalone MCP server.
@@ -33,10 +37,10 @@ The project intentionally owns the ReAct loop, approval UX, prompt rendering, ou
 
 ## ReAct Loop and Prompt Rules
 
-- `internal/react` owns the ReAct loop.
+- `internal/react` owns the ReAct loop; `react.go` is its facade and `coordinator` runs it.
 - `prompts/default.tmpl` is the main prompt path.
 - Tool/function calling and shim mode must both remain supported.
-- Shim mode expects a single JSON object in a `json` code block and is repaired by `internal/react/shim.go`.
+- Shim mode expects a single JSON object in a `json` code block and is repaired by `internal/react/protocol/shim.go` before coordinator consumption.
 - Do not translate or mutate tool calls, function call JSON, kubectl commands, resource names, field names, JSON/YAML, or raw command output.
 - If `lang.language=Korean` and `lang.model`/`lang.endpoint` are set, the main model should operate in English and only user-facing natural-language text should be translated through the language model client.
 - `lang` provider is fixed to OpenAI-compatible. Do not add generic provider selection unless explicitly requested.
@@ -56,6 +60,7 @@ The project intentionally owns the ReAct loop, approval UX, prompt rendering, ou
 
 Current user-facing meta commands include:
 
+- `/help`
 - `/config`
 - `/model`
 - `/lang Korean|English|status`
@@ -63,6 +68,8 @@ Current user-facing meta commands include:
 - `/kubeconfig`
 - `/kube-context`
 - `/save`
+- `/clear`, `/reset`
+- `/exit`, `/quit`
 
 Meta command changes that affect runtime behavior should invalidate the active agent when needed.
 
@@ -89,11 +96,8 @@ Meta command changes that affect runtime behavior should invalidate the active a
 ## Verification
 
 - Do not run build commands unless the user explicitly asks. The user requested that builds are not needed.
-- Prefer focused tests for changed packages, for example:
-  - `GOCACHE=/Users/ngkim/workspaces/kinx-k8s-assistant/.cache/go-build go test ./internal/react ./internal/orchestrator ./internal/config -count=1`
-  - `GOCACHE=/Users/ngkim/workspaces/kinx-k8s-assistant/.cache/go-build go test ./...`
-- Use workspace-local `GOCACHE` if the default Go cache is blocked by sandbox permissions.
-- Remove temporary `.cache/` after test runs.
+- Prefer focused tests for changed packages only when the user explicitly requests tests.
+- The ReAct implementation now spans `internal/react/coordinator`, `session`, `flow/...`, `protocol`, `kube`, `prompt`, `provider`, and `language`.
 - Always run `git diff --check` after edits.
 
 ## Editing and Git Hygiene

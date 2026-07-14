@@ -5,6 +5,8 @@
 > `RuntimeSnapshot.Control` 기반 input dispatch와 orchestrator의 incident guidance
 > choice-gating이 반영되어 있다. ReAct-owned free text/approval/choice 입력은
 > incident side-flow가 선점하지 않는다.
+> 현재 구현 위치는 `internal/react/contract/enums.go`, `session/control.go`,
+> `coordinator/input.go`, `coordinator/loop.go`다. 아래 옛 루트 파일 경로는 구현 이력이다.
 
 ## Problem
 
@@ -14,15 +16,15 @@ ReAct loop가 사용자 입력을 기다리는 동안 orchestrator side-flow가 
 
 ## Current Code Evidence
 
-- `internal/react/loop.go`, `internal/react/next_directions.go`
-  - `Loop.InputOwner()`가 atomic snapshot으로 현재 입력 소유자를 노출한다.
-  - `StateWaitingApproval`은 `approval`, `StateWaitingDirectionChoice`는 `react_choice`, `StateWaitingDirectionText`는 `react_text`로 표시된다.
-  - `StateWaitingDirectionChoice`에서 free-input 선택 시 `StateWaitingDirectionText`로 전환한다.
+- `internal/react/contract/enums.go`, `internal/react/session/control.go`, `internal/react/coordinator/loop.go`, `internal/react/coordinator/iteration.go`
+  - `RuntimeControlState`와 `InputOwner`가 approval, continuation choice, continuation text를 구분한다.
+  - `Loop.InputOwner()`와 published snapshot이 현재 입력 소유자를 노출한다.
+  - continuation choice에서 free-input을 고르면 `RuntimeControlAwaitingContinuationText`로 전환한다.
   - 이후 `MessageTypeUserInputRequest`가 발생하고 사용자의 직접 입력을 기다린다.
 - `internal/orchestrator/orchestrator.go`
   - `handleMessage`는 `MessageTypeUserInputRequest`를 받으면 `handleAgentInputRequest`로 진입한다.
   - `handleAgentInputRequest`는 incident guidance side-flow를 실행하지 않고 pending offer를 폐기한 뒤 입력을 ReAct loop로 전달한다.
-  - `handleAgentChoiceRequest`는 `InputOwner()==react_choice`이고 continuation choice가 free-input/finalize를 포함할 때만 runbook 검색 option을 추가한다.
+  - `handleAgentChoiceRequest`는 continuation-choice control이고 선택지가 조건을 만족할 때만 runbook 검색 option을 추가한다.
 - `internal/orchestrator/incident_guidance_flow.go`
   - agent text/tool result를 관찰해 `incidentGuidanceOfferPending`을 만들 수 있다.
   - out-of-band remediation approval prompt 경로는 제거됐다.

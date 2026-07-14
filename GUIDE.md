@@ -62,7 +62,7 @@ native tool/function calling을 지원하지 않는 모델은 `enabletoolshim: t
 
 #### 2. 명령줄 옵션 (CLI 플래그)
 ```bash
-./k8s-assistant \
+./bin/k8s-assistant \
   --llm-provider openai \
   --model gpt-4o \
   --kubeconfig ~/.kube/config \
@@ -96,12 +96,12 @@ openai_endpoint: https://api.openai.com/v1  # 선택사항
 ```bash
 export OPENAI_API_KEY=sk-...
 export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
-./k8s-assistant
+./bin/k8s-assistant
 ```
 
 ### 방법 3: 실행 옵션으로 provider/model 선택
 ```bash
-./k8s-assistant --llm-provider openai --model gpt-4o
+./bin/k8s-assistant --llm-provider openai --model gpt-4o
 ```
 
 **주의:** kubectl-ai/gollm은 provider별 환경 변수가 설정되어 있어야 동작합니다. k8s-assistant는 시작 시 config.yaml의 provider별 API/endpoint 값을 필요한 환경 변수로 올린 뒤 gollm이 읽도록 합니다. 이미 환경 변수가 설정되어 있으면 환경 변수 값을 우선합니다.
@@ -109,6 +109,10 @@ export OPENAI_ENDPOINT=https://api.openai.com/v1  # 선택사항
 ## 메타 명령어
 
 메타 명령어는 `/` 로 시작합니다. `/` 입력 시 자동으로 메타 명령 메뉴가 표시됩니다.
+
+현재 명령은 `/help`, `/config`, `/kubeconfig`, `/kube-context`, `/model`, `/lang`,
+`/readonly`, `/save`, `/clear`, `/reset`, `/exit`, `/quit`입니다. `/clear`와 `/reset`은
+현재 대화/agent 상태를 초기화하고, `/exit`와 `/quit`은 CLI를 종료합니다.
 
 ### 메뉴 표시
 ```bash
@@ -189,9 +193,13 @@ servers:
 
 ## guidance 설정
 
-guidance는 별도 서버를 실행하지 않습니다. k8s-assistant가 custom resource 작업/진단 요청에는 resource guide를 먼저 조회하고, 장애 흐름에는 사용자 확인 후 incident guide 검색과 조치 계획 생성을 수행합니다. Kubernetes 명령 실행은 k8s-assistant ReAct 루프와 승인 흐름이 담당합니다.
+guidance는 별도 서버를 실행하지 않습니다. Resource guide는 관찰 evidence를 수집한 뒤
+model-declared plan이 `guidance_lookup` phase에 도달하고 runtime이 CRD-backed target을
+확인한 경우에만 조회합니다. Incident guide는 구체적인 장애 흐름에서 사용자가 runbook
+검색을 선택했을 때 실행합니다. Kubernetes 명령 실행은 항상 k8s-assistant ReAct 루프와
+승인 흐름이 담당합니다.
 
-### CRD-first resource guide 조회
+### Phase-owned resource guide 조회
 
 k8s-assistant는 LLM이 리소스 이름만 보고 custom resource 여부를 맞히는 것에 의존하지 않습니다. 사용자 요청은 먼저 별도 requirement-analysis 단계에서 자연어 대상과 Kubernetes 리소스 후보를 분리합니다. 대상은 리소스가 아닐 수도 있으므로, "이 클러스터의 문제를 해결해줘" 같은 요청은 구체적인 Kubernetes `Cluster` 오브젝트가 명시되지 않은 한 현재 접속한 클러스터 환경으로 분류합니다.
 
@@ -201,10 +209,17 @@ k8s-assistant는 LLM이 리소스 이름만 보고 custom resource 여부를 맞
 4. 예전 target 값 대신 새 `target.category`와 `resource_candidates` 계약만 사용합니다.
 5. `target.category`와 `scope.type`은 권장값을 우선 쓰되, 자연어 표현을 막지 않도록 런타임 enum으로 강제하지 않습니다.
 6. `resource_candidates`가 비어 있으면 Kubernetes 리소스 컨텍스트와 CRD resource guide/RAG 조회를 만들지 않습니다.
-7. primary Kubernetes 리소스 후보가 있을 때만 런타임이 discovery로 built-in/CRD 여부를 확인합니다.
-8. CRD로 확인된 경우에만 resource guide/RAG를 조회합니다.
-9. guide 결과에 근거가 있을 때만 해당 CRD family 전용 주의사항을 조건부로 주입합니다.
-10. resource guide/RAG 조회가 불가능하거나 결과가 없으면 guide를 가정하지 않고 일반 kubectl 증거 수집과 LLM 판단으로 진행합니다.
+7. model은 `phase_plan`을 선언하고 필요한 live observation을 먼저 수행합니다.
+8. primary Kubernetes 리소스 후보가 있을 때만 런타임이 discovery로 built-in/CRD 여부를 확인합니다.
+9. CRD 확인만으로 RAG를 자동 실행하지 않습니다. model이 accepted plan의 `guidance_lookup` phase에 진입해야 합니다.
+10. 해당 phase에서만 `resource_guide_lookup`을 받아 resource guide/RAG를 조회합니다.
+11. guide 결과에 근거가 있을 때만 해당 CRD family 전용 주의사항과 nested diagnostic step을 주입합니다.
+12. 조회가 불가능하거나 결과가 없으면 guide를 가정하지 않고 일반 kubectl evidence와 model 판단으로 진행합니다.
+
+예: `tenant-a의 Cluster demo가 준비되지 않는 원인을 확인해줘`라는 요청은 먼저 Cluster와
+관련 객체의 live status를 관찰합니다. discovery가 Cluster를 CRD로 확인하고 plan이
+`guidance_lookup`으로 전진했을 때만 Cluster 계열 guide를 검색합니다. 단순히 CRD kind가
+요청에 포함됐다는 이유만으로 첫 단계에서 RAG를 호출하지 않습니다.
 
 guide가 제공한 label selector, annotation, command template은 진단 컨텍스트에서 보존됩니다. Cluster API 계열 guide가 주입된 경우, 관리 클러스터의 `kubectl get node` 결과를 workload cluster node 등록/건강/providerID 판단 근거로 사용하지 않습니다. workload cluster node를 확인하려면 먼저 해당 workload cluster kubeconfig/context임을 확인해야 합니다.
 
@@ -223,7 +238,9 @@ resource guide가 주입되면 가이드의 진단 step들이 체크리스트로
 - 사용자 요청 분류 (`requirement_analysis`): 진단 대상이 도중에 다른 리소스로 흘러가지 않도록 고정합니다.
 - 가이드 진행도: 어떤 step이 완료됐고 어떤 step이 남았는지, 다음에 무엇을 수행해야 하는지를 짧게 다시 제공합니다.
 
-가이드의 모든 step이 완료되면 모델은 일반 `kubectl` 명령을 또 실행하지 않고 진단 결과 보고서(`final_report`)를 생성합니다.
+가이드의 모든 nested step이 완료되면 모델은 먼저 부모 `guided_diagnosis` phase를
+`phase_progress`로 완료합니다. 그 다음 accepted plan에 따라 `final_report`를 생성합니다.
+guide completion을 보고하는 응답에 추가 `kubectl` action을 함께 실행해서는 안 됩니다.
 
 - 결론이 충분히 도출된 경우: 보고서를 사용자에게 출력하고 진단을 종료합니다.
 - 결론이 충분하지 않은 경우: 보고서를 출력한 뒤 1~3개의 다음 진단 방향 옵션을 사용자에게 묻습니다.
