@@ -181,7 +181,7 @@ The field is not a RAG execution request. Guide lookup is selected by the model'
 - Before each new query, the runtime snapshots the previous accepted `requirement_analysis`, derived `request_context`, original query, and compact diagnosis summary into explicit conversation memory fields such as `previous_requirement_analysis` and `previous_request_context`.
 - For follow-up requests, the runtime injects that previous conversation context before the requirement-analysis prompt. If the new request does not explicitly name a resource, object, or namespace, the model should use the previous accepted `requirement_analysis` / `request_context` as defaults.
 - Explicit resource, object name, namespace, or all-namespaces scope in the new request always overrides prior conversation state.
-- Follow-up target defaulting is based on `operational_focus.relationship_to_primary` and `resource_candidates.primary.source`, not runtime keyword matching.
+- Normal follow-up target defaulting is based on `operational_focus.relationship_to_primary` and `resource_candidates.primary.source`. A compatibility retry branch still uses query keywords; this is a known gap rather than part of the contract.
 - `resource_candidates.primary.source=user_request` means the current request explicitly changed or named the primary target.
 - `resource_candidates.primary.source=previous_context` means runtime may fill missing target name or namespace from the previous request context.
 - `resource_candidates.primary.source=model_inference` with `operational_focus.relationship_to_primary=related_to_primary` is not accepted as a target switch; runtime keeps the previous primary and moves the inferred resource into `operational_focus.related_resource_hints`.
@@ -218,7 +218,17 @@ If a node-group question has no prior useful context and no namespace, cluster, 
 
 ## Current Implementation Notes
 
-The runtime implementation is in `internal/react/requirement_prompt.go`, `internal/react/request_context.go`, and `internal/react/context_state.go`.
+The contract is defined in `internal/react/contract/structured.go`. Prompt text lives in
+`internal/react/prompt/requirement.go`; request classification, context derivation, and
+follow-up defaulting live in `internal/react/flow/request`; mutable request memory lives in
+`internal/react/session/context.go`. `internal/react/coordinator/iteration.go` integrates
+these rules with model turns and compatibility behavior.
+
+Example: for a follow-up such as "이번에는 모든 namespace에서 확인해줘", the intended
+result is to preserve the accepted target while overriding the prior namespace with
+`scope.type=all_namespaces`. The coordinator parses the structured requirement and
+`session.ContextState` retains the accepted context for later turns. The namespace-value-only
+encoding gap described below can still incorrectly restore the previous namespace.
 
 Implemented behavior:
 
@@ -229,6 +239,14 @@ Implemented behavior:
 - `model_inference` primary candidates for related follow-ups are moved into `operational_focus.related_resource_hints` instead of replacing the previous primary target.
 - Placeholder namespace/name values such as unknown or explanatory phrases are normalized away; `unknown` is rejected as a Kubernetes resource kind.
 - Clarification is emitted for diagnostic/remediation requests when `target.category=unknown`, or when no primary resource is available and the target category is not a broad environment/log/event/metric category.
+
+Known implementation gaps:
+
+- `shouldRetryPreviousRequest` still uses common Korean words such as `다시`, `정확`, and `아닌`; a new conversation-style question can be mistaken for a retry of the previous Kubernetes request (`BUG-23`).
+- If all-namespaces intent is encoded only in `scope.namespace` without `scope.type=all_namespaces`, normalization can clear the value and prior-context merging can restore the old namespace (`BUG-24`).
+
+These are tracked in [`../bug.md`](../bug.md). The runtime rules above remain the required
+contract, not a claim that both edge cases are already enforced.
 
 Remaining contract details:
 

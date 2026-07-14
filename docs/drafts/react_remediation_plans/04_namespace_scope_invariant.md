@@ -5,6 +5,9 @@
 > request context namespace와 mutating kubectl command/action target의 namespace
 > invariant는 구현되어 있다. `kubectl apply -f ...` manifest 내부 namespace 검증은
 > 아직 남아 있다.
+> 현재 관련 위치는 `contract/action.go`, `contract/structured.go`, `kube/target.go`,
+> `kube/resource.go`, `flow/request`, `coordinator/iteration.go`다. 아래 옛 루트 파일
+> 경로는 구현 이력이다.
 
 ## Problem
 
@@ -12,10 +15,10 @@
 
 ## Current Code Evidence
 
-- `internal/react/action_target_validation.go`
+- `internal/react/coordinator/execution.go`, `internal/react/coordinator/iteration.go`, `internal/react/kube/target.go`
   - target namespace가 있으면 command namespace 누락을 잡는다.
   - 하지만 target namespace 자체가 비어 있으면 request context namespace가 있어도 잡기 어렵다.
-- `internal/react/request_context.go`
+- `internal/react/flow/request`, `internal/react/session/context.go`
   - requirement analysis에서 request context와 namespace가 만들어진다.
 - `prompts/default.tmpl`
   - "namespace를 유지하라"는 prompt rule이 있지만 deterministic gate는 아니다.
@@ -90,7 +93,7 @@ kubectl -n web create configmap app-config ...
 
 ## Implementation Status
 
-- `internal/react/action_target_validation.go`에 request scope namespace invariant gate를 추가했다.
+- coordinator target validation과 `kube/target.go` 경계에 request scope namespace invariant gate를 유지한다.
 - 적용 범위는 request context namespace가 확정된 `kubectl` mutating command 중, CLI command 또는 `action.target.resource`에서 namespaced resource를 판정할 수 있는 경우다.
 - `action.target.namespace`가 request namespace와 다르거나, command namespace가 다르거나, command namespace가 누락된 경우 correction을 추가하고 실행을 막는다.
 - cluster-scoped resource는 namespace 강제 대상에서 제외한다.

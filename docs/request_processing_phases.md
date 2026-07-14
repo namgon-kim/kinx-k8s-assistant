@@ -7,6 +7,14 @@ Related contracts:
 - [`requirement_analysis.md`](./requirement_analysis.md): request classification, target/scope extraction, operational focus.
 - [`guide_progress_and_continuation.md`](./guide_progress_and_continuation.md): behavior after a resource guide has already been injected.
 
+Current code ownership:
+
+- `internal/react/contract/structured.go`: immutable `PhasePlan`, `PhaseStep`, and `PhaseProgress` payloads;
+- `internal/react/flow/phase`: plan start, progress, and graph validation rules;
+- `internal/react/session/phase.go`: mutable accepted plan/current phase/completed-step state;
+- `internal/react/flow/guidance` and `internal/react/flow/verification`: nested guide and mutation-verification decisions;
+- `internal/react/coordinator/iteration.go`: protocol consumption, compatibility adapters, and model-turn integration.
+
 ## Core Principle
 
 RAG is not the primary request-processing phase. The model should first determine what the user is asking, declare the ordered processing phases, define each phase's goal and completion condition, and then advance one phase at a time.
@@ -153,7 +161,7 @@ Rules:
 - `phase_progress` completes top-level `phase_step` entries.
 - `guide_progress` completes nested `guidance_step` entries within `guided_diagnosis`.
 - When all `guidance_step` entries are complete, the model should complete the parent `guided_diagnosis` phase with `phase_progress` and move to `final_report`.
-- Runtime may store both states, but the parent-child relationship must be explicit: `guideStepState` is scoped to the current `guided_diagnosis` `phase_step`.
+- Runtime stores parent phase state separately from nested guide progress; nested guide state is scoped to the current `guided_diagnosis` `phase_step`.
 
 Example after guide injection:
 
@@ -242,7 +250,7 @@ The phase-owned guidance flow is implemented in this order:
 5. CRD discovery is exposed as eligibility context for the next model turn, not as automatic guide injection.
 6. Runtime-driven initial guide injection paths are disabled.
 7. Top-level `resource_guide_lookup` is allowed only as the model-selected action inside the `guidance_lookup` phase.
-8. `guideStepState` is scoped under `guided_diagnosis`, and nested guide completion requires parent `phase_progress`.
+8. Nested guide progress is scoped under `guided_diagnosis`, and nested guide completion requires parent `phase_progress`.
 9. Final-report prompting distinguishes completed `phase_step` entries and nested `guidance_step` entries conceptually.
 
 Remaining hardening should focus on stricter semantic validation of phase completion, not on adding another guide-entry path.
@@ -406,6 +414,10 @@ RAG is useful when the assistant needs procedural operating knowledge beyond the
 
 The phase-owned guide path is implemented. The remaining work is contract hardening, not another guide-entry path:
 
+- Reject `phase_progress` when `evidence_useful=false` or the latest relevant observation is blocked/failed (`BUG-8`).
+- Validate that mutation verification occurs after execution and before response/final phases, rather than accepting any phase whose name merely contains `verify` (`BUG-10`).
+- Determine terminal phases from graph sinks instead of list order so valid multi-sink plans are accepted (`BUG-7`).
+- Require a valid initial phase instead of accepting any declared `current_phase_index` (`BUG-21`).
 - Refine phase-progress validation beyond structural checks, especially for broad scans and ambiguous evidence.
 - Define when a broad scan becomes diagnostic evidence instead of target resolution.
 - Define how namespace/name discovered from `-A` output should update `request_context`.

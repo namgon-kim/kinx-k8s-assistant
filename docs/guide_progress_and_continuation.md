@@ -152,7 +152,7 @@ The runtime instructs the model to emit this when all diagnostic_steps are compl
 
 | `conclusive` | Loop behavior |
 |---|---|
-| `true` without `problematic_resources` | Render the conclusion, transition to `StateDone`. |
+| `true` without `problematic_resources` | Render the conclusion and return control to `RuntimeControlAwaitingUserQuery`. |
 | `true` with `problematic_resources` | Render the conclusion, show a user choice asking whether to investigate the named suspected blocker/root-cause resource(s). If the user chooses yes/resource option, start a new query from requirement_analysis with that resource kind/name/namespace as the target. |
 | `false` | Render the report, call `requestNextDirectionsFromModel(report)`, continue the loop so the next model response is a `next_directions` object. |
 
@@ -194,101 +194,89 @@ Emitted only after an inconclusive `final_report`. The model proposes 1–3 dist
 
 Invalid options (missing required fields, unknown `kind`) are filtered before the user is prompted. If no valid option remains, the runtime emits one correction and asks the model to re-emit. If the correction also fails, the runtime does not show an internal schema error to the user; it falls back to a user choice prompt containing "직접 다른 방향 입력" and "여기서 진단 종료", plus one generic `different_approach` option when `blockers` or `evidence_missing` from the inconclusive `final_report` can be turned into a safe continuation directive.
 
-## State machine
+## Control flow
 
-This is the outer runtime state machine. The model-declared `phase_step` workflow is nested inside `StateRunning`; it should not require a new user-visible runtime state for every phase.
+The model-declared `phase_step` workflow and runtime control are separate axes. A phase says
+which diagnostic goal is active; `RuntimeControlState` says which output or external event is
+accepted next.
 
-```
-                  ┌──────────────────────────┐
-                  │ StateIdle / StateDone    │
-                  │  (waits for user input)  │
-                  └────────────┬─────────────┘
-                               │ user types query
-                               ▼
-                  ┌──────────────────────────┐
-   ┌─────────────►│ StateRunning             │
-   │              │  runIteration            │
-   │              └───┬──────────┬─────────┬─┘
-   │                  │          │         │
-   │   mutation       │          │         │   final_report (conclusive=true)
-   │   approval?      │          │         │   or plain answer
-   │   ┌──────────────▼──┐       │         │   ───────────────► StateDone
-   │   │ StateWaiting    │       │         │
-   │   │   Approval      │       │         │
-   │   └──────────┬──────┘       │         │   final_report (conclusive=false)
-   │              │              │         │   → next_directions request queued
-   │              ▼              │         │
-   └──────────────────────────── │ ────────┘
-                                 │
-                          next_directions emitted by model
-                                 │
-                                 ▼
-                  ┌──────────────────────────┐
-                  │ StateWaitingDirection    │
-                  │   Choice                 │
-                  │  (UserChoiceRequest)     │
-                  └─┬──────────┬──────────┬──┘
-                    │          │          │
-       finalize     │          │ another_ │ different_
-       ─────────────┘          │  guide   │  approach
-       StateDone               │          │
-                               ▼          ▼
-                  ┌──────────────────────────┐
-                  │ searchAndInjectResource  │  or  inject directive
-                  │  Guide                   │  into currChatContent
-                  │  → StateRunning          │  → StateRunning
-                  └──────────────────────────┘
-                    user picked "직접 입력"
-                               │
-                               ▼
-                  ┌──────────────────────────┐
-                  │ StateWaitingDirection    │
-                  │   Text                   │
-                  │  (UserInputRequest)      │
-                  └────────────┬─────────────┘
-                               │ user types text
-                               ▼
-                       inject as different_approach
-                          → StateRunning
+```text
+RuntimeControlAwaitingUserQuery
+  -> RuntimeControlAwaitingRequirementAnalysis
+  -> RuntimeControlAwaitingPhasePlan
+  -> RuntimeControlAwaitingModelStep
+       -> RuntimeControlAwaitingResourceGuideLookup
+       -> RuntimeControlAwaitingGuidedDiagnosisStep
+       -> RuntimeControlAwaitingGuidedPhaseProgress
+       -> RuntimeControlAwaitingApproval -> RuntimeControlExecutingTool
+       -> RuntimeControlAwaitingMutationVerificationEvidence
+       -> RuntimeControlAwaitingMutationVerificationResult
+       -> RuntimeControlAwaitingFinalReport
+       -> RuntimeControlAwaitingNextDirections
+       -> RuntimeControlAwaitingContinuationChoice
+            -> RuntimeControlAwaitingContinuationText
+            -> RuntimeControlAwaitingModelStep
+  -> RuntimeControlAwaitingUserQuery
 ```
 
-New states added in this flow: `StateWaitingDirectionChoice`, `StateWaitingDirectionText`. Both reuse the orchestrator's existing `UserChoiceRequest` and `UserInputRequest` handlers.
+Not every request visits every state. A read-only lookup can finish without approval or mutation
+verification. An inconclusive diagnosis goes through next directions and continuation choice;
+selecting direct input additionally uses continuation text.
+
+The enum is defined in `contract/enums.go`; mutable control and lifecycle projection live in
+`session/control.go`. `LoopLifecycleState` is only the goroutine/UI execution view and must not be
+used as a substitute for the runtime obligation.
 
 ## Key files
 
 | File | Role |
 |---|---|
-| `internal/react/loop.go` | State enum, `phaseStepState`, `guideStepState`, mutation verification state, anchor wiring (`buildIterationSendContent`), phase and guide step completion bookkeeping. |
-| `internal/react/request_context.go`, `internal/react/phase_plan.go` | `requirementAnalysisAnchor()`, `phaseStepAnchor()`, `guideStepAnchor()`. |
-| `internal/react/mutation_lifecycle.go` | Goal-level mutation verification requirements, verification result consumption, and continuation enforcement after unresolved/progressing remediation. |
-| `internal/react/resource_guidance.go` | `buildGuideStepState` builds nested guide progress from `GuideCase.DiagnosticSteps` and stores step details in `guideStepState` when the guide is injected under `guided_diagnosis`. |
-| `internal/react/final_report.go` | `requestFinalReportFromModel`, `consumeFinalReport`, `renderFinalReport`, `requestNextDirectionsFromModel`. |
-| `internal/react/next_directions.go` | `consumeNextDirections`, `promptDirectionChoice`, `waitForDirectionChoice`, `waitForDirectionText`, `applyDirectionOption`. |
-| `internal/react/shim.go` | Target shim fields: `phase_plan`, `phase_progress`, `guide_progress`, backward-compatible `action.guide_progress`, `mutation_verification_result`, `final_report`, `next_directions`. |
+| `internal/react/contract/structured.go`, `enums.go` | Phase/guide/report/direction/verification payloads and control/phase/step enums. |
+| `internal/react/session/phase.go`, `verification.go`, `context.go` | Mutable phase, verification, and compact context state. |
+| `internal/react/flow/guidance` | Guide lookup eligibility and nested guide-step completion rules. |
+| `internal/react/flow/verification` | Mutation evidence requirements, command matching, and continuation decision. |
+| `internal/react/flow/report`, `internal/react/flow/direction` | Final-report normalization and continuation options. |
+| `internal/react/protocol/calls.go`, `shim.go`, `schema.go` | Internal call names, native/shim normalization, and shim JSON repair. |
+| `internal/react/coordinator/iteration.go` | Anchor wiring, structured-call consumption, guide/report/direction lifecycle integration, and compatibility adapters. |
+| `internal/react/coordinator/input.go`, `output.go`, `execution.go` | Continuation input, user-facing output, approval/tool execution. |
 | `prompts/default.tmpl`, `prompts/system_ko.tmpl` | Output schemas and model rules for phase planning, phase progress, nested guide progress, and final reporting. |
 
 ## Design constraints honored
 
 - **Directive gates for critical transitions.** When runtime has requested guide completion, final report, or mutation verification result, conflicting structured outputs are rejected instead of being silently executed or dropped. Anchors still provide context, but lifecycle safety no longer depends only on the model following a soft instruction.
 - **Conversation and observation gates.** Conversation/clarification requests cannot escape into `kubectl`/shell tool calls, and shell commands that only print or wait locally are rejected before dispatch because they do not produce cluster evidence.
-- **Single-case tracking.** Only the top guide case's `DiagnosticSteps` populates `guideStepState`. Multi-case progress is not tracked because the runtime only injects one case at a time.
+- **Single-case tracking.** Only the top guide case's `DiagnosticSteps` populates active nested guide progress. Multi-case progress is not tracked because the runtime only injects one case at a time.
 - **No MaxIteration coupling.** `MaxIterations` still ends the loop with the existing "Maximum number of iterations reached" message. Guide-exhaustion via `final_report` is independent and can fire well before `MaxIterations`.
-- **Phase owns guide.** `guideStepState` is subordinate to the active `guided_diagnosis` `phase_step`; guide completion should lead to parent `phase_progress`, not directly replace the phase workflow.
+- **Phase owns guide.** Nested guide progress is subordinate to the active `guided_diagnosis` `phase_step`; guide completion should lead to parent `phase_progress`, not directly replace the phase workflow.
 - **Mutation needs verification.** A successful mutating command creates goal-level read-only evidence requirements unless the only available evidence is a successful target-unmapped `kubectl apply -f ...` output. Final report and phase completion are blocked until the model returns `mutation_verification_result` after the required observations.
 
-## Invariants
+## Contract invariants
 
-- `phaseStepState` is non-nil after the model-declared `phase_plan` is accepted and remains active until `final_report`, `startQuery`, or `clearConversationState`.
-- `guideStepState` is non-nil only while the active `phase_step` is `guided_diagnosis`; it is cleared when that parent phase completes, when a different guide is selected, or on `startQuery`/`clearConversationState`.
-- `another_guide` never bypasses `phase_step`: it clears prior guide progress and resumes the top-level phase workflow so that a new guide can be requested only through `guidance_lookup` and consumed only under `guided_diagnosis`.
-- `finalReportRequested` is set when `requestFinalReportFromModel` queues its instruction. It prevents duplicate instruction text from being re-appended on every dispatch. It is cleared on `applyDirectionOption`, `startQuery`, `clearConversationState`, and at every `injectResourceGuide*` entry.
-- `pendingMutationVerification` is non-nil after a successful mutating action that requires goal-level verification. It stores multiple `mutationEvidenceRequirement` entries and per-requirement satisfaction state.
-- `pendingMutationVerification.AwaitingResult` means the required read-only evidence has been collected and the next accepted structured output must be `mutation_verification_result`.
-- `mutationContinuationRequired` is set after `mutation_verification_result.status=progressing` or `unresolved`. It prevents `final_report`, `phase_progress`, and `next_directions` until at least one further ReAct action is taken.
-- `pendingDirectionPrompt` is non-nil only while in `StateWaitingDirectionChoice`. The user's `Choice` index is mapped back to a concrete `nextDirectionOption` (or the synthetic finalize / free-input rows) using `FreeInputIdx` and `FinalizeIdx`.
+- `session.State.Control` represents the next runtime obligation; phase and step status do not replace it.
+- An accepted phase plan populates `session.PhaseState`, and its current phase remains separate from nested guide or verification steps.
+- Active guide progress is valid only under the `guided_diagnosis` phase and is cleared when that parent phase or request ends.
+- `another_guide` must re-enter guidance through a declared phase path; it must not inject guide steps directly into an unrelated phase.
+- A successful mutation that needs direct-effect evidence populates verification requirements. Once all required evidence is collected, control must require exactly one `mutation_verification_result` before final reporting.
+- `progressing` or `unresolved` verification must keep a continuation/recheck obligation until resolved or the bounded retry policy closes inconclusively.
+- Continuation choice and free-text input are distinct controls with `react_choice` and `react_text` input owners.
 - `phase_progress.phase_completed` is the model's self-report for the top-level phase. It is ignored when the corresponding observation is blocked, declined, failed, errored, or structurally unrelated to the active phase goal.
 - `guide_progress.step_completed` is the model's self-report, not enforced by command matching. It is ignored when the corresponding observation is blocked, declined, failed, or errored. Misreported indices on successful observations are accepted (the worst case is premature parent phase-progress/final-report instruction or a step staying open).
 - Internal schema/correction errors, including invalid `next_directions`, are runtime errors rather than Kubernetes incident evidence. They must not trigger incident guidance offers.
+
+The coordinator still contains package-local compatibility fields for several of these concepts.
+They are migration state, not a second public contract; removing them in favor of `session.State`
+is tracked in [`TODO.md`](./TODO.md).
+
+## Known implementation gaps
+
+The invariants above are the required contract. The following gaps remain in the current code and
+are tracked in [`../bug.md`](../bug.md):
+
+- `phase_progress` does not yet reject `evidence_useful=false` or every failed/blocked latest observation (`BUG-8`).
+- standalone `__guide_progress__` does not verify that the latest observation succeeded (`BUG-12`).
+- progressing/unresolved mutation verification does not reliably re-arm the same verification cycle (`BUG-9`, `BUG-14`).
+- `another_guide` rewind and `different_approach` continuation still have re-entry/branching risks (`BUG-1`, `BUG-13`).
+- shim structured acknowledgements for guide and mutation results still use native `FunctionCallResult` history (`BUG-5`).
 
 ## Remaining Contract Hardening
 

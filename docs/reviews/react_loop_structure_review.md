@@ -1,13 +1,29 @@
 # ReAct Loop Structure Review
 
-> 상태: 구조 리뷰.
+> 상태: 리팩터링 전 구조 리뷰, 새 패키지 기준 재검증 필요.
 >
 > 이 문서는 개별 버그 목록이 아니라 `internal/react` ReAct loop의 구조적 리스크를
-> 정리한다. 구체적인 재현 증상은 최상위 [`bug.md`](../../bug.md)와 함께 본다.
+> 정리한다. 본문의 파일/라인 참조는 package split 이전 위치다. 현재 대응 위치는
+> `internal/react/coordinator`, `session`, `flow`, `contract`, `protocol`, `kube`다.
+> 구체적인 재현 증상은 최상위 [`bug.md`](../../bug.md)와 함께 본다.
+
+## Refactor Status
+
+| Review area | Current package boundary | Status |
+| --- | --- | --- |
+| State management | `contract/enums.go`, `session/*`, `contract/snapshot.go` | enum과 mutable-state container는 도입됨. `coordinator.Loop` compatibility 필드가 남아 단일 source of truth는 미완료. |
+| Gate pipeline | `flow/gate`, `coordinator/iteration.go` | outcome/correction 규칙은 분리됨. consume/enforce 순서 문제의 해소 여부는 별도 동작 재검증 필요. |
+| Phase/guidance | `flow/phase`, `flow/guidance`, `session/phase.go` | 책임은 분리됨. rewind/re-entry 의미가 바뀌었다고 간주하지 않음. |
+| Verification | `flow/verification`, `session/verification.go` | requirement/matching/continuation 타입은 분리됨. 반복 lifecycle과 target 추출 이슈는 재검증 필요. |
+| Input/liveness | `coordinator/input.go`, `session/control.go` | 입력 위치는 분리됨. no-progress 감지 도입은 확인되지 않음. |
+| Protocol | `protocol/*`, `coordinator/iteration.go` | call/schema/shim parser는 분리됨. structured call과 action의 turn-level 혼합 정책은 coordinator에서 계속 통합됨. |
+
+따라서 이번 변경은 구조적 개선의 기반이지, 아래 리뷰 항목이나 `bug.md`의 개별
+증상이 자동으로 해결됐다는 증거는 아니다.
 
 ## Summary
 
-현재 ReAct loop는 동작하는 기능을 많이 갖추고 있지만, 핵심 제어가 하나의 명시적 상태 머신으로 닫혀 있지 않다. 실제 obligation은 여러 플래그와 pending struct에 흩어져 있고, 매 iteration마다 `RuntimeSnapshot.Control`로 재투영된다. 이 구조 때문에 gate 순서, 플래그 clear 타이밍, trailing function call 처리 방식이 런타임 안전성을 결정한다.
+리팩터링 전 ReAct loop는 동작하는 기능을 많이 갖추고 있었지만, 핵심 제어가 하나의 명시적 상태 머신으로 닫혀 있지 않았다. 실제 obligation은 여러 플래그와 pending struct에 흩어져 있었고, 매 iteration마다 `RuntimeSnapshot.Control`로 재투영됐다. 이 구조 때문에 gate 순서, 플래그 clear 타이밍, trailing function call 처리 방식이 런타임 안전성을 결정했다.
 
 확인된 구조적 근본 원인은 다음 다섯 가지다.
 

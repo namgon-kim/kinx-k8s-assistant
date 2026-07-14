@@ -1,10 +1,14 @@
 # Plan 07: Explicit State Machine
 
-> 상태: 부분 구현됨.
+> 상태: 패키지 경계와 enum 도입 완료, source-of-truth 이전은 부분 구현됨.
 >
-> `RuntimeSnapshot.Control`, input dispatch decision, runtime-state anchor, cleanup policy는
-> 현재 코드에 반영되어 있다. 다만 `inputOwner` compatibility field 제거와 일부
-> 요청 directive의 완전한 `ControlState` 파생화는 후속 cleanup으로 남아 있다.
+> 현재 enum/event/effect/structured contract는 `internal/react/contract`, mutable state는
+> `internal/react/session`, 실행 조정은 `internal/react/coordinator`로 분리됐다.
+> `RuntimeSnapshot.Control`, input dispatch decision, runtime-state anchor, cleanup policy도
+> 반영됐다. 다만 `coordinator.Loop`에 기존 request/phase/guide/verification 필드와
+> package-local compatibility control이 남아 있어 `session.State` 단일 소유권 이전은
+> 후속 cleanup으로 남아 있다. 아래의 옛 단일-package 경로와 필드 목록은 이전 구조를
+> 설명하는 설계 이력으로 읽는다.
 
 ## 목적
 
@@ -49,7 +53,7 @@
 - RAG/runbook이 현재 phase와 무관하게 제안된다.
 - LLM에게는 correction을 보냈지만 runtime 상태는 여전히 다른 것을 기다린다.
 
-## 현재 코드 기준 상태 인벤토리
+## 리팩터링 전 상태 인벤토리
 
 ### Coarse State
 
@@ -585,29 +589,23 @@ anchor := snapshot.AnchorText()
 
 현재 반영된 범위:
 
-- `internal/react/runtime_state.go`에 `ControlState`와 `RuntimeSnapshot` projection을 추가했다.
-- `RuntimeSnapshot()`은 현재 `Loop` 필드 조합을 읽어 문서의 우선순위에 맞는 `ControlState`를 계산한다.
-- `runtimeStateAnchor`는 더 이상 자체적으로 active gate를 추론하지 않고 `RuntimeSnapshot`의 `ActiveGate`, `RequiredNextOutput`, `ForbiddenNextOutputs`, `NestedStateName`을 사용한다.
-- `ControlAwaitingUserQuery`, `ControlAwaitingNextDirections`, `ControlAwaitingGuidedDiagnosisStep`를 현재 코드 전이에 맞게 projection에 반영했다.
-- `DerivedInputOwner()`를 snapshot에 추가했고, `InputOwner()`는 published `RuntimeSnapshot`을 우선 읽는다.
-- `setInputOwner(owner)`는 인자를 받지 않는 `refreshInputOwner()`로 정리했다. owner는 항상 `RuntimeSnapshot.Control`에서 파생한다.
-- `addMessage()` 직전에 snapshot을 publish해 orchestrator goroutine이 `Loop` 내부 state를 직접 읽지 않게 했다.
-- raw input을 `choice_number`, `approval`, `slash_meta`, `free_text`, `empty`로 분류하고, `ControlState + input kind`를 `DecideInputDispatch`로 판단한다.
-- continuation choice는 slash meta를 받지 않고, continuation free-text에서만 slash meta를 orchestrator가 처리한다.
-- `next_directions_required`는 structured output과 plain answer 양쪽에서 deterministic gate로 강제한다.
-- impossible state audit hook을 run loop 공통 경로에 추가해 mutation verification과 final/phase requested flags 충돌, direction prompt 불일치, approval pending call 누락을 내부 invariant 위반으로 드러낸다.
-- mutation verification pending과 final/phase requested의 공존은 fatal invariant로 보지 않는다. 이 조합은 `ControlAwaitingMutationVerification*` precedence로 먼저 검증을 처리한 뒤 남은 requested output을 이어서 처리한다.
-- `ControlExecutingTool`은 `dispatchToolCalls` 동기 실행 구간에서 snapshot에 표시되며, 진입/종료 시 명시적으로 snapshot을 publish한다.
-- requested structured output gate는 raw requested flag가 아니라 `RuntimeSnapshot.Control`을 기준으로 판단한다.
-- orchestrator input dispatch는 표시된 입력 모드 기준으로 고정한다. `선택 (번호)`는 숫자만, `선택 (y/n)`은 `y/n/yes/no/예/아니오`만 허용한다.
-- 문제 리소스 추가 조사처럼 여러 continuation option을 보여주는 prompt는 `(y/n)`가 아니라 번호 선택 prompt로 표시한다.
-- orchestrator input dispatch, waiting-state audit, mutation verification precedence, executing-tool snapshot, `next_directions` plain-answer gate 회귀 테스트를 추가했다.
+- `internal/react/react.go` facade와 `coordinator` implementation 경계를 만들었다.
+- `contract/enums.go`에 lifecycle, runtime control, phase, step, input enum을 분리했다.
+- `contract/structured.go`, `action.go`, `snapshot.go`에 공유 payload/read model을 분리했다.
+- `session.State`에 control, phase, verification, context state container와 cleanup/snapshot API를 도입했다.
+- request/phase/guidance/verification/report/direction/gate 규칙을 `flow` 하위 package로 분류했다.
+- protocol, kube, prompt, provider, language 책임을 별도 package로 이동했다.
+- orchestrator는 facade의 `RuntimeControlState`와 input dispatch API를 사용한다.
+- 기존 외부 API는 facade alias로 유지해 package 이동이 호출자 변경으로 번지지 않게 했다.
 
 아직 의도적으로 남긴 범위:
 
-- `inputOwner` atomic field는 fallback compatibility로 남아 있다. source of truth는 published snapshot으로 이동했지만, 완전 제거는 후속 cleanup이다.
-- `finalReportRequested`, `guidedPhaseProgressRequested`, `pendingMutationVerification`, `mutationContinuationRequired`, `pendingResponseDirective`는 아직 source field로 남아 있다.
-- `pendingResponseDirective`는 중복 append를 막지만, 아직 완전히 `ControlState -> directive` 파생 구조로 바뀐 것은 아니다.
+- `coordinator.Loop`의 package-local `control`, `inputOwner`, request/phase/guide/verification
+  compatibility 필드는 아직 남아 있다.
+- 일부 runtime transition과 snapshot/anchor 계산은 `session.State`만 사용하지 않는다.
+- `coordinator/iteration.go`는 여러 flow의 integration과 기존 helper 로직을 함께 보유한다.
+- 따라서 `session.State` 단일 source of truth, transition invariant, effect-driven coordinator는
+  후속 cleanup 범위다.
 
 ### Step 1. Snapshot만 추가
 

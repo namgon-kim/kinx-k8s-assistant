@@ -692,7 +692,7 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 	options := append([]api.UserChoiceOption(nil), choiceReq.Options...)
 	incidentChoice := 0
 	initialSnapshot := activeRuntimeSnapshot(activeAgent)
-	if initialSnapshot.Control == react.ControlAwaitingContinuationChoice && o.incidentGuidance.hasPendingOffer() && choiceOptionsAllowRunbookSearch(choiceReq.Options) {
+	if initialSnapshot.Control == react.RuntimeControlAwaitingContinuationChoice && o.incidentGuidance.hasPendingOffer() && choiceOptionsAllowRunbookSearch(choiceReq.Options) {
 		incidentChoice = len(options) + 1
 		options = append(options, api.UserChoiceOption{Value: "incident-runbook", Label: "[runbook 검색] 감지된 문제의 해결 방법 검색"})
 	}
@@ -767,15 +767,15 @@ func (o *Orchestrator) handleAgentChoiceRequest(choiceReq *api.UserChoiceRequest
 
 func activeRuntimeSnapshot(agent *react.Loop) react.RuntimeSnapshot {
 	if agent == nil {
-		return react.RuntimeSnapshot{Control: react.ControlIdle, InputOwner: react.InputOwnerOrchestrator}
+		return react.RuntimeSnapshot{Control: react.RuntimeControlUnset, InputOwner: react.InputOwnerOrchestrator}
 	}
 	if snapshot, ok := agent.PublishedRuntimeSnapshot(); ok {
 		return snapshot
 	}
-	return react.RuntimeSnapshot{Control: react.ControlAwaitingUserQuery, InputOwner: react.InputOwnerOrchestrator}
+	return react.RuntimeSnapshot{Control: react.RuntimeControlAwaitingUserQuery, InputOwner: react.InputOwnerOrchestrator}
 }
 
-func decideOrchestratorInput(control react.ControlState, input string) react.InputDispatchDecision {
+func decideOrchestratorInput(control react.RuntimeControlState, input string) react.InputDispatchDecision {
 	return react.DecideInputDispatch(control, react.ClassifyUserInput(input))
 }
 

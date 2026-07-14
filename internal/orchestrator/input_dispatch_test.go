@@ -10,63 +10,63 @@ import (
 func TestDecideOrchestratorInput(t *testing.T) {
 	tests := []struct {
 		name     string
-		control  react.ControlState
+		control  react.RuntimeControlState
 		input    string
 		accepted bool
 		handler  react.InputHandlerKind
 	}{
 		{
 			name:     "user query accepts slash meta",
-			control:  react.ControlAwaitingUserQuery,
+			control:  react.RuntimeControlAwaitingUserQuery,
 			input:    "/readonly status",
 			accepted: true,
 			handler:  react.InputHandlerOrchestratorMeta,
 		},
 		{
 			name:     "user query accepts free text",
-			control:  react.ControlAwaitingUserQuery,
+			control:  react.RuntimeControlAwaitingUserQuery,
 			input:    "pods가 많은 node 알려줘",
 			accepted: true,
 			handler:  react.InputHandlerUserQuery,
 		},
 		{
 			name:     "continuation text sends slash meta to orchestrator",
-			control:  react.ControlAwaitingContinuationText,
+			control:  react.RuntimeControlAwaitingContinuationText,
 			input:    "/help",
 			accepted: true,
 			handler:  react.InputHandlerOrchestratorMeta,
 		},
 		{
 			name:     "continuation text sends free text to react",
-			control:  react.ControlAwaitingContinuationText,
+			control:  react.RuntimeControlAwaitingContinuationText,
 			input:    "네임스페이스가 달라",
 			accepted: true,
 			handler:  react.InputHandlerReactText,
 		},
 		{
 			name:     "continuation choice rejects slash meta",
-			control:  react.ControlAwaitingContinuationChoice,
+			control:  react.RuntimeControlAwaitingContinuationChoice,
 			input:    "/help",
 			accepted: false,
 			handler:  react.InputHandlerNone,
 		},
 		{
 			name:     "continuation choice accepts number",
-			control:  react.ControlAwaitingContinuationChoice,
+			control:  react.RuntimeControlAwaitingContinuationChoice,
 			input:    "2",
 			accepted: true,
 			handler:  react.InputHandlerReactChoice,
 		},
 		{
 			name:     "approval rejects slash meta",
-			control:  react.ControlAwaitingApproval,
+			control:  react.RuntimeControlAwaitingApproval,
 			input:    "/readonly status",
 			accepted: false,
 			handler:  react.InputHandlerNone,
 		},
 		{
 			name:     "approval control can classify yes token",
-			control:  react.ControlAwaitingApproval,
+			control:  react.RuntimeControlAwaitingApproval,
 			input:    "y",
 			accepted: true,
 			handler:  react.InputHandlerReactApproval,
@@ -87,42 +87,42 @@ func TestChoiceInputAcceptedFollowsPresentedInputMode(t *testing.T) {
 	tests := []struct {
 		name     string
 		mode     choiceInputKind
-		control  react.ControlState
+		control  react.RuntimeControlState
 		input    string
 		accepted bool
 	}{
 		{
 			name:     "number mode accepts number",
 			mode:     choiceInputNumber,
-			control:  react.ControlAwaitingContinuationChoice,
+			control:  react.RuntimeControlAwaitingContinuationChoice,
 			input:    "2",
 			accepted: true,
 		},
 		{
 			name:     "number mode rejects yes token even for approval control",
 			mode:     choiceInputNumber,
-			control:  react.ControlAwaitingApproval,
+			control:  react.RuntimeControlAwaitingApproval,
 			input:    "y",
 			accepted: false,
 		},
 		{
 			name:     "yes-no mode accepts yes token",
 			mode:     choiceInputYesNo,
-			control:  react.ControlAwaitingContinuationChoice,
+			control:  react.RuntimeControlAwaitingContinuationChoice,
 			input:    "y",
 			accepted: true,
 		},
 		{
 			name:     "yes-no mode rejects number",
 			mode:     choiceInputYesNo,
-			control:  react.ControlAwaitingContinuationChoice,
+			control:  react.RuntimeControlAwaitingContinuationChoice,
 			input:    "1",
 			accepted: false,
 		},
 		{
 			name:     "yes-no mode rejects slash meta",
 			mode:     choiceInputYesNo,
-			control:  react.ControlAwaitingContinuationChoice,
+			control:  react.RuntimeControlAwaitingContinuationChoice,
 			input:    "/help",
 			accepted: false,
 		},

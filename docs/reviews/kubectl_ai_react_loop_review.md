@@ -3,7 +3,9 @@
 > 상태: Historical review.
 >
 > 이 문서는 kubectl-ai ReAct loop를 분석하고 k8s-assistant가 자체 loop를 갖게 된
-> 배경을 남긴 검토 문서다. 현재 구현은 이미 `internal/react`가 ReAct loop를 소유한다.
+> 배경을 남긴 검토 문서다. 현재 구현은 `internal/react/react.go` facade와
+> `internal/react/coordinator`가 ReAct loop를 소유한다. contract/state/flow/protocol/kube
+> 책임은 각각의 하위 package로 분리됐다.
 > 본문 일부 제안 경로(`internal/agent/setup.go`, `internal/react/approval.go`,
 > `troubleshooting_flow.go`)와 troubleshooting 명칭은 현재 repository 레이아웃과
 > 다를 수 있으므로 구현 기준으로 직접 사용하지 않는다.
