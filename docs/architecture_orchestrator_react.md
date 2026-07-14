@@ -209,6 +209,9 @@ matching과 evidence/result continuation을 판단한다. 현재 mutable require
 판단 경로에는 coordinator의 compatibility 필드가 남아 있다. 이를
 `session.VerificationState`만 사용하도록 단일화하는 작업은 후속 범위다.
 
+이름을 label/field selector에서 확인할 때는 selector flag를 파싱한 뒤 key/value를 완전
+일치로 비교한다. 예를 들어 target `web`은 `metadata.name=web-prod`와 일치하지 않는다.
+
 예: Deployment replicas를 변경한 뒤에는 변경 command의 성공 출력만으로 종료하지 않고
 read-only rollout/status 관찰과 `mutation_verification_result`를 거쳐 resolved/progressing/
 unresolved를 판단한다. progressing/unresolved recheck budget이 소진되면 runtime은 다음

@@ -807,11 +807,75 @@ func commandUsesSelectorForName(command, name string) bool {
 	if name == "" {
 		return true
 	}
-	lower := strings.ToLower(command)
-	return strings.Contains(lower, "cluster-name="+name) ||
-		strings.Contains(lower, "cluster-name: "+name) ||
-		strings.Contains(lower, "cluster.x-k8s.io/cluster-name="+name) ||
-		strings.Contains(lower, "metadata.name="+name)
+	for _, selector := range commandSelectors(command) {
+		for _, requirement := range strings.Split(selector.expression, ",") {
+			key, value, ok := selectorEquality(requirement)
+			if !ok || value != name {
+				continue
+			}
+			switch selector.kind {
+			case "label":
+				if key == "cluster-name" || strings.HasSuffix(key, "/cluster-name") {
+					return true
+				}
+			case "field":
+				if key == "metadata.name" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+type commandSelector struct {
+	kind       string
+	expression string
+}
+
+func commandSelectors(command string) []commandSelector {
+	fields := strings.Fields(command)
+	selectors := make([]commandSelector, 0, 2)
+	for index := 0; index < len(fields); index++ {
+		field := strings.ToLower(strings.TrimSpace(fields[index]))
+		switch {
+		case field == "-l" || field == "--selector":
+			if index+1 < len(fields) {
+				selectors = append(selectors, commandSelector{kind: "label", expression: fields[index+1]})
+				index++
+			}
+		case strings.HasPrefix(field, "-l="):
+			selectors = append(selectors, commandSelector{kind: "label", expression: fields[index][3:]})
+		case strings.HasPrefix(field, "--selector="):
+			selectors = append(selectors, commandSelector{kind: "label", expression: fields[index][len("--selector="):]})
+		case field == "--field-selector":
+			if index+1 < len(fields) {
+				selectors = append(selectors, commandSelector{kind: "field", expression: fields[index+1]})
+				index++
+			}
+		case strings.HasPrefix(field, "--field-selector="):
+			selectors = append(selectors, commandSelector{kind: "field", expression: fields[index][len("--field-selector="):]})
+		}
+	}
+	return selectors
+}
+
+func selectorEquality(requirement string) (string, string, bool) {
+	requirement = strings.Trim(strings.TrimSpace(requirement), "'\"")
+	separator := "="
+	if strings.Contains(requirement, "==") {
+		separator = "=="
+	}
+	parts := strings.SplitN(requirement, separator, 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	key := strings.ToLower(strings.Trim(strings.TrimSpace(parts[0]), "'\""))
+	value := strings.ToLower(strings.Trim(strings.TrimSpace(parts[1]), "'\""))
+	if key == "" || value == "" {
+		return "", "", false
+	}
+	return key, value, true
 }
 
 func commandUsesPositionalObjectName(command, resource, name string) bool {
