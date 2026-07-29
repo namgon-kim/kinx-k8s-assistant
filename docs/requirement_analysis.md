@@ -220,14 +220,14 @@ If a node-group question has no prior useful context and no namespace, cluster, 
 
 The contract is defined in `internal/react/contract/structured.go`. Prompt text lives in
 `internal/react/prompt/requirement.go`; request classification, context derivation, and
-follow-up defaulting live in `internal/react/flow/request`; mutable request memory lives in
-`internal/react/session/context.go`. `internal/react/coordinator/iteration.go` integrates
-these rules with model turns and compatibility behavior.
+follow-up defaulting live in `internal/react/flow/request`; mutable request memory is part of the
+revisioned coordinator runtime root in `internal/react/coordinator/state.go`.
+`internal/react/coordinator/iteration.go` integrates these rules with model turns.
 
 Example: for a follow-up such as "이번에는 모든 namespace에서 확인해줘", the intended
 result is to preserve the accepted target while overriding the prior namespace with
 `scope.type=all_namespaces`. The coordinator parses the structured requirement and
-`session.ContextState` retains the accepted context for later turns. The namespace-value-only
+the runtime root retains the accepted context for later turns. The namespace-value-only
 encoding gap described below can still incorrectly restore the previous namespace.
 
 Implemented behavior:

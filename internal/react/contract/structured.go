@@ -70,6 +70,18 @@ type PhasePlan struct {
 	PhaseSteps        []PhaseStep `json:"phase_steps,omitempty"`
 }
 
+type PhasePlanRevision struct {
+	BaseRevision        int                  `json:"base_revision"`
+	Reason              string               `json:"reason"`
+	EvidenceRefs        []string             `json:"evidence_refs"`
+	SupersededPhaseIDs  []string             `json:"superseded_phase_ids"`
+	SupersededStepIDs   []string             `json:"superseded_step_ids"`
+	RemainingPhases     []PhaseContract      `json:"remaining_phases"`
+	StepLineageMappings []StepLineageMapping `json:"step_lineage_mappings"`
+	ActivePhaseID       string               `json:"active_phase_id"`
+	ActiveStepID        string               `json:"active_step_id"`
+}
+
 type PhaseStep struct {
 	Index               int                  `json:"index"`
 	Name                string               `json:"name"`
@@ -139,8 +151,10 @@ type NextDirectionOption struct {
 }
 
 type MutationVerificationResult struct {
-	Status          string   `json:"status"`
-	EvidenceSummary []string `json:"evidence_summary,omitempty"`
-	Reason          string   `json:"reason,omitempty"`
-	NextAction      string   `json:"next_action,omitempty"`
+	VerificationID  string                   `json:"verification_id"`
+	Status          VerificationResultStatus `json:"status"`
+	EvidenceRefs    []string                 `json:"evidence_refs"`
+	EvidenceSummary []string                 `json:"evidence_summary,omitempty"`
+	Reason          string                   `json:"reason,omitempty"`
+	NextAction      string                   `json:"next_action,omitempty"`
 }

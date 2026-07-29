@@ -38,6 +38,39 @@ func TestAnalyzeToolCallsMarksKubectlMutation(t *testing.T) {
 	}
 }
 
+func TestAnalyzeToolCallsPreservesRuntimeActionTarget(t *testing.T) {
+	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	loop := &Loop{cfg: &config.Config{}, registry: registry}
+
+	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
+		Name: "kubectl",
+		Arguments: map[string]any{
+			"command":              "kubectl delete pod test-oom -n tests",
+			"reason":               "replace the failed pod",
+			"goal":                 "remove the failed pod",
+			"expected_observation": "the pod is absent",
+			"target": map[string]any{
+				"resource":  "pod",
+				"namespace": "tests",
+				"name":      "test-oom",
+			},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("analyze tool calls: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("unexpected pending count: %d", len(pending))
+	}
+	target, ok := pending[0].FunctionCall.Arguments["target"].(map[string]any)
+	if !ok || target["resource"] != "pod" || target["namespace"] != "tests" || target["name"] != "test-oom" {
+		t.Fatalf("runtime action target was not preserved: %#v", pending[0].FunctionCall.Arguments["target"])
+	}
+}
+
 func TestAnalyzeToolCallsMarksKubectlReadOnly(t *testing.T) {
 	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
 	if err != nil {
@@ -537,51 +570,17 @@ func TestAnalyzeToolCallsBlocksKubectlApplyAfterReadOnlyPipeline(t *testing.T) {
 	}
 }
 
-func TestRejectNonObservationShellToolCallsRetriesBeforeReadOnlyGate(t *testing.T) {
-	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		output:  make(chan *api.Message, 1),
-	}
-	calls := []gollm.FunctionCall{{
-		Name: "bash",
-		Arguments: map[string]any{
-			"command": `echo "Resource kinds will be fetched in the following order"`,
-		},
-	}}
-
-	if !loop.rejectNonObservationShellToolCalls(calls) {
-		t.Fatal("expected echo self-talk command to be rejected")
-	}
-	if loop.loopLifecycle() != LoopLifecycleModelTurn {
-		t.Fatalf("lifecycle = %v, want LoopLifecycleModelTurn", loop.loopLifecycle())
-	}
-	if !strings.Contains(loop.pendingResponseDirective+strings.Join(stringContent(loop.currChatContent), "\n"), "phase_progress") {
-		t.Fatalf("expected correction to request phase_progress or real kubectl action, got %#v", loop.currChatContent)
-	}
-}
-
-func TestRejectNonObservationShellToolCallsAllowsKubectlPipeline(t *testing.T) {
-	loop := &Loop{control: RuntimeControlAwaitingModelStep}
-	calls := []gollm.FunctionCall{{
-		Name: "bash",
-		Arguments: map[string]any{
-			"command": `bash -c "kubectl get pods -A | wc -l"`,
-		},
-	}}
-	if loop.rejectNonObservationShellToolCalls(calls) {
-		t.Fatal("read-only kubectl pipeline must not be treated as self-talk")
-	}
-}
-
 func TestRejectReadOnlyUnknownRetriesInsteadOfForcingFinal(t *testing.T) {
 	registry, err := toolconnector.NewRegistry(context.Background(), sandbox.NewLocalExecutor(), false)
 	if err != nil {
 		t.Fatalf("new registry: %v", err)
 	}
 	loop := &Loop{
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+		},
 		cfg:      &config.Config{ReadOnly: true},
 		registry: registry,
-		control:  RuntimeControlAwaitingModelStep,
 		output:   make(chan *api.Message, 1),
 	}
 	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
@@ -593,17 +592,17 @@ func TestRejectReadOnlyUnknownRetriesInsteadOfForcingFinal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("analyze tool calls: %v", err)
 	}
-	loop.pendingCalls = pending
+	loop.mutableRuntime().pendingCalls = pending
 	loop.rejectReadOnlyModifyingCalls()
 
-	text := strings.Join(stringContent(loop.currChatContent), "\n")
+	text := strings.Join(stringContent(loop.mutableRuntime().currChatContent), "\n")
 	if strings.Contains(text, "single final answer") {
 		t.Fatalf("unknown read-only block must not force final answer, got %q", text)
 	}
 	if !strings.Contains(text, "Retry with one real read-only kubectl command") {
 		t.Fatalf("expected retry correction, got %q", text)
 	}
-	result := firstFunctionCallResult(t, loop.currChatContent)
+	result := firstFunctionCallResult(t, loop.mutableRuntime().currChatContent)
 	if result["retryable"] != true {
 		t.Fatalf("unknown read-only block must be agent-retryable, got %#v", result["retryable"])
 	}
@@ -618,9 +617,11 @@ func TestRejectReadOnlyMutationIsUserRequestBlocker(t *testing.T) {
 		t.Fatalf("new registry: %v", err)
 	}
 	loop := &Loop{
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+		},
 		cfg:      &config.Config{ReadOnly: true},
 		registry: registry,
-		control:  RuntimeControlAwaitingModelStep,
 		output:   make(chan *api.Message, 1),
 	}
 	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{{
@@ -632,17 +633,17 @@ func TestRejectReadOnlyMutationIsUserRequestBlocker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("analyze tool calls: %v", err)
 	}
-	loop.pendingCalls = pending
+	loop.mutableRuntime().pendingCalls = pending
 	loop.rejectReadOnlyModifyingCalls()
 
-	result := firstFunctionCallResult(t, loop.currChatContent)
+	result := firstFunctionCallResult(t, loop.mutableRuntime().currChatContent)
 	if result["retryable"] != false {
 		t.Fatalf("mutation block must not be agent-retryable, got %#v", result["retryable"])
 	}
 	if result["retry_scope"] != "user_request_blocked_by_read_only" {
 		t.Fatalf("retry_scope = %#v, want user_request_blocked_by_read_only", result["retry_scope"])
 	}
-	text := strings.Join(stringContent(loop.currChatContent), "\n")
+	text := strings.Join(stringContent(loop.mutableRuntime().currChatContent), "\n")
 	if !strings.Contains(text, "user/request blocker") {
 		t.Fatalf("expected user/request blocker correction, got %q", text)
 	}
@@ -654,9 +655,11 @@ func TestRejectReadOnlyMixedUnknownAndMutationIsUserRequestBlocker(t *testing.T)
 		t.Fatalf("new registry: %v", err)
 	}
 	loop := &Loop{
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+		},
 		cfg:      &config.Config{ReadOnly: true},
 		registry: registry,
-		control:  RuntimeControlAwaitingModelStep,
 		output:   make(chan *api.Message, 1),
 	}
 	pending, err := loop.analyzeToolCalls(context.Background(), []gollm.FunctionCall{
@@ -676,10 +679,10 @@ func TestRejectReadOnlyMixedUnknownAndMutationIsUserRequestBlocker(t *testing.T)
 	if err != nil {
 		t.Fatalf("analyze tool calls: %v", err)
 	}
-	loop.pendingCalls = pending
+	loop.mutableRuntime().pendingCalls = pending
 	loop.rejectReadOnlyModifyingCalls()
 
-	for _, result := range functionCallResults(t, loop.currChatContent) {
+	for _, result := range functionCallResults(t, loop.mutableRuntime().currChatContent) {
 		if result["retryable"] != false {
 			t.Fatalf("mixed read-only block must not be agent-retryable, got %#v in %#v", result["retryable"], result)
 		}
@@ -687,7 +690,7 @@ func TestRejectReadOnlyMixedUnknownAndMutationIsUserRequestBlocker(t *testing.T)
 			t.Fatalf("retry_scope = %#v, want user_request_blocked_by_read_only in %#v", result["retry_scope"], result)
 		}
 	}
-	text := strings.Join(stringContent(loop.currChatContent), "\n")
+	text := strings.Join(stringContent(loop.mutableRuntime().currChatContent), "\n")
 	if !strings.Contains(text, "user/request blocker") {
 		t.Fatalf("expected user/request blocker correction, got %q", text)
 	}
@@ -695,18 +698,20 @@ func TestRejectReadOnlyMixedUnknownAndMutationIsUserRequestBlocker(t *testing.T)
 
 func TestRejectInteractiveToolCallsUsesPolicyBlockOutcome(t *testing.T) {
 	loop := &Loop{
-		cfg:     &config.Config{},
-		control: RuntimeControlAwaitingModelStep,
-		output:  make(chan *api.Message, 1),
-		pendingCalls: []PendingCall{{
-			FunctionCall: gollm.FunctionCall{
-				ID:        "call-1",
-				Name:      "bash",
-				Arguments: map[string]any{"command": "read -p proceed"},
-			},
-			IsInteractive:    true,
-			InteractiveError: fmt.Errorf("interactive command requires stdin"),
-		}},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+			pendingCalls: []PendingCall{{
+				FunctionCall: gollm.FunctionCall{
+					ID:        "call-1",
+					Name:      "bash",
+					Arguments: map[string]any{"command": "read -p proceed"},
+				},
+				IsInteractive:    true,
+				InteractiveError: fmt.Errorf("interactive command requires stdin"),
+			}},
+		},
+		cfg:    &config.Config{},
+		output: make(chan *api.Message, 1),
 	}
 
 	if !loop.rejectInteractiveToolCalls() {
@@ -715,14 +720,14 @@ func TestRejectInteractiveToolCallsUsesPolicyBlockOutcome(t *testing.T) {
 	if loop.loopLifecycle() != LoopLifecycleModelTurn {
 		t.Fatalf("lifecycle = %v, want LoopLifecycleModelTurn", loop.loopLifecycle())
 	}
-	if len(loop.pendingCalls) != 0 {
-		t.Fatalf("pendingCalls = %#v, want cleared", loop.pendingCalls)
+	if len(loop.mutableRuntime().pendingCalls) != 0 {
+		t.Fatalf("pendingCalls = %#v, want cleared", loop.mutableRuntime().pendingCalls)
 	}
-	text := strings.Join(stringContent(loop.currChatContent), "\n")
+	text := strings.Join(stringContent(loop.mutableRuntime().currChatContent), "\n")
 	if !strings.Contains(text, "non-interactive command") {
 		t.Fatalf("expected non-interactive correction, got %q", text)
 	}
-	result := firstFunctionCallResult(t, loop.currChatContent)
+	result := firstFunctionCallResult(t, loop.mutableRuntime().currChatContent)
 	if result["policy"] != "interactive_command_blocked" {
 		t.Fatalf("policy = %#v, want interactive_command_blocked", result["policy"])
 	}

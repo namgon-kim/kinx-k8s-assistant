@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -9,18 +10,23 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/kube"
 	"k8s.io/klog/v2"
 )
 
 func (l *Loop) requestApproval() {
-	descriptions := make([]string, 0, len(l.pendingCalls))
-	for _, call := range l.pendingCalls {
-		descriptions = append(descriptions, call.ParsedToolCall.Description())
+	descriptions := make([]string, 0, len(l.mutableRuntime().pendingCalls))
+	for _, call := range l.mutableRuntime().pendingCalls {
+		description := call.ParsedToolCall.Description()
+		if call.Risk != nil && call.Risk.Risky {
+			description += "\n  risk: " + strings.TrimSpace(call.Risk.Reason)
+		}
+		descriptions = append(descriptions, description)
 	}
 	prompt := "다음 명령은 실행 전 승인이 필요합니다:\n* " + strings.Join(descriptions, "\n* ")
 	prompt += "\n\n진행할까요?"
-	klog.V(0).InfoS("approval requested", "calls", len(l.pendingCalls))
+	klog.V(0).InfoS("approval requested", "calls", len(l.mutableRuntime().pendingCalls))
 	klog.V(1).InfoS("approval request call summaries", "descriptions", maskedLogStrings(descriptions))
 	l.transitionControl(RuntimeControlAwaitingApproval)
 	l.refreshInputOwner()
@@ -28,156 +34,338 @@ func (l *Loop) requestApproval() {
 		Prompt: prompt,
 		Options: []api.UserChoiceOption{
 			{Value: "yes", Label: "예"},
-			{Value: "yes_and_dont_ask_me_again", Label: "예, 이후 묻지 않기"},
 			{Value: "no", Label: "아니오"},
 		},
 	})
 }
 
 func (l *Loop) handleApproval(ctx context.Context, choice int) error {
-	klog.V(0).InfoS("handling approval choice", "choice", choice, "pending", len(l.pendingCalls))
+	klog.V(0).InfoS("handling approval choice", "choice", choice, "pending", len(l.mutableRuntime().pendingCalls))
 	switch choice {
 	case 1:
-		return l.dispatchToolCalls(ctx)
+		return l.commitPendingToolDispatch(ctx)
 	case 2:
-		l.skipPermissions = true
-		klog.V(0).InfoS("approval granted with skip future permissions")
-		return l.dispatchToolCalls(ctx)
-	case 3:
-		klog.V(0).InfoS("approval declined", "pending", len(l.pendingCalls))
-		for _, call := range l.pendingCalls {
-			l.appendToolObservation(call, map[string]any{
-				"error":     "User declined to run this operation.",
-				"status":    "declined",
-				"retryable": false,
-			})
-		}
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "사용자가 작업 실행을 거부했습니다.")
-		l.applyRuntimeCleanup(cleanupApprovalDeclinedPolicy())
-		l.currIteration++
-		l.transitionControl(RuntimeControlAwaitingModelStep)
-		return nil
+		return l.mutateRuntimeAtomically(func() error {
+			klog.V(0).InfoS("approval declined", "pending", len(l.mutableRuntime().pendingCalls))
+			for _, call := range l.mutableRuntime().pendingCalls {
+				if err := l.appendToolObservation(call, map[string]any{
+					"error":     "User declined to run this operation.",
+					"status":    "declined",
+					"retryable": false,
+				}); err != nil {
+					return err
+				}
+			}
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "사용자가 작업 실행을 거부했습니다.")
+			l.applyRuntimeCleanup(cleanupApprovalDeclinedPolicy())
+			l.mutableRuntime().currIteration++
+			l.transitionControl(RuntimeControlAwaitingModelStep)
+			return nil
+		})
 	default:
 		return fmt.Errorf("잘못된 승인 선택: %d", choice)
 	}
 }
 
-func (l *Loop) dispatchToolCalls(ctx context.Context) error {
-	klog.V(1).InfoS("tool dispatch starting", "pending", len(l.pendingCalls), "summaries", logPendingCallSummaries(l.pendingCalls))
-	l.transitionControl(RuntimeControlExecutingTool)
-	l.refreshInputOwner()
-	defer l.refreshInputOwner()
+func (l *Loop) commitPendingToolDispatch(ctx context.Context) error {
+	tx, err := l.beginRuntimeTransaction()
+	if err != nil {
+		return err
+	}
+	if err := l.preparePendingToolDispatch(true); err != nil {
+		l.rollbackRuntimeTransaction(tx)
+		return err
+	}
+	effects := append([]contract.Effect(nil), tx.effects...)
+	if err := l.commitRuntimeTransaction(tx); err != nil {
+		return err
+	}
+	return l.executeTurnEffects(ctx, effects)
+}
 
-	var failureOutcome *GateOutcome
-	for _, call := range l.pendingCalls {
+func (l *Loop) dispatchToolCalls(ctx context.Context, dispatchIDs []string) error {
+	klog.V(1).InfoS("committed tool dispatch starting", "dispatches", len(dispatchIDs))
+	pendingDispatchIDs := make([]string, 0, len(dispatchIDs))
+	for _, dispatchID := range dispatchIDs {
+		intent, ok := l.mutableRuntime().dispatchIntents[dispatchID]
+		if !ok {
+			return fmt.Errorf("committed dispatch %q was not found", dispatchID)
+		}
+		switch intent.Status {
+		case contract.ToolDispatchReconciled, contract.ToolDispatchUncertain, contract.ToolDispatchRejected, contract.ToolDispatchCancelled:
+			klog.V(1).InfoS("committed tool dispatch already terminal; skipping duplicate effect", "dispatch_id", dispatchID, "status", intent.Status)
+			continue
+		case contract.ToolDispatchPending:
+			pendingDispatchIDs = append(pendingDispatchIDs, dispatchID)
+		default:
+			return fmt.Errorf("committed dispatch %q has unsupported status %q", dispatchID, intent.Status)
+		}
+	}
+	for index, dispatchID := range pendingDispatchIDs {
+		intent := l.mutableRuntime().dispatchIntents[dispatchID]
+		call, err := l.pendingCallFromDispatch(ctx, intent)
+		if err != nil {
+			admission, ok := err.(*dispatchAdmissionError)
+			if !ok {
+				admission = &dispatchAdmissionError{
+					Code:       dispatchAdmissionInvocationInvalid,
+					DispatchID: dispatchID,
+					Err:        err,
+				}
+			}
+			remaining := append([]string(nil), pendingDispatchIDs[index+1:]...)
+			if rejectErr := l.rejectToolDispatch(ctx, dispatchID, admission, remaining); rejectErr != nil {
+				return rejectErr
+			}
+			return nil
+		}
 		description := call.ParsedToolCall.Description()
 		toolStart := time.Now()
-		klog.V(1).InfoS("tool invocation starting", "tool", call.FunctionCall.Name, "description", maskForSystemLog(description), "modifies_resource", call.ModifiesResource)
-		l.addMessage(api.MessageSourceModel, api.MessageTypeToolCallRequest, description)
+		klog.V(1).InfoS("tool invocation starting", "dispatch_id", dispatchID, "tool", call.FunctionCall.Name, "description", maskForSystemLog(description), "modifies_resource", call.ModifiesResource)
+		l.emitMessage(api.MessageSourceModel, api.MessageTypeToolCallRequest, description)
 
-		output, err := call.ParsedToolCall.InvokeTool(ctx, tools.InvokeToolOptions{
+		output, invokeErr := call.ParsedToolCall.InvokeTool(ctx, tools.InvokeToolOptions{
 			Kubeconfig: l.cfg.Kubeconfig,
 			WorkDir:    l.workDir,
 			Executor:   l.executor,
 		})
-		if err != nil {
-			if ctx.Err() != nil {
-				klog.ErrorS(err, "tool invocation cancelled", "tool", call.FunctionCall.Name, "duration", time.Since(toolStart))
-				return err
+		result := map[string]any(nil)
+		if invokeErr != nil {
+			result = toolFailureResultFromError(invokeErr)
+			if !strings.EqualFold(call.ModifiesResource, "no") {
+				result["status"] = "unknown"
+				result["execution_state"] = "uncertain"
 			}
-			result := toolFailureResultFromError(err)
-			failureOutcome = l.recordToolDispatchFailure(call, result, failureOutcome, toolStart, "tool invocation failed")
-			break
+		} else {
+			result, invokeErr = tools.ToolResultToMap(output)
+			if invokeErr != nil {
+				result = toolFailureResultFromMapError(invokeErr)
+				if !strings.EqualFold(call.ModifiesResource, "no") {
+					result["status"] = "unknown"
+					result["execution_state"] = "uncertain"
+				}
+			}
 		}
-
-		result, err := tools.ToolResultToMap(output)
-		if err != nil {
-			result = toolFailureResultFromMapError(err)
-			failureOutcome = l.recordToolDispatchFailure(call, result, failureOutcome, toolStart, "tool result conversion failed")
-			break
-		}
-		if outcome, failed := l.annotateToolFailureResult(call, result); failed && failureOutcome == nil {
+		var failureOutcome *GateOutcome
+		if outcome, failed := l.annotateToolFailureResult(call, result); failed {
 			failureOutcome = &outcome
 		}
 		status, errText, keys := logResultSummary(result)
-		klog.V(1).InfoS("tool invocation completed", "tool", call.FunctionCall.Name, "duration", time.Since(toolStart), "status", status, "error", errText)
-		klog.V(2).InfoS("tool result summary", "tool", call.FunctionCall.Name, "keys", keys)
-		l.appendToolObservation(call, result)
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, result)
+		klog.V(1).InfoS("tool invocation completed", "dispatch_id", dispatchID, "tool", call.FunctionCall.Name, "duration", time.Since(toolStart), "status", status, "error", errText)
+		klog.V(2).InfoS("tool result summary", "dispatch_id", dispatchID, "tool", call.FunctionCall.Name, "keys", keys)
+		final := failureOutcome != nil || index == len(pendingDispatchIDs)-1
+		var remaining []string
+		if failureOutcome != nil {
+			remaining = append(remaining, pendingDispatchIDs[index+1:]...)
+		}
+		if err := l.reconcileToolDispatch(ctx, call, dispatchID, result, failureOutcome, final, remaining); err != nil {
+			return err
+		}
+		if failureOutcome != nil {
+			return nil
+		}
 	}
-
-	if failureOutcome != nil {
-		klog.V(0).InfoS("tool dispatch produced failure outcome", "code", failureOutcome.Code, "kind", failureOutcome.Kind, "retryable", failureOutcome.Retryable)
-		l.transitionAfterToolFailure()
-		l.applyGateOutcome(*failureOutcome)
-		return nil
-	}
-
-	l.pendingCalls = nil
-	l.currIteration++
-	l.requestPostGuideCompletionDirective()
-	if l.shouldCompactBeforeNextSend() {
-		l.compactBeforeNextIteration("Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it.")
-	}
-	if l.controlState() == RuntimeControlExecutingTool {
-		l.transitionControl(RuntimeControlAwaitingModelStep)
-	}
-	klog.V(0).InfoS("tool dispatch completed", "next_iteration", l.currIteration+1)
 	return nil
 }
 
-func (l *Loop) recordToolDispatchFailure(call PendingCall, result map[string]any, current *GateOutcome, started time.Time, message string) *GateOutcome {
-	status, errText, keys := logResultSummary(result)
-	klog.V(0).InfoS(message, "tool", call.FunctionCall.Name, "duration", time.Since(started), "status", status, "error", errText)
-	klog.V(2).InfoS("tool failure result summary", "tool", call.FunctionCall.Name, "keys", keys)
-	if outcome, failed := l.annotateToolFailureResult(call, result); failed && current == nil {
-		current = &outcome
+func (l *Loop) rejectToolDispatch(
+	ctx context.Context,
+	dispatchID string,
+	admission *dispatchAdmissionError,
+	cancelledDispatchIDs []string,
+) (returnErr error) {
+	tx, err := l.beginRuntimeTransaction()
+	if err != nil {
+		return err
 	}
-	l.appendToolObservation(call, result)
-	l.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, result)
-	return current
+	defer func() {
+		if returnErr != nil {
+			l.rollbackRuntimeTransaction(tx)
+			return
+		}
+		effects := append([]contract.Effect(nil), tx.effects...)
+		returnErr = l.commitRuntimeTransaction(tx)
+		if returnErr == nil && len(effects) > 0 {
+			returnErr = l.executeTurnEffects(ctx, effects)
+		}
+	}()
+
+	intent, ok := l.mutableRuntime().dispatchIntents[dispatchID]
+	if !ok || intent.Status != contract.ToolDispatchPending {
+		return fmt.Errorf("pending dispatch %q disappeared before rejection", dispatchID)
+	}
+	call := pendingCallFromIntent(intent, l.lookupTool(intent.Call.Name))
+	result := dispatchTerminalResult("rejected", "not_invoked", admission.Error(), "")
+	result["code"] = string(admission.Code)
+	l.appendFunctionCallResult(call.FunctionCall, result)
+	intent.Status = contract.ToolDispatchRejected
+	l.mutableRuntime().dispatchIntents[dispatchID] = intent
+	if intent.AttemptReserved {
+		l.setAttemptStatus(intent.AttemptID, contract.AttemptCancelled)
+	}
+	l.cancelUninvokedDispatches(
+		cancelledDispatchIDs,
+		"an earlier dispatch in the same batch was rejected before invocation",
+		dispatchID,
+	)
+	l.recordInternalObservation("tool_dispatch_rejected", admission.Error())
+
+	outcome := dispatchAdmissionGateOutcome(admission)
+	if l.controlState() == RuntimeControlAwaitingToolResult {
+		l.transitionControl(RuntimeControlAwaitingModelStep)
+	}
+	l.applyGateOutcome(outcome)
+	if !outcome.Retryable {
+		l.mutableRuntime().currIteration = 0
+		l.transitionControl(RuntimeControlAwaitingUserQuery)
+	}
+	return nil
 }
 
-func (l *Loop) appendToolObservation(call PendingCall, result map[string]any) {
+func dispatchAdmissionGateOutcome(admission *dispatchAdmissionError) GateOutcome {
+	outcome := GateOutcome{
+		Kind:            GateOutcomeAgentCommandRetry,
+		Code:            "tool_dispatch_invocation_parse_failed",
+		Retryable:       true,
+		RetryScope:      RetryScopeCurrentStep,
+		UserVisible:     true,
+		UserMessage:     "도구 호출을 실행 가능한 형식으로 해석하지 못해 실행하지 않았습니다.",
+		ModelCorrection: "The committed tool call was not invoked because its arguments could not be parsed. Return one corrected action for the current step.",
+		CorrectionMode:  CorrectionModeAppendCompacted,
+		BranchPolicy:    BranchRetryStep,
+	}
+	if admission == nil {
+		return outcome
+	}
+	switch admission.Code {
+	case dispatchAdmissionApprovalMissing:
+		outcome.Kind = GateOutcomePolicyBlock
+		outcome.Code = "tool_dispatch_approval_missing"
+		outcome.Retryable = false
+		outcome.RetryScope = RetryScopeUserRequest
+		outcome.UserMessage = "필수 사용자 승인이 확인되지 않아 명령을 실행하지 않았습니다."
+		outcome.ModelCorrection = "The runtime rejected the committed action because required human approval was missing. Do not claim that the action ran."
+		outcome.BranchPolicy = BranchBlockUserRequest
+	case dispatchAdmissionIntegrityMismatch:
+		outcome.Kind = GateOutcomePolicyBlock
+		outcome.Code = "tool_dispatch_integrity_mismatch"
+		outcome.Retryable = false
+		outcome.RetryScope = RetryScopeUserRequest
+		outcome.UserMessage = "승인 후 명령 내용의 무결성 검증에 실패해 실행하지 않았습니다."
+		outcome.ModelCorrection = "The runtime rejected the committed action because its canonical payload changed after admission. Do not claim that the action ran."
+		outcome.BranchPolicy = BranchBlockUserRequest
+	}
+	return outcome
+}
+
+func (l *Loop) reconcileToolDispatch(
+	ctx context.Context,
+	call PendingCall,
+	dispatchID string,
+	result map[string]any,
+	failureOutcome *GateOutcome,
+	final bool,
+	cancelledDispatchIDs []string,
+) (returnErr error) {
+	tx, err := l.beginRuntimeTransaction()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if returnErr != nil {
+			l.rollbackRuntimeTransaction(tx)
+			return
+		}
+		effects := append([]contract.Effect(nil), tx.effects...)
+		returnErr = l.commitRuntimeTransaction(tx)
+		if returnErr == nil && len(effects) > 0 {
+			returnErr = l.executeTurnEffects(ctx, effects)
+		}
+	}()
+	intent, ok := l.mutableRuntime().dispatchIntents[dispatchID]
+	if !ok {
+		return fmt.Errorf("dispatch %q disappeared before reconciliation", dispatchID)
+	}
+	if intent.Status == contract.ToolDispatchReconciled {
+		return nil
+	}
+	if err := l.appendToolObservation(call, result); err != nil {
+		return err
+	}
+	l.addMessage(api.MessageSourceAgent, api.MessageTypeToolCallResponse, result)
+	intent.Status = contract.ToolDispatchReconciled
+	if mutationExecutionUncertain(result) {
+		intent.Status = contract.ToolDispatchUncertain
+	}
+	l.mutableRuntime().dispatchIntents[dispatchID] = intent
+	l.cancelUninvokedDispatches(
+		cancelledDispatchIDs,
+		"an earlier dispatch in the same batch did not complete successfully",
+		dispatchID,
+	)
+	if failureOutcome != nil {
+		klog.V(0).InfoS("tool dispatch produced failure outcome", "dispatch_id", dispatchID, "code", failureOutcome.Code, "kind", failureOutcome.Kind, "retryable", failureOutcome.Retryable)
+		if l.mutableRuntime().pendingMutationVerification != nil {
+			l.transitionMutationVerification()
+			l.queueResponseDirective(l.mutableRuntime().pendingMutationVerification.requiredMessage())
+			return nil
+		}
+		if l.controlState() == RuntimeControlAwaitingToolResult {
+			l.transitionControl(RuntimeControlAwaitingModelStep)
+		}
+		l.applyGateOutcome(*failureOutcome)
+		return nil
+	}
+	if !final {
+		return nil
+	}
+	l.mutableRuntime().currIteration++
+	l.requestPostGuideCompletionDirective()
+	if l.controlState() == RuntimeControlAwaitingToolResult {
+		l.transitionControl(RuntimeControlAwaitingModelStep)
+	}
+	klog.V(0).InfoS("tool dispatch completed", "next_iteration", l.mutableRuntime().currIteration+1)
+	return nil
+}
+
+func (l *Loop) appendToolObservation(call PendingCall, result map[string]any) error {
 	status, errText, keys := logResultSummary(result)
 	klog.V(2).InfoS("appending tool observation", "tool", call.FunctionCall.Name, "status", status, "error", errText, "keys", keys, "shim", l.cfg.EnableToolUseShim)
 	l.recordAction(call, result)
-	l.trackMutationVerification(call, result)
-	if l.cfg.EnableToolUseShim {
-		l.currChatContent = append(l.currChatContent, fmt.Sprintf("Result of running %q:\n%v", call.FunctionCall.Name, result))
+	if err := l.trackMutationVerification(call, result); err != nil {
+		return err
+	}
+	l.appendFunctionCallResult(call.FunctionCall, result)
+	return nil
+}
+
+func (l *Loop) appendFunctionCallResult(call gollm.FunctionCall, result map[string]any) {
+	if l.cfg != nil && l.cfg.EnableToolUseShim {
+		l.mutableRuntime().currChatContent = append(
+			l.mutableRuntime().currChatContent,
+			fmt.Sprintf("Result of running %q:\n%v", call.Name, result),
+		)
 		return
 	}
-	l.currChatContent = append(l.currChatContent, gollm.FunctionCallResult{
-		ID:     call.FunctionCall.ID,
-		Name:   call.FunctionCall.Name,
+	l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, gollm.FunctionCallResult{
+		ID:     call.ID,
+		Name:   call.Name,
 		Result: result,
 	})
 }
 
 func (l *Loop) recordAction(call PendingCall, result map[string]any) {
-	command, _ := commandString(call.FunctionCall.Arguments["command"])
-	target, ok := actionTargetFromFunctionCall(call.FunctionCall)
-	l.actionSeq++
-	phase := l.currentPhaseRef()
-	record := actionRecord{
-		Step:       l.actionSeq,
-		Tool:       call.FunctionCall.Name,
-		Command:    command,
-		ResultHash: contextHash(fmt.Sprintf("%v", result)),
-		Result:     compactObservationResult(result),
-		Clues:      extractObservationClues(result),
-	}
-	if phase.Index != 0 || strings.TrimSpace(phase.Name) != "" {
-		record.Phase = &phase
-	}
-	if ok {
-		record.Target = &target
-	}
-	l.completedActions = append(l.completedActions, record)
-	klog.V(1).InfoS("action recorded", "step", record.Step, "tool", record.Tool, "command", trimForLog(record.Command, 180), "result_hash", record.ResultHash)
-	if len(l.completedActions) > 12 {
-		l.completedActions = l.completedActions[len(l.completedActions)-12:]
-	}
+	attemptID := l.recordExecutionAttempt(call, result)
+	command, _ := rawCommandString(call.FunctionCall.Arguments["command"])
+	l.mutableRuntime().actionSeq++
+	klog.V(1).InfoS(
+		"action recorded",
+		"step", l.mutableRuntime().actionSeq,
+		"attempt_id", attemptID,
+		"tool", call.FunctionCall.Name,
+		"command", trimForLog(command, 180),
+		"result_hash", contextHash(fmt.Sprintf("%v", result)),
+	)
 	if guideProgressObservationUseful(result) && l.guideProgressAllowedForCurrentPhase() {
 		if step, ok := guideStepCompletedFromFunctionCall(call.FunctionCall); ok {
 			l.markGuideStepCompleted(step)
@@ -189,23 +377,144 @@ func (l *Loop) recordAction(call PendingCall, result map[string]any) {
 
 func (l *Loop) analyzeToolCalls(ctx context.Context, calls []gollm.FunctionCall) ([]PendingCall, error) {
 	pending := make([]PendingCall, len(calls))
+	bound, boundOK := l.deriveActionStepRef(calls)
 	for i, call := range calls {
-		klog.V(2).InfoS("parsing tool invocation", "name", call.Name, "argument_keys", logMapKeys(call.Arguments))
-		parsed, err := l.registry.Tools.ParseToolInvocation(ctx, call.Name, call.Arguments)
+		call.Arguments = contract.CloneDataMap(call.Arguments)
+		toolArguments := contract.CloneDataMap(call.Arguments)
+		retryOf := strings.TrimSpace(stringFromAny(call.Arguments["retry_of"]))
+		retryReason := strings.TrimSpace(stringFromAny(call.Arguments["retry_reason"]))
+		changedSince := stringSliceFromAnyLoose(call.Arguments["changed_since"])
+		verificationInput := call.Arguments["verification"]
+		riskInput := call.Arguments["risk"]
+		for _, name := range []string{
+			"step_ref",
+			"retry_of",
+			"retry_reason",
+			"changed_since",
+			"verification",
+			"runtime_target",
+			"risk",
+		} {
+			delete(toolArguments, name)
+		}
+		if !toolDefinesArgument(l.registry.Tools.Lookup(call.Name), "target") {
+			delete(toolArguments, "target")
+		}
+		delete(call.Arguments, "step_ref")
+		delete(call.Arguments, "retry_of")
+		delete(call.Arguments, "retry_reason")
+		delete(call.Arguments, "changed_since")
+		delete(call.Arguments, "verification")
+		delete(call.Arguments, "risk")
+		risk, err := commandRiskFromAny(riskInput, false)
+		if err != nil {
+			return nil, err
+		}
+		klog.V(2).InfoS("parsing tool invocation", "name", call.Name, "argument_keys", logMapKeys(toolArguments))
+		parsed, err := l.registry.Tools.ParseToolInvocation(ctx, call.Name, toolArguments)
 		if err != nil {
 			return nil, fmt.Errorf("tool call 파싱 실패: %w", err)
 		}
-		isInteractive, interactiveErr := parsed.GetTool().IsInteractive(call.Arguments)
+		isInteractive, interactiveErr := parsed.GetTool().IsInteractive(toolArguments)
+		toolCall := call
+		toolCall.Arguments = toolArguments
+		var stepRef *StepRef
+		if boundOK {
+			ref := bound
+			if ref.Kind == StepGeneralAction && len(calls) > 1 {
+				ref.Index += i
+			}
+			stepRef = &ref
+		}
 		pending[i] = PendingCall{
-			FunctionCall:     call,
-			ParsedToolCall:   parsed,
-			IsInteractive:    isInteractive,
-			InteractiveError: interactiveErr,
-			ModifiesResource: l.modifiesResource(parsed, call),
+			FunctionCall:      call,
+			StepRef:           stepRef,
+			ParsedToolCall:    parsed,
+			IsInteractive:     isInteractive,
+			InteractiveError:  interactiveErr,
+			ModifiesResource:  l.modifiesResource(parsed, toolCall),
+			RetryOf:           retryOf,
+			RetryReason:       retryReason,
+			ChangedSince:      changedSince,
+			verificationInput: verificationInput,
+			Risk:              risk,
 		}
 		klog.V(1).InfoS("tool invocation parsed", "name", call.Name, "modifies_resource", pending[i].ModifiesResource, "interactive", isInteractive)
 	}
 	return pending, nil
+}
+
+func (l *Loop) validateCommandRiskMetadata(calls []gollm.FunctionCall) error {
+	for _, call := range calls {
+		tool := l.registry.Tools.Lookup(call.Name)
+		if !toolDefinesArgument(tool, "command") {
+			continue
+		}
+		if _, err := commandRiskFromAny(call.Arguments["risk"], true); err != nil {
+			return fmt.Errorf("%s: %w", call.Name, err)
+		}
+	}
+	return nil
+}
+
+func commandRiskFromAny(value any, required bool) (*contract.CommandRisk, error) {
+	if value == nil {
+		if required {
+			return nil, fmt.Errorf("command action requires risk.risky")
+		}
+		return nil, nil
+	}
+	raw, ok := value.(map[string]any)
+	if required {
+		if !ok {
+			return nil, fmt.Errorf("command action risk must be an object containing risky")
+		}
+		if _, exists := raw["risky"]; !exists {
+			return nil, fmt.Errorf("command action requires risk.risky")
+		}
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("command risk metadata marshal failed: %w", err)
+	}
+	var risk contract.CommandRisk
+	if err := json.Unmarshal(data, &risk); err != nil {
+		return nil, fmt.Errorf("command risk metadata parse failed: %w", err)
+	}
+	if risk.Risky && strings.TrimSpace(risk.Reason) == "" {
+		return nil, fmt.Errorf("command action with risk.risky=true requires risk.reason")
+	}
+	return &risk, nil
+}
+
+func toolDefinesArgument(tool tools.Tool, name string) bool {
+	if tool == nil {
+		return false
+	}
+	definition := tool.FunctionDefinition()
+	if definition == nil || definition.Parameters == nil {
+		return false
+	}
+	_, ok := definition.Parameters.Properties[name]
+	return ok
+}
+
+func normalizePendingVerification(calls []PendingCall) error {
+	for i := range calls {
+		verification, err := verificationSpecFromAny(calls[i].verificationInput)
+		if err != nil {
+			return fmt.Errorf("verification metadata 파싱 실패: %w", err)
+		}
+		calls[i].Verification = verification
+		calls[i].verificationInput = nil
+	}
+	return nil
+}
+
+func clearPendingVerificationInput(calls []PendingCall) {
+	for i := range calls {
+		calls[i].verificationInput = nil
+	}
 }
 
 func (l *Loop) modifiesResource(parsed *tools.ToolCall, call gollm.FunctionCall) string {
@@ -226,7 +535,7 @@ func (l *Loop) modifiesResource(parsed *tools.ToolCall, call gollm.FunctionCall)
 }
 
 func hasKnownMutatingKubectlInvocation(call gollm.FunctionCall) bool {
-	script, ok := readonlyShellScriptFromFunctionCall(call)
+	script, ok := shellScriptFromFunctionCall(call)
 	if !ok {
 		return false
 	}
@@ -243,7 +552,7 @@ func hasKnownMutatingKubectlInvocation(call gollm.FunctionCall) bool {
 }
 
 func hasBlockedReadOnlyFastPathFeature(call gollm.FunctionCall) bool {
-	script, ok := readonlyShellScriptFromFunctionCall(call)
+	script, ok := shellScriptFromFunctionCall(call)
 	if !ok {
 		return false
 	}
@@ -260,7 +569,7 @@ func hasBlockedReadOnlyFastPathFeature(call gollm.FunctionCall) bool {
 }
 
 func isNonMutatingKubectlInvocation(call gollm.FunctionCall) bool {
-	script, ok := readonlyShellScriptFromFunctionCall(call)
+	script, ok := shellScriptFromFunctionCall(call)
 	if !ok {
 		return false
 	}
@@ -276,7 +585,7 @@ func isNonMutatingKubectlInvocation(call gollm.FunctionCall) bool {
 	return true
 }
 
-func readonlyShellScriptFromFunctionCall(call gollm.FunctionCall) (string, bool) {
+func shellScriptFromFunctionCall(call gollm.FunctionCall) (string, bool) {
 	raw, ok := call.Arguments["command"].(string)
 	if !ok {
 		return "", false
@@ -318,7 +627,7 @@ func isObservationToolName(name string) bool {
 }
 
 func (l *Loop) hasModifyingCalls() bool {
-	for _, call := range l.pendingCalls {
+	for _, call := range l.mutableRuntime().pendingCalls {
 		if call.ModifiesResource != "no" {
 			return true
 		}
@@ -330,7 +639,7 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 	var descriptions []string
 	hasUnknown := false
 	hasKnownMutation := false
-	for _, call := range l.pendingCalls {
+	for _, call := range l.mutableRuntime().pendingCalls {
 		if call.ModifiesResource == "no" {
 			continue
 		}
@@ -341,7 +650,7 @@ func (l *Loop) rejectReadOnlyModifyingCalls() {
 		}
 		descriptions = append(descriptions, call.ParsedToolCall.Description())
 	}
-	for _, call := range l.pendingCalls {
+	for _, call := range l.mutableRuntime().pendingCalls {
 		if call.ModifiesResource == "no" {
 			continue
 		}
@@ -471,10 +780,10 @@ func (l *Loop) requestNamespaceInvariantMessage(call gollm.FunctionCall) (string
 }
 
 func (l *Loop) requestScopeNamespace() string {
-	if l == nil || l.requestContext == nil {
+	if l == nil || l.mutableRuntime().requestContext == nil {
 		return ""
 	}
-	namespace := cleanNamespaceValue(l.requestContext.Scope.Namespace)
+	namespace := cleanNamespaceValue(l.mutableRuntime().requestContext.Scope.Namespace)
 	if namespace == "" || isAllNamespacesValue(namespace) {
 		return ""
 	}
@@ -494,10 +803,10 @@ func (l *Loop) rejectInvalidKubectlResources(calls []gollm.FunctionCall) bool {
 }
 
 func (l *Loop) rejectUnrelatedFirstDiagnostic(calls []gollm.FunctionCall) bool {
-	if l.actionSeq > 0 || l.requestContext == nil {
+	if l.mutableRuntime().actionSeq > 0 || l.mutableRuntime().requestContext == nil {
 		return false
 	}
-	target := l.requestContext.PrimaryTarget
+	target := l.mutableRuntime().requestContext.PrimaryTarget
 	if target.Resource == "" || target.Name == "" {
 		return false
 	}
@@ -566,8 +875,15 @@ func inconsistentActionTargetMessage(call gollm.FunctionCall) (string, bool) {
 }
 
 func actionTargetFromFunctionCall(call gollm.FunctionCall) (actionTarget, bool) {
-	raw, ok := call.Arguments["target"].(map[string]any)
-	if !ok {
+	var raw map[string]any
+	for _, name := range []string{"runtime_target", "target"} {
+		value, ok := call.Arguments[name].(map[string]any)
+		if ok {
+			raw = value
+			break
+		}
+	}
+	if raw == nil {
 		return actionTarget{}, false
 	}
 	resource, _ := raw["resource"].(string)
@@ -1087,7 +1403,10 @@ func isUnknownPlaceholder(value string) bool {
 func kubectlCommandFromFunctionCall(call gollm.FunctionCall) (string, bool) {
 	return kube.KubectlCommandFromFunctionCall(call)
 }
-func commandString(value any) (string, bool) { return kube.CommandString(value) }
+func rawCommandString(value any) (string, bool) { return kube.RawCommandString(value) }
+func kubectlCommandString(value any) (string, bool) {
+	return kube.KubectlCommandString(value)
+}
 func firstKubectlResourceArg(fields []string, start int) (string, bool) {
 	return kube.FirstKubectlResourceArg(fields, start)
 }

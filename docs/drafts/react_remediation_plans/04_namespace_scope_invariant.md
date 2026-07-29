@@ -18,7 +18,7 @@
 - `internal/react/coordinator/execution.go`, `internal/react/coordinator/iteration.go`, `internal/react/kube/target.go`
   - target namespace가 있으면 command namespace 누락을 잡는다.
   - 하지만 target namespace 자체가 비어 있으면 request context namespace가 있어도 잡기 어렵다.
-- `internal/react/flow/request`, `internal/react/session/context.go`
+- `internal/react/flow/request`, `internal/react/coordinator/state.go`
   - requirement analysis에서 request context와 namespace가 만들어진다.
 - `prompts/default.tmpl`
   - "namespace를 유지하라"는 prompt rule이 있지만 deterministic gate는 아니다.

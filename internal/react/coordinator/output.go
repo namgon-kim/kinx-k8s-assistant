@@ -33,7 +33,37 @@ func (l *Loop) translateModelText(ctx context.Context, text string) string {
 }
 
 func (l *Loop) addMessage(source api.MessageSource, messageType api.MessageType, payload any) {
-	l.publishRuntimeSnapshot()
+	if l != nil && l.activeTransaction != nil {
+		l.activeTransaction.messages = append(l.activeTransaction.messages, deferredMessage{
+			source:      source,
+			messageType: messageType,
+			payload:     payload,
+		})
+		return
+	}
+	l.emitMessage(source, messageType, payload)
+}
+
+func (l *Loop) addTranslatedModelMessage(ctx context.Context, text string) {
+	if l != nil && l.activeTransaction != nil {
+		l.activeTransaction.messages = append(l.activeTransaction.messages, deferredMessage{
+			source:      api.MessageSourceModel,
+			messageType: api.MessageTypeText,
+			payload:     text,
+			translate:   true,
+			context:     ctx,
+		})
+		return
+	}
+	l.emitMessage(api.MessageSourceModel, api.MessageTypeText, l.translateModelText(ctx, text))
+}
+
+func (l *Loop) emitMessage(source api.MessageSource, messageType api.MessageType, payload any) {
+	if l == nil || l.output == nil {
+		klog.V(2).InfoS("react output message dropped because output channel is unavailable", "source", source, "type", messageType, "payload_type", fmt.Sprintf("%T", payload))
+		return
+	}
+	l.publishCommittedRuntimeSnapshot()
 	klog.V(2).InfoS("react output message queued", "source", source, "type", messageType, "payload_type", fmt.Sprintf("%T", payload))
 	l.output <- &api.Message{
 		ID:        uuid.NewString(),
@@ -75,7 +105,7 @@ func logFunctionCallSummaries(calls []gollm.FunctionCall) []string {
 	summaries := make([]string, 0, len(calls))
 	for _, call := range calls {
 		summary := strings.TrimSpace(call.Name)
-		if command, ok := commandString(call.Arguments["command"]); ok && strings.TrimSpace(command) != "" {
+		if command, ok := rawCommandString(call.Arguments["command"]); ok {
 			summary += " command=" + trimForLog(masking.MaskSensitiveData(command), 180)
 		}
 		summaries = append(summaries, summary)

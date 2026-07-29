@@ -7,15 +7,23 @@ import (
 )
 
 func KubectlCommandFromFunctionCall(call gollm.FunctionCall) (string, bool) {
-	return CommandString(call.Arguments["command"])
+	return KubectlCommandString(call.Arguments["command"])
 }
 
-func CommandString(value any) (string, bool) {
+func RawCommandString(value any) (string, bool) {
 	command, ok := value.(string)
 	if !ok {
 		return "", false
 	}
 	command = strings.TrimSpace(command)
+	return command, command != ""
+}
+
+func KubectlCommandString(value any) (string, bool) {
+	command, ok := RawCommandString(value)
+	if !ok {
+		return "", false
+	}
 	if !IsKubectlCommand(command) {
 		return "", false
 	}

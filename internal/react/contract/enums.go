@@ -27,39 +27,44 @@ const (
 type RuntimeControlState string
 
 const (
-	RuntimeControlUnset                                RuntimeControlState = "unset"
-	RuntimeControlAwaitingUserQuery                    RuntimeControlState = "awaiting_user_query"
-	RuntimeControlAwaitingRequirementAnalysis          RuntimeControlState = "awaiting_requirement_analysis"
-	RuntimeControlAwaitingPhasePlan                    RuntimeControlState = "awaiting_phase_plan"
-	RuntimeControlAwaitingModelStep                    RuntimeControlState = "awaiting_model_step"
-	RuntimeControlAwaitingResourceGuideLookup          RuntimeControlState = "awaiting_resource_guide_lookup"
-	RuntimeControlAwaitingGuidedDiagnosisStep          RuntimeControlState = "awaiting_guided_diagnosis_step"
-	RuntimeControlAwaitingGuidedPhaseProgress          RuntimeControlState = "awaiting_guided_phase_progress"
-	RuntimeControlAwaitingFinalReport                  RuntimeControlState = "awaiting_final_report"
-	RuntimeControlAwaitingNextDirections               RuntimeControlState = "awaiting_next_directions"
-	RuntimeControlAwaitingApproval                     RuntimeControlState = "awaiting_approval"
-	RuntimeControlExecutingTool                        RuntimeControlState = "executing_tool"
-	RuntimeControlAwaitingMutationVerificationEvidence RuntimeControlState = "awaiting_mutation_verification_evidence"
-	RuntimeControlAwaitingMutationVerificationResult   RuntimeControlState = "awaiting_mutation_verification_result"
-	RuntimeControlAwaitingMutationContinuation         RuntimeControlState = "awaiting_mutation_continuation"
-	RuntimeControlAwaitingContinuationChoice           RuntimeControlState = "awaiting_continuation_choice"
-	RuntimeControlAwaitingContinuationText             RuntimeControlState = "awaiting_continuation_text"
-	RuntimeControlExited                               RuntimeControlState = "exited"
+	RuntimeControlUnset                                     RuntimeControlState = "unset"
+	RuntimeControlAwaitingUserQuery                         RuntimeControlState = "awaiting_user_query"
+	RuntimeControlAwaitingRequirementAnalysis               RuntimeControlState = "awaiting_requirement_analysis"
+	RuntimeControlAwaitingPhasePlan                         RuntimeControlState = "awaiting_phase_plan"
+	RuntimeControlAwaitingModelStep                         RuntimeControlState = "awaiting_model_step"
+	RuntimeControlAwaitingResourceGuideLookup               RuntimeControlState = "awaiting_resource_guide_lookup"
+	RuntimeControlAwaitingGuidedDiagnosisStep               RuntimeControlState = "awaiting_guided_diagnosis_step"
+	RuntimeControlAwaitingGuidedPhaseProgress               RuntimeControlState = "awaiting_guided_phase_progress"
+	RuntimeControlAwaitingFinalReport                       RuntimeControlState = "awaiting_final_report"
+	RuntimeControlAwaitingNextDirections                    RuntimeControlState = "awaiting_next_directions"
+	RuntimeControlAwaitingApproval                          RuntimeControlState = "awaiting_approval"
+	RuntimeControlAwaitingToolResult                        RuntimeControlState = "awaiting_tool_result"
+	RuntimeControlAwaitingMutationVerificationEvidence      RuntimeControlState = "awaiting_mutation_verification_evidence"
+	RuntimeControlAwaitingMutationVerificationResult        RuntimeControlState = "awaiting_mutation_verification_result"
+	RuntimeControlAwaitingMutationVerificationChainEvidence RuntimeControlState = "awaiting_mutation_verification_chain_evidence"
+	RuntimeControlAwaitingMutationVerificationChainResult   RuntimeControlState = "awaiting_mutation_verification_chain_result"
+	RuntimeControlAwaitingMutationContinuation              RuntimeControlState = "awaiting_mutation_continuation"
+	RuntimeControlAwaitingContinuationHandoff               RuntimeControlState = "awaiting_continuation_handoff"
+	RuntimeControlAwaitingContinuationChoice                RuntimeControlState = "awaiting_continuation_choice"
+	RuntimeControlAwaitingContinuationText                  RuntimeControlState = "awaiting_continuation_text"
+	RuntimeControlExited                                    RuntimeControlState = "exited"
 )
 
 type PhaseStatus string
 
 const (
-	PhasePending   PhaseStatus = "pending"
-	PhaseActive    PhaseStatus = "active"
-	PhaseCompleted PhaseStatus = "completed"
-	PhaseSkipped   PhaseStatus = "skipped"
+	PhasePending    PhaseStatus = "pending"
+	PhaseActive     PhaseStatus = "active"
+	PhaseCompleted  PhaseStatus = "completed"
+	PhaseSkipped    PhaseStatus = "skipped"
+	PhaseSuperseded PhaseStatus = "superseded"
 )
 
 type StepKind string
 
 const (
 	StepGeneralAction               StepKind = "general_action"
+	StepLightweightLookup           StepKind = "lightweight_lookup"
 	StepExplicitPhase               StepKind = "explicit_phase_step"
 	StepResourceGuideDiagnostic     StepKind = "resource_guide_diagnostic"
 	StepMutationEvidenceRequirement StepKind = "mutation_evidence_requirement"
@@ -68,11 +73,14 @@ const (
 type StepStatus string
 
 const (
-	StepPending   StepStatus = "pending"
-	StepActive    StepStatus = "active"
-	StepCompleted StepStatus = "completed"
-	StepSkipped   StepStatus = "skipped"
-	StepRetrying  StepStatus = "retrying"
+	StepPending    StepStatus = "pending"
+	StepActive     StepStatus = "active"
+	StepCompleted  StepStatus = "completed"
+	StepAchieved   StepStatus = "achieved"
+	StepBlocked    StepStatus = "blocked"
+	StepSkipped    StepStatus = "skipped"
+	StepRetrying   StepStatus = "retrying"
+	StepSuperseded StepStatus = "superseded"
 )
 
 type UserInputKind string

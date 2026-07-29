@@ -1,7 +1,8 @@
 # ReAct Loop Structure Review
 
 > 상태: 리팩터링 전 구조 리뷰. 아래 Refactor Status만 현재 package 연결 상태로 갱신했으며,
-> 본문 시나리오와 과거 파일 참조는 별도 동작 재검증이 필요하다.
+> 본문 시나리오와 과거 파일 참조는 historical finding이다. 현재 계약은 stable architecture 문서와
+> Plan 08을 우선한다.
 >
 > 이 문서는 개별 버그 목록이 아니라 `internal/react` ReAct loop의 구조적 리스크를
 > 정리한다. 본문의 파일/라인 참조는 package split 이전 위치다. 현재 대응 위치는
@@ -12,15 +13,15 @@
 
 | Review area | Current package boundary | Status |
 | --- | --- | --- |
-| State management | `contract/enums.go`, `session/*`, `contract/snapshot.go` | enum과 mutable-state container는 도입됨. `coordinator.Loop` compatibility 필드가 남아 단일 source of truth는 미완료. |
-| Gate pipeline | `flow/gate`, `coordinator/iteration.go` | outcome 계약/target validation과 correction message 선택은 production 경로에 연결됨. consume/enforce 순서와 decision/apply 전체 추출은 미완료. |
-| Phase/guidance | `flow/phase`, `flow/guidance`, `session/phase.go` | phase validation/progress와 guide lookup/progress 규칙은 production 경로에 연결됨. rewind/re-entry 의미가 바뀌었다고 간주하지 않음. |
-| Verification | `flow/verification`, `session/verification.go` | 구조화된 namespace/resource/name match evidence와 continuation 규칙은 production 경로에 연결됨. requirement 생성, 반복 lifecycle, mutable state 단일화는 미완료. |
-| Input/liveness | `coordinator/input.go`, `session/control.go` | 입력 위치는 분리됨. no-progress 감지 도입은 확인되지 않음. |
-| Protocol | `protocol/*`, `coordinator/iteration.go` | call/schema/shim parser는 분리됨. structured call과 action의 turn-level 혼합 정책은 coordinator에서 계속 통합됨. |
+| State management | `coordinator/runtimeState`, `session/aggregate.go`, `session/ledger.go` | 하나의 revisioned root와 detached snapshot으로 단일화됨. Compatibility mirror와 hydrate path 제거됨. |
+| Gate pipeline | `flow/gate`, `coordinator/turn_output.go`, `coordinator/iteration.go` | Typed output policy가 domain consumer 전에 적용되고 correction counter는 execution state가 소유함. |
+| Phase/guidance | `flow/phase`, `flow/guidance`, `coordinator/revision.go` | Stable phase/step lineage와 evidence-backed revision이 연결됨. 남은 semantic phase 검증은 TODO에서 추적. |
+| Verification | `flow/verification`, `coordinator/verification_runtime.go`, `coordinator/termination.go` | Single/ordered chain, await-state recheck, evidence qualification과 단일 terminal finalizer가 연결됨. |
+| Input/liveness | `coordinator/input.go`, `session/control.go`, `coordinator/continuation.go` | Control-derived input owner와 bounded continuation handoff를 사용함. Producer 없는 yes/no choice 우회는 제거됨. |
+| Protocol | `protocol/*`, `flow/gate/output_policy.go` | Native/shim이 동일 typed envelope로 정규화되고 structured state event/action 혼합을 policy에서 판정함. |
 
-따라서 이번 변경은 구조적 개선의 기반이지, 아래 리뷰 항목이나 `bug.md`의 개별
-증상이 자동으로 해결됐다는 증거는 아니다.
+아래 본문은 당시 문제를 설명하는 근거로 유지한다. 현재 해결 여부는 이 표와 `bug.md`,
+Plan 08의 Stage별 구현 상태를 기준으로 판단한다.
 
 ## Summary
 
@@ -231,12 +232,10 @@ No-progress 상황은 다음처럼 종료된다.
 
 하지만 "이 requirement는 충족 불가능하다", "동일 evidence를 반복 수집한다", "같은 phase에서 관찰이 새로워지지 않는다" 같은 progress semantics는 별도 상태로 추적하지 않는다.
 
-입력 처리도 두 층이다.
-
-- `DecideInputDispatch`: control state와 input kind 기준
-- `choiceInputMode`/`choiceInputAccepted`: prompt 표시 방식 기준
-
-현재 number choice가 주류라 큰 문제는 제한적이지만, `(y/n)` 모드가 다시 production에 들어오면 `decision.Accepted`를 우회할 수 있다. 또한 일반 입력 path와 active agent input path의 empty input 계약이 다르다.
+현재 구현 메모: `MaxIterations`는 validated `continuation_handoff`로 segment를 닫고 같은 lineage와
+budget으로 재개한다. Choice input은 번호 입력과 `DecideInputDispatch`만 사용하며
+`choiceInputMode`/`choiceInputAccepted` 문자열 분기는 제거됐다. 아래 시나리오는 리팩터링 전
+liveness 설명이다.
 
 ### User Scenario
 

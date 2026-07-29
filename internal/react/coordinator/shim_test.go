@@ -2,6 +2,9 @@ package coordinator
 
 import (
 	"testing"
+
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/protocol"
 )
 
 func TestParseReActResponseWithAction(t *testing.T) {
@@ -45,6 +48,77 @@ suffix`)
 	}
 }
 
+func TestUnknownShimKeyBecomesInvalidStructuredOutput(t *testing.T) {
+	parsed, err := parseReActResponse("```json\n{\"thought\":\"x\",\"future_transition\":{}}\n```")
+	if err != nil {
+		t.Fatalf("parse shim response: %v", err)
+	}
+	if len(parsed.InvalidStructuredKeys) != 1 || parsed.InvalidStructuredKeys[0] != "future_transition" {
+		t.Fatalf("invalid keys = %#v", parsed.InvalidStructuredKeys)
+	}
+	calls := functionCallsFromParsedReActResponse(parsed)
+	if len(calls) != 1 || calls[0].Name != protocol.InvalidStructuredOutputCall {
+		t.Fatalf("calls = %#v", calls)
+	}
+}
+
+func TestMixedAnswerAndUnknownShimKeyProduceOneInvalidOutput(t *testing.T) {
+	parsed, err := parseReActResponse("```json\n" + `{
+		"answer": "must not be mixed",
+		"phase_progress": {
+			"phase_completed": 1,
+			"evidence_useful": true,
+			"completion_reason": "observed"
+		},
+		"future_transition": {}
+	}` + "\n```")
+	if err != nil {
+		t.Fatalf("parse shim response: %v", err)
+	}
+	calls := functionCallsFromParsedReActResponse(parsed)
+	if len(calls) != 1 || calls[0].Name != protocol.InvalidStructuredOutputCall {
+		t.Fatalf("calls = %#v, want one invalid structured output", calls)
+	}
+	if calls[0].Arguments["answer_mixed_with_structured_output"] != true {
+		t.Fatalf("mixed-answer diagnostic missing: %#v", calls[0].Arguments)
+	}
+	keys, ok := calls[0].Arguments["unknown_top_level_keys"].([]string)
+	if !ok || len(keys) != 1 || keys[0] != "future_transition" {
+		t.Fatalf("unknown-key diagnostic = %#v", calls[0].Arguments["unknown_top_level_keys"])
+	}
+}
+
+func TestShimActionPreservesOptionalStepRef(t *testing.T) {
+	parsed, err := parseReActResponse("```json\n" + `{
+		"action": {
+			"name": "kubectl",
+			"reason": "inspect the active guide step",
+			"command": "kubectl get pods",
+			"modifies_resource": "no",
+			"step_ref": {
+				"kind": "resource_guide_diagnostic",
+				"index": 2,
+				"phase": {"index": 3, "name": "guided_diagnosis"}
+			}
+		}
+	}` + "\n```")
+	if err != nil {
+		t.Fatalf("parse shim action: %v", err)
+	}
+	calls := functionCallsFromParsedReActResponse(parsed)
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	envelope := normalizeModelOutputEnvelope("", calls)
+	if len(envelope.ExternalActions) != 1 {
+		t.Fatalf("external actions = %d, want 1", len(envelope.ExternalActions))
+	}
+	ref := envelope.ExternalActions[0].StepRef
+	if ref == nil || ref.Kind != StepResourceGuideDiagnostic || ref.Index != 2 || ref.Phase.Index != 3 {
+		t.Fatalf("shim step_ref = %#v", ref)
+	}
+}
+
 func TestFunctionCallsFromParsedReActResponseCoversNativeTextFallbackStructuredCalls(t *testing.T) {
 	parsed, err := parseReActResponse("```json\n" + `{
   "thought": "recover structured output",
@@ -73,9 +147,11 @@ func TestFunctionCallsFromParsedReActResponseCoversNativeTextFallbackStructuredC
     }]
   },
   "mutation_verification_result": {
-    "status": "progressing",
+    "verification_id": "mutation-1-verification",
+    "status": "waiting",
+    "evidence_refs": ["observation-1"],
     "evidence_summary": ["rollout started"],
-    "next_action": "recheck rollout"
+    "reason": "rollout is still converging"
   }
 }` + "\n```")
 	if err != nil {
@@ -87,11 +163,11 @@ func TestFunctionCallsFromParsedReActResponseCoversNativeTextFallbackStructuredC
 		names[call.Name] = true
 	}
 	for _, name := range []string{
-		internalGuideProgressCall,
-		internalResourceGuideLookupCall,
-		internalFinalReportCall,
-		internalNextDirectionsCall,
-		internalMutationVerificationResultCall,
+		protocol.GuideProgressCall,
+		protocol.ResourceGuideLookupCall,
+		protocol.FinalReportCall,
+		protocol.NextDirectionsCall,
+		protocol.MutationVerificationResultCall,
 	} {
 		if !names[name] {
 			t.Fatalf("expected recovered function call %s in %#v", name, calls)
@@ -219,6 +295,11 @@ func TestShimPartConvertsActionToFunctionCall(t *testing.T) {
 		Command:             "kubectl get pods app -n tests",
 		ExpectedObservation: "pod phase and readiness",
 		ModifiesResource:    "no",
+		Verification: &contract.VerificationSpec{
+			Shape:         contract.VerificationSingle,
+			Mode:          contract.VerificationAwaitState,
+			ExpectedState: "pod is ready",
+		},
 	}}
 
 	calls, ok := part.AsFunctionCalls()
@@ -239,6 +320,37 @@ func TestShimPartConvertsActionToFunctionCall(t *testing.T) {
 	}
 	if calls[0].Arguments["goal"] != "verify whether the pod is running" {
 		t.Fatalf("unexpected goal: %#v", calls[0].Arguments["goal"])
+	}
+	verification, ok := calls[0].Arguments["verification"].(map[string]any)
+	if !ok || verification["shape"] != "single" || verification["mode"] != "await_state" {
+		t.Fatalf("unexpected verification metadata: %#v", calls[0].Arguments["verification"])
+	}
+}
+
+func TestShimPhasePlanRevisionMapsToNativeCall(t *testing.T) {
+	parsed, err := parseReActResponse("```json\n" + `{
+  "thought": "the observation changes the remaining plan",
+  "phase_plan_revision": {
+    "base_revision": 1,
+    "reason": "node readiness is the observed blocker",
+    "evidence_refs": ["observation-1"],
+    "superseded_phase_ids": ["phase-1"],
+    "superseded_step_ids": ["step-1"],
+    "remaining_phases": [],
+    "step_lineage_mappings": [],
+    "active_phase_id": "phase-2",
+    "active_step_id": "step-2"
+  }
+}` + "\n```")
+	if err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	calls := functionCallsFromParsedReActResponse(parsed)
+	if len(calls) != 1 || calls[0].Name != protocol.PhasePlanRevisionCall {
+		t.Fatalf("revision calls = %#v", calls)
+	}
+	if got := intFromAny(calls[0].Arguments["base_revision"]); got != 1 {
+		t.Fatalf("base revision = %d, want 1", got)
 	}
 }
 
@@ -271,7 +383,7 @@ func TestParseReActResponseTreatsStringFinalReportAsInvalidCall(t *testing.T) {
 	if !ok || len(calls) != 1 {
 		t.Fatalf("expected invalid final_report function call, got %#v", calls)
 	}
-	if calls[0].Name != internalFinalReportCall {
+	if calls[0].Name != protocol.FinalReportCall {
 		t.Fatalf("unexpected call name: %q", calls[0].Name)
 	}
 	if len(calls[0].Arguments) != 0 {
@@ -291,7 +403,7 @@ func TestShimPartConvertsResourceGuideLookupToInternalCall(t *testing.T) {
 	if !ok || len(calls) != 1 {
 		t.Fatalf("expected one internal lookup call, got %#v", calls)
 	}
-	if calls[0].Name != internalResourceGuideLookupCall {
+	if calls[0].Name != protocol.ResourceGuideLookupCall {
 		t.Fatalf("unexpected call name: %q", calls[0].Name)
 	}
 	if calls[0].Arguments["problem_focus"] != "nodegroup reconciliation" {
@@ -316,7 +428,7 @@ func TestShimPartConvertsPhasePlanToInternalCall(t *testing.T) {
 	if !ok || len(calls) != 1 {
 		t.Fatalf("expected one internal phase-plan call, got %#v", calls)
 	}
-	if calls[0].Name != internalPhasePlanCall {
+	if calls[0].Name != protocol.PhasePlanCall {
 		t.Fatalf("unexpected call name: %q", calls[0].Name)
 	}
 	if calls[0].Arguments["request_goal"] != "diagnose cluster health" {
@@ -336,7 +448,7 @@ func TestShimPartConvertsPhaseProgressToInternalCall(t *testing.T) {
 	if !ok || len(calls) != 1 {
 		t.Fatalf("expected one internal phase-progress call, got %#v", calls)
 	}
-	if calls[0].Name != internalPhaseProgressCall {
+	if calls[0].Name != protocol.PhaseProgressCall {
 		t.Fatalf("unexpected call name: %q", calls[0].Name)
 	}
 	if calls[0].Arguments["phase_completed"] != float64(2) {
@@ -370,7 +482,7 @@ func TestShimPartConvertsRequirementAnalysisToInternalCall(t *testing.T) {
 	if !ok || len(calls) != 1 {
 		t.Fatalf("expected one internal requirement-analysis call, got %#v", calls)
 	}
-	if calls[0].Name != internalRequirementAnalysisCall {
+	if calls[0].Name != protocol.RequirementAnalysisCall {
 		t.Fatalf("unexpected call name: %q", calls[0].Name)
 	}
 	if calls[0].Arguments["request_type"] != "diagnosis" {
@@ -396,7 +508,33 @@ func TestShimPartConvertsRequestContextToInternalCall(t *testing.T) {
 	if !ok || len(calls) != 1 {
 		t.Fatalf("expected one internal request-context call, got %#v", calls)
 	}
-	if calls[0].Name != internalRequestContextCall {
+	if calls[0].Name != protocol.RequestContextCall {
 		t.Fatalf("unexpected call name: %q", calls[0].Name)
+	}
+}
+
+func TestShimStepResultUsesNativeStructuredCall(t *testing.T) {
+	parsed, err := parseReActResponse("```json\n" + `{
+		"thought": "The pod readiness observation satisfies the active step.",
+		"step_result": {
+			"step_id": "request-000001.phase-1.step-1",
+			"status": "achieved",
+			"criteria": [{
+				"criterion_id": "request-000001.phase-1.step-1.criterion-1",
+				"satisfied": true,
+				"evidence_refs": ["request-000001.observation-000001"]
+			}],
+			"evidence_refs": ["request-000001.observation-000001"]
+		}
+	}` + "\n```")
+	if err != nil {
+		t.Fatalf("parse step_result: %v", err)
+	}
+	calls := functionCallsFromParsedReActResponse(parsed)
+	if len(calls) != 1 || calls[0].Name != protocol.StepResultCall {
+		t.Fatalf("step_result calls = %#v", calls)
+	}
+	if calls[0].Arguments["step_id"] != "request-000001.phase-1.step-1" {
+		t.Fatalf("step id = %#v", calls[0].Arguments["step_id"])
 	}
 }

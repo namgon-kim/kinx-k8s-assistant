@@ -33,17 +33,18 @@ type Config struct {
 	GCPLocation         string `json:"gcp_location,omitempty"`
 
 	// ReAct loop 설정
-	Kubeconfig         string   `json:"kubeconfig"`
-	CurrentContext     string   `json:"-"`
-	AvailableContexts  []string `json:"-"`
-	SkipVerifySSL      bool     `json:"skipverifyssl"`
-	EnableToolUseShim  bool     `json:"enabletoolshim"`
-	MCPClient          bool     `json:"mcp_client"`
-	MaxIterations      int      `json:"maxiterations"`
-	ShowToolOutput     bool     `json:"showtooloutput"`
-	ReadOnly           bool     `json:"readonly"`
-	PromptTemplateFile string   `json:"prompttemplatefile,omitempty"`
-	SessionBackend     string   `json:"sessionbackend"`
+	Kubeconfig         string       `json:"kubeconfig"`
+	CurrentContext     string       `json:"-"`
+	AvailableContexts  []string     `json:"-"`
+	SkipVerifySSL      bool         `json:"skipverifyssl"`
+	EnableToolUseShim  bool         `json:"enabletoolshim"`
+	MCPClient          bool         `json:"mcp_client"`
+	MaxIterations      int          `json:"maxiterations"`
+	ShowToolOutput     bool         `json:"showtooloutput"`
+	ReadOnly           bool         `json:"readonly"`
+	PromptTemplateFile string       `json:"prompttemplatefile,omitempty"`
+	SessionBackend     string       `json:"sessionbackend"`
+	Budgets            BudgetConfig `json:"budgets,omitempty"`
 
 	// 앱 디렉토리 (~/.k8s-assistant)
 	AppDir      string `json:"-"`
@@ -74,6 +75,21 @@ type LangConfig struct {
 type GuidanceConfig struct {
 	ResourceGuides string `json:"resource_guides,omitempty"`
 	IncidentGuides string `json:"incident_guides,omitempty"`
+}
+
+// BudgetConfig contains optional ReAct execution-budget overrides. Zero keeps
+// the runtime-calibrated default; the runtime clamps every non-zero value.
+type BudgetConfig struct {
+	LightweightAttempts          int `json:"lightweight_attempts,omitempty"`
+	ReadOnlyAttempts             int `json:"readonly_attempts,omitempty"`
+	GuidedAttempts               int `json:"guided_attempts,omitempty"`
+	PlanRevisions                int `json:"plan_revisions,omitempty"`
+	NativeProtocolCorrections    int `json:"native_protocol_corrections,omitempty"`
+	ShimProtocolCorrections      int `json:"shim_protocol_corrections,omitempty"`
+	DomainCorrections            int `json:"domain_corrections,omitempty"`
+	SafetyCorrections            int `json:"safety_corrections,omitempty"`
+	VerificationEvidenceAttempts int `json:"verification_evidence_attempts,omitempty"`
+	MutationContinuationAttempts int `json:"mutation_continuation_attempts,omitempty"`
 }
 
 // NewConfig는 기본값이 설정된 Config를 반환합니다.

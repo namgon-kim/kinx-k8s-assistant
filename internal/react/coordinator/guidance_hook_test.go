@@ -9,14 +9,49 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/sandbox"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/guidance"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/protocol"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/session"
 )
 
-func TestCommandStringAcceptsOnlyKubectlCommands(t *testing.T) {
-	if _, ok := commandString("kubectl get cluster c1 -n ns"); !ok {
+func TestCommandExtractorsSeparateRawAndKubectlCommands(t *testing.T) {
+	if _, ok := kubectlCommandString("kubectl get cluster c1 -n ns"); !ok {
 		t.Fatal("expected kubectl command to be accepted")
 	}
-	if _, ok := commandString("echo hello"); ok {
+	if _, ok := kubectlCommandString("echo hello"); ok {
 		t.Fatal("expected non-kubectl command to be rejected")
+	}
+	if command, ok := rawCommandString(`bash -c "kubectl get cluster c1 -n ns"`); !ok || !strings.HasPrefix(command, "bash -c") {
+		t.Fatalf("expected wrapped raw command to be preserved, got %q", command)
+	}
+}
+
+func TestRecordActionPreservesWrappedRawCommandInLedger(t *testing.T) {
+	loop := &Loop{
+		cfg: &config.Config{},
+		runtimeState: &runtimeState{execution: &session.GoalExecutionState{
+			SessionID: "session-1",
+			RequestID: "request-1",
+		}},
+	}
+	loop.mutableRuntime()
+	command := `bash -c "kubectl get pods -n app"`
+	step := StepRef{ID: "step-1", GoalLineageID: "lineage-1"}
+
+	loop.recordAction(PendingCall{
+		FunctionCall: gollm.FunctionCall{
+			Name:      "bash",
+			Arguments: map[string]any{"command": command},
+		},
+		StepRef: &step,
+	}, map[string]any{"status": "success"})
+
+	attempts := loop.mutableRuntime().execution.OrderedAttempts()
+	if len(attempts) != 1 {
+		t.Fatalf("attempts = %d, want 1", len(attempts))
+	}
+	if got := stringFromAny(attempts[0].Action.Arguments["command"]); got != command {
+		t.Fatalf("recorded command = %q, want %q", got, command)
 	}
 }
 
@@ -33,7 +68,11 @@ func TestResourceGuideQueryDeduplicatesExactRefinement(t *testing.T) {
 }
 
 func TestResourceGuideRefinementQueryUsesProblemFocus(t *testing.T) {
-	loop := &Loop{originalQuery: "cluster status"}
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			originalQuery: "cluster status",
+		},
+	}
 	got := loop.resourceGuideRefinementQuery(resourceGuideLookup{
 		ResourceFamily: "cluster-api",
 		ProblemFocus:   "nodegroup reconciliation",
@@ -52,7 +91,11 @@ func TestResourceGuideRefinementQueryUsesProblemFocus(t *testing.T) {
 }
 
 func TestFilterResourceGuidesDropsDeletionGuideForGeneralDiagnosis(t *testing.T) {
-	loop := &Loop{originalQuery: "namespace tenant-a에서 clst-a cluster가 왜 문제야?"}
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			originalQuery: "namespace tenant-a에서 clst-a cluster가 왜 문제야?",
+		},
+	}
 	got := loop.filterResourceGuidesForRequest(&guidance.GuideSearchResult{
 		Cases: []guidance.GuideCase{
 			{ID: "iksv2-renew-cluster-deletion", Title: "IKS v2 Cluster Deletion and Cleanup", Tags: []string{"delete"}},
@@ -65,7 +108,11 @@ func TestFilterResourceGuidesDropsDeletionGuideForGeneralDiagnosis(t *testing.T)
 }
 
 func TestFilterResourceGuidesKeepsDeletionGuideForDeletionDiagnosis(t *testing.T) {
-	loop := &Loop{originalQuery: "cluster deletion이 왜 안 끝나?"}
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			originalQuery: "cluster deletion이 왜 안 끝나?",
+		},
+	}
 	got := loop.filterResourceGuidesForRequest(&guidance.GuideSearchResult{
 		Cases: []guidance.GuideCase{
 			{ID: "iksv2-renew-cluster-deletion", Title: "IKS v2 Cluster Deletion and Cleanup", Tags: []string{"delete"}},
@@ -120,10 +167,12 @@ func TestCommandMentionsResourceTreatsKubectlLogsAsPodTarget(t *testing.T) {
 
 func TestRejectUnrelatedFirstDiagnosticForExplicitClusterTarget(t *testing.T) {
 	loop := &Loop{
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-pz02-shs1006-04"},
-			Scope:         requestScope{Namespace: "tenant-a"},
-			ResourceClass: "custom_resource",
+		runtimeState: &runtimeState{
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-pz02-shs1006-04"},
+				Scope:         requestScope{Namespace: "tenant-a"},
+				ResourceClass: "custom_resource",
+			},
 		},
 	}
 	if !loop.rejectUnrelatedFirstDiagnostic([]gollm.FunctionCall{{
@@ -210,12 +259,14 @@ func TestResourceGuideObservationPreservesGuideMetadataAndAnchorCarriesCommands(
 	}
 
 	loop := &Loop{
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
-			Scope:         requestScope{Namespace: "tenant-a"},
+		runtimeState: &runtimeState{
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+				Scope:         requestScope{Namespace: "tenant-a"},
+			},
 		},
 	}
-	loop.guideStepState = loop.buildGuideStepState(result)
+	loop.mutableRuntime().guideStepState = loop.buildGuideStepState(result)
 	anchor := loop.guideStepAnchor()
 	for _, want := range []string{
 		"next_step_command_template: kubectl -n {{namespace}} get machinedeployment -l cluster.x-k8s.io/cluster-name={{name}},metadata.example.com/primary=true -o yaml",
@@ -381,10 +432,12 @@ func TestInconsistentActionTargetMessageRejectsUnknownActionTargetResource(t *te
 
 func TestRequestNamespaceInvariantRejectsMutatingCommandWithoutNamespace(t *testing.T) {
 	loop := &Loop{
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
-			Scope:         requestScope{Namespace: "web"},
-			ResourceClass: "built_in",
+		runtimeState: &runtimeState{
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
+				Scope:         requestScope{Namespace: "web"},
+				ResourceClass: "built_in",
+			},
 		},
 	}
 	got, invalid := loop.requestNamespaceInvariantMessage(gollm.FunctionCall{
@@ -404,10 +457,12 @@ func TestRequestNamespaceInvariantRejectsMutatingCommandWithoutNamespace(t *test
 
 func TestRequestNamespaceInvariantRejectsDifferentMutationNamespace(t *testing.T) {
 	loop := &Loop{
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
-			Scope:         requestScope{Namespace: "web"},
-			ResourceClass: "built_in",
+		runtimeState: &runtimeState{
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
+				Scope:         requestScope{Namespace: "web"},
+				ResourceClass: "built_in",
+			},
 		},
 	}
 	got, invalid := loop.requestNamespaceInvariantMessage(gollm.FunctionCall{
@@ -428,10 +483,12 @@ func TestRequestNamespaceInvariantRejectsDifferentMutationNamespace(t *testing.T
 
 func TestRequestNamespaceInvariantAllowsMatchingMutationNamespace(t *testing.T) {
 	loop := &Loop{
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
-			Scope:         requestScope{Namespace: "web"},
-			ResourceClass: "built_in",
+		runtimeState: &runtimeState{
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
+				Scope:         requestScope{Namespace: "web"},
+				ResourceClass: "built_in",
+			},
 		},
 	}
 	got, invalid := loop.requestNamespaceInvariantMessage(gollm.FunctionCall{
@@ -451,10 +508,12 @@ func TestRequestNamespaceInvariantAllowsMatchingMutationNamespace(t *testing.T) 
 
 func TestRequestNamespaceInvariantAllowsClusterScopedMutation(t *testing.T) {
 	loop := &Loop{
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "node", Name: "node-a"},
-			Scope:         requestScope{Namespace: "web"},
-			ResourceClass: "built_in",
+		runtimeState: &runtimeState{
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "node", Name: "node-a"},
+				Scope:         requestScope{Namespace: "web"},
+				ResourceClass: "built_in",
+			},
 		},
 	}
 	got, invalid := loop.requestNamespaceInvariantMessage(gollm.FunctionCall{
@@ -474,13 +533,15 @@ func TestRequestNamespaceInvariantAllowsClusterScopedMutation(t *testing.T) {
 
 func TestMutationLifecycleCreatesPendingVerificationAfterMutation(t *testing.T) {
 	loop := &Loop{
-		cfg: &config.Config{},
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
-			Scope:         requestScope{Namespace: "web"},
-			ResourceClass: "built_in",
+		runtimeState: &runtimeState{
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "configmap", Name: "app-config"},
+				Scope:         requestScope{Namespace: "web"},
+				ResourceClass: "built_in",
+			},
+			actionSeq: 3,
 		},
-		actionSeq: 3,
+		cfg: &config.Config{},
 	}
 	loop.trackMutationVerification(PendingCall{
 		FunctionCall: gollm.FunctionCall{
@@ -496,17 +557,22 @@ func TestMutationLifecycleCreatesPendingVerificationAfterMutation(t *testing.T) 
 			},
 		},
 		ModifiesResource: "yes",
+		Verification: &contract.VerificationSpec{
+			Shape:         contract.VerificationSingle,
+			Mode:          contract.VerificationImmediate,
+			ExpectedState: "configmap exists",
+		},
 	}, map[string]any{"status": "ok"})
 
-	if loop.pendingMutationVerification == nil {
+	if loop.mutableRuntime().pendingMutationVerification == nil {
 		t.Fatal("expected pending mutation verification")
 	}
-	got := loop.pendingMutationVerification
-	if len(got.Requirements) != 1 {
-		t.Fatalf("expected one direct evidence requirement, got %#v", got.Requirements)
+	got := loop.mutableRuntime().pendingMutationVerification
+	if len(got.Checks) != 1 {
+		t.Fatalf("expected one direct verification, got %#v", got.Checks)
 	}
-	direct := got.Requirements[0]
-	if direct.Kind != "direct_effect" || direct.Target.Resource != "configmap" || direct.Target.Namespace != "web" || direct.Target.Name != "app-config" {
+	direct := got.Checks[0]
+	if direct.Target.Resource != "configmap" || direct.Target.Namespace != "web" || direct.Target.Name != "app-config" {
 		t.Fatalf("unexpected direct evidence target: %#v", direct)
 	}
 	if !strings.Contains(direct.SuggestedCommand, "kubectl get configmap app-config -n web -o yaml") {
@@ -524,10 +590,15 @@ func TestMutationLifecycleDoesNotStartInReadOnlyMode(t *testing.T) {
 			},
 		},
 		ModifiesResource: "yes",
+		Verification: &contract.VerificationSpec{
+			Shape:         contract.VerificationSingle,
+			Mode:          contract.VerificationImmediate,
+			ExpectedState: "configmap exists",
+		},
 	}, map[string]any{"status": "ok"})
 
-	if loop.pendingMutationVerification != nil {
-		t.Fatalf("read-only mode must not start mutation verification, got %#v", loop.pendingMutationVerification)
+	if loop.mutableRuntime().pendingMutationVerification != nil {
+		t.Fatalf("read-only mode must not start mutation verification, got %#v", loop.mutableRuntime().pendingMutationVerification)
 	}
 }
 
@@ -543,24 +614,26 @@ func TestMutationLifecycleSkipsGenericVerificationForUnmappedSuccessfulMutation(
 		ModifiesResource: "unknown",
 	}, map[string]any{"status": "ok"})
 
-	if loop.pendingMutationVerification != nil {
-		t.Fatalf("successful unmapped mutation must not create generic verification, got %#v", loop.pendingMutationVerification)
+	if loop.mutableRuntime().pendingMutationVerification != nil {
+		t.Fatalf("successful unmapped mutation must not create generic verification, got %#v", loop.mutableRuntime().pendingMutationVerification)
 	}
 }
 
 func TestMutationLifecycleRejectsFinalReportBeforeVerification(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingMutationVerificationResult,
-		pendingMutationVerification: &pendingMutationVerification{
-			Requirements: []mutationEvidenceRequirement{{
-				ID:     "direct_effect",
-				Kind:   "direct_effect",
-				Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
-			}},
+		runtimeState: &runtimeState{
+			pendingMutationVerification: &pendingMutationVerification{
+				Checks: []verificationRuntimeCheck{{
+					ID:     "verification-1",
+					Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+					Status: contract.VerificationCheckActive,
+				}},
+			},
 		},
 	}
+	loop.transitionMutationVerification()
 	if !loop.enforcePendingMutationVerification([]gollm.FunctionCall{{
-		Name: internalFinalReportCall,
+		Name: protocol.FinalReportCall,
 		Arguments: map[string]any{
 			"conclusive":        true,
 			"attempted":         []any{"created configmap"},
@@ -578,12 +651,14 @@ func TestMutationLifecycleRejectsFinalReportBeforeVerification(t *testing.T) {
 
 func TestMutationLifecycleRequiresExactReadOnlyVerification(t *testing.T) {
 	loop := &Loop{
-		pendingMutationVerification: &pendingMutationVerification{
-			Requirements: []mutationEvidenceRequirement{{
-				ID:     "direct_effect",
-				Kind:   "direct_effect",
-				Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
-			}},
+		runtimeState: &runtimeState{
+			pendingMutationVerification: &pendingMutationVerification{
+				Checks: []verificationRuntimeCheck{{
+					ID:     "verification-1",
+					Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+					Status: contract.VerificationCheckActive,
+				}},
+			},
 		},
 	}
 	if _, ok := loop.mutationVerificationCallMatchID(gollm.FunctionCall{
@@ -606,13 +681,14 @@ func TestMutationLifecycleRequiresExactReadOnlyVerification(t *testing.T) {
 
 func TestMutationLifecycleAwaitsResultAfterSuccessfulVerification(t *testing.T) {
 	loop := &Loop{
-		pendingMutationVerification: &pendingMutationVerification{
-			Requirements: []mutationEvidenceRequirement{{
-				ID:     "direct_effect",
-				Kind:   "direct_effect",
-				Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
-			}},
-			Satisfied: map[string]bool{},
+		runtimeState: &runtimeState{
+			pendingMutationVerification: &pendingMutationVerification{
+				Checks: []verificationRuntimeCheck{{
+					ID:     "verification-1",
+					Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+					Status: contract.VerificationCheckActive,
+				}},
+			},
 		},
 	}
 	loop.trackMutationVerification(PendingCall{
@@ -624,19 +700,21 @@ func TestMutationLifecycleAwaitsResultAfterSuccessfulVerification(t *testing.T) 
 		},
 		ModifiesResource: "no",
 	}, map[string]any{"status": "ok"})
-	if loop.pendingMutationVerification == nil || !loop.pendingMutationVerification.AwaitingResult {
-		t.Fatalf("expected verification to await interpretation result, got %#v", loop.pendingMutationVerification)
+	if loop.mutableRuntime().pendingMutationVerification == nil || !loop.mutableRuntime().pendingMutationVerification.AwaitingResult {
+		t.Fatalf("expected verification to await interpretation result, got %#v", loop.mutableRuntime().pendingMutationVerification)
 	}
 }
 
-func TestMutationLifecycleKeepsPendingUntilOutcomeEvidenceSatisfied(t *testing.T) {
+func TestMutationLifecycleBuildsOrderedVerificationChainFromAction(t *testing.T) {
 	loop := &Loop{
-		cfg: &config.Config{},
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "deployment", Name: "web-app"},
-			Scope:         requestScope{Namespace: "web"},
-			ResourceClass: "built_in",
+		runtimeState: &runtimeState{
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "deployment", Name: "web-app"},
+				Scope:         requestScope{Namespace: "web"},
+				ResourceClass: "built_in",
+			},
 		},
+		cfg: &config.Config{},
 	}
 	loop.trackMutationVerification(PendingCall{
 		FunctionCall: gollm.FunctionCall{
@@ -651,58 +729,60 @@ func TestMutationLifecycleKeepsPendingUntilOutcomeEvidenceSatisfied(t *testing.T
 			},
 		},
 		ModifiesResource: "yes",
-	}, map[string]any{"status": "ok"})
-	if loop.pendingMutationVerification == nil || len(loop.pendingMutationVerification.Requirements) != 2 {
-		t.Fatalf("expected direct and outcome evidence requirements, got %#v", loop.pendingMutationVerification)
-	}
-
-	loop.trackMutationVerification(PendingCall{
-		FunctionCall: gollm.FunctionCall{
-			Name: "kubectl",
-			Arguments: map[string]any{
-				"command": "kubectl get configmap app-config -n web -o yaml",
+		Verification: &contract.VerificationSpec{
+			Shape:  contract.VerificationChain,
+			Policy: contract.VerificationOrdered,
+			Checks: []contract.VerificationCheckSpec{
+				{
+					Mode:          contract.VerificationImmediate,
+					ExpectedState: "configmap exists",
+					Target:        &contract.ActionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+				},
+				{
+					Mode:          contract.VerificationAwaitState,
+					ExpectedState: "configmap contains the requested key",
+					Target:        &contract.ActionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+				},
 			},
 		},
-		ModifiesResource: "no",
 	}, map[string]any{"status": "ok"})
-	if loop.pendingMutationVerification == nil {
-		t.Fatal("direct evidence alone must not clear pending verification while outcome evidence remains")
+	if loop.mutableRuntime().pendingMutationVerification == nil || len(loop.mutableRuntime().pendingMutationVerification.Checks) != 2 {
+		t.Fatalf("expected two ordered verification checks, got %#v", loop.mutableRuntime().pendingMutationVerification)
 	}
-	directID := loop.pendingMutationVerification.Requirements[0].ID
-	if !loop.pendingMutationVerification.Satisfied[directID] {
-		t.Fatalf("expected direct evidence to be marked satisfied, got %#v", loop.pendingMutationVerification.Satisfied)
+	if got := loop.mutableRuntime().pendingMutationVerification.Checks[0].Status; got != contract.VerificationCheckActive {
+		t.Fatalf("first check status = %s, want active", got)
 	}
-
-	loop.trackMutationVerification(PendingCall{
-		FunctionCall: gollm.FunctionCall{
-			Name: "kubectl",
-			Arguments: map[string]any{
-				"command": "kubectl get deployment web-app -n web -o yaml",
-			},
-		},
-		ModifiesResource: "no",
-	}, map[string]any{"status": "ok"})
-	if loop.pendingMutationVerification == nil || !loop.pendingMutationVerification.AwaitingResult {
-		t.Fatalf("expected pending verification to await interpretation after outcome evidence, got %#v", loop.pendingMutationVerification)
+	if got := loop.mutableRuntime().pendingMutationVerification.Checks[1].Status; got != contract.VerificationCheckPending {
+		t.Fatalf("second check status = %s, want pending", got)
+	}
+	if got := loop.controlState(); got != RuntimeControlAwaitingMutationVerificationChainEvidence {
+		t.Fatalf("control = %s, want mutation verification chain evidence", got)
 	}
 }
 
-func TestMutationLifecycleConsumesResolvedVerificationResult(t *testing.T) {
+func TestMutationLifecycleConsumesSatisfiedVerificationResult(t *testing.T) {
 	loop := &Loop{
-		pendingMutationVerification: &pendingMutationVerification{
-			AwaitingResult: true,
-			Requirements: []mutationEvidenceRequirement{{
-				ID:     "mutation_1_direct_effect",
-				Kind:   "direct_effect",
-				Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
-			}},
-			Satisfied: map[string]bool{"mutation_1_direct_effect": true},
+		runtimeState: &runtimeState{
+			execution: executionWithStateBearingObservations(t, "observation-1"),
+			pendingMutationVerification: &pendingMutationVerification{
+				AttemptID:      testMutationAttemptID,
+				AwaitingResult: true,
+				Checks: []verificationRuntimeCheck{{
+					ID:           "mutation_1_verification",
+					Target:       actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+					Status:       contract.VerificationCheckActive,
+					EvidenceRefs: []string{"observation-1"},
+				}},
+			},
 		},
 	}
+	loop.transitionMutationVerification()
 	_, handled := loop.consumeMutationVerificationResult([]gollm.FunctionCall{{
-		Name: internalMutationVerificationResultCall,
+		Name: protocol.MutationVerificationResultCall,
 		Arguments: map[string]any{
-			"status":           "resolved",
+			"verification_id":  "mutation_1_verification",
+			"status":           "satisfied",
+			"evidence_refs":    []any{"observation-1"},
 			"evidence_summary": []any{"configmap exists and deployment is available"},
 			"reason":           "verification evidence shows the requested state is healthy",
 		},
@@ -710,64 +790,116 @@ func TestMutationLifecycleConsumesResolvedVerificationResult(t *testing.T) {
 	if !handled {
 		t.Fatal("expected mutation_verification_result to be handled")
 	}
-	if loop.pendingMutationVerification != nil {
-		t.Fatalf("expected pending verification to clear after resolved interpretation, got %#v", loop.pendingMutationVerification)
+	if loop.mutableRuntime().pendingMutationVerification != nil {
+		t.Fatalf("expected pending verification to clear after satisfied interpretation, got %#v", loop.mutableRuntime().pendingMutationVerification)
 	}
 }
 
-func TestMutationLifecycleProgressingDirectiveKeepsNextAction(t *testing.T) {
+func TestMutationVerificationResultUsesTextAcknowledgementInShimMode(t *testing.T) {
 	loop := &Loop{
-		pendingMutationVerification: &pendingMutationVerification{
-			AwaitingResult: true,
-			Requirements: []mutationEvidenceRequirement{{
-				ID:     "mutation_1_outcome_primary_target",
-				Kind:   "outcome_evidence",
-				Target: actionTarget{Resource: "deployment", Namespace: "web", Name: "web-app"},
-			}},
-			Satisfied: map[string]bool{"mutation_1_outcome_primary_target": true},
+		cfg: &config.Config{EnableToolUseShim: true},
+		runtimeState: &runtimeState{
+			execution: executionWithStateBearingObservations(t, "observation-1"),
+			pendingMutationVerification: &pendingMutationVerification{
+				AttemptID:      testMutationAttemptID,
+				AwaitingResult: true,
+				Checks: []verificationRuntimeCheck{{
+					ID:           "mutation_1_verification",
+					Status:       contract.VerificationCheckActive,
+					EvidenceRefs: []string{"observation-1"},
+				}},
+			},
 		},
 	}
+	loop.transitionMutationVerification()
+
 	_, handled := loop.consumeMutationVerificationResult([]gollm.FunctionCall{{
-		Name: internalMutationVerificationResultCall,
+		ID:   "verification-result-1",
+		Name: protocol.MutationVerificationResultCall,
 		Arguments: map[string]any{
-			"status":           "progressing",
-			"evidence_summary": []any{"deployment rollout is still progressing"},
-			"reason":           "new replicaset is not fully available yet",
-			"next_action":      "wait briefly, then run kubectl -n web rollout status deployment/web-app",
+			"verification_id":  "mutation_1_verification",
+			"status":           "satisfied",
+			"evidence_refs":    []any{"observation-1"},
+			"evidence_summary": []any{"the mutation target is in the expected state"},
+			"reason":           "the observation satisfies the verification contract",
 		},
 	}})
 	if !handled {
-		t.Fatal("expected progressing mutation_verification_result to be handled")
+		t.Fatal("expected mutation_verification_result to be handled")
 	}
-	if loop.control != RuntimeControlAwaitingMutationContinuation {
-		t.Fatalf("control = %s, want mutation continuation", loop.control)
+	assertShimFunctionCallAcknowledgement(t, loop.mutableRuntime().currChatContent, protocol.MutationVerificationResultCall)
+}
+
+func TestMutationLifecycleWaitingDirectiveKeepsSameVerification(t *testing.T) {
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			execution: executionWithStateBearingObservations(t, "observation-2"),
+			pendingMutationVerification: &pendingMutationVerification{
+				AttemptID:      testMutationAttemptID,
+				AwaitingResult: true,
+				Checks: []verificationRuntimeCheck{{
+					ID:           "mutation_1_outcome_primary_target",
+					Mode:         contract.VerificationAwaitState,
+					Target:       actionTarget{Resource: "deployment", Namespace: "web", Name: "web-app"},
+					Status:       contract.VerificationCheckActive,
+					EvidenceRefs: []string{"observation-2"},
+					MaxRechecks:  5,
+					RechecksUsed: 0,
+				}},
+			},
+		},
 	}
-	if !strings.Contains(loop.pendingResponseDirective, "rollout status deployment/web-app") {
-		t.Fatalf("expected next_action to be preserved in directive, got %q", loop.pendingResponseDirective)
+	loop.transitionMutationVerification()
+	_, handled := loop.consumeMutationVerificationResult([]gollm.FunctionCall{{
+		Name: protocol.MutationVerificationResultCall,
+		Arguments: map[string]any{
+			"verification_id":  "mutation_1_outcome_primary_target",
+			"status":           "waiting",
+			"evidence_refs":    []any{"observation-2"},
+			"evidence_summary": []any{"deployment rollout is still progressing"},
+			"reason":           "new replicaset is not fully available yet",
+		},
+	}})
+	if !handled {
+		t.Fatal("expected waiting mutation_verification_result to be handled")
+	}
+	if loop.mutableRuntime().control != RuntimeControlAwaitingMutationVerificationEvidence {
+		t.Fatalf("control = %s, want mutation verification evidence", loop.mutableRuntime().control)
+	}
+	if loop.mutableRuntime().pendingMutationVerification == nil || loop.mutableRuntime().pendingMutationVerification.Checks[0].RechecksUsed != 1 {
+		t.Fatalf("expected same verification to remain with one recheck, got %#v", loop.mutableRuntime().pendingMutationVerification)
 	}
 }
 
-func TestMutationVerificationResultRequiresNextActionForUnresolved(t *testing.T) {
+func TestMutationVerificationResultRequiresNextActionForFailed(t *testing.T) {
 	_, ok := mutationVerificationResultFromFunctionCall(gollm.FunctionCall{
-		Name: internalMutationVerificationResultCall,
+		Name: protocol.MutationVerificationResultCall,
 		Arguments: map[string]any{
-			"status":           "unresolved",
+			"verification_id":  "verification-1",
+			"status":           "failed",
+			"evidence_refs":    []any{"observation-1"},
 			"evidence_summary": []any{"deployment remains unavailable"},
 			"reason":           "config is still missing",
 		},
 	})
 	if ok {
-		t.Fatal("unresolved mutation_verification_result without next_action must be invalid")
+		t.Fatal("failed mutation_verification_result without next_action must be invalid")
 	}
 }
 
 func TestMutationContinuationBlocksReportAndClearsAfterUsefulObservation(t *testing.T) {
-	loop := &Loop{control: RuntimeControlAwaitingMutationContinuation}
-	if !loop.enforceMutationContinuation([]gollm.FunctionCall{{Name: internalFinalReportCall}}) {
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingMutationContinuation,
+		},
+	}
+	calls := []gollm.FunctionCall{{Name: protocol.FinalReportCall}}
+	envelope := normalizeModelOutputEnvelope("", calls)
+	if !loop.validateModelOutputEnvelope(&envelope, calls) {
 		t.Fatal("final_report must be blocked while mutation continuation is required")
 	}
 
-	loop.control = RuntimeControlAwaitingMutationContinuation
+	loop.mutableRuntime().control = RuntimeControlAwaitingMutationContinuation
 	loop.trackMutationVerification(PendingCall{
 		FunctionCall: gollm.FunctionCall{
 			Name: "kubectl",
@@ -777,30 +909,32 @@ func TestMutationContinuationBlocksReportAndClearsAfterUsefulObservation(t *test
 		},
 		ModifiesResource: "no",
 	}, map[string]any{"status": "ok"})
-	if loop.control != RuntimeControlAwaitingModelStep {
-		t.Fatalf("control = %s, want model step after useful observation", loop.control)
+	if loop.mutableRuntime().control != RuntimeControlAwaitingModelStep {
+		t.Fatalf("control = %s, want model step after useful observation", loop.mutableRuntime().control)
 	}
 }
 
-func TestMutationLifecycleAllowsMultipleVerificationActions(t *testing.T) {
+func TestMutationLifecycleRequiresOneActiveChainCheckAction(t *testing.T) {
 	loop := &Loop{
-		pendingMutationVerification: &pendingMutationVerification{
-			Requirements: []mutationEvidenceRequirement{
-				{
-					ID:     "mutation_1_direct_effect",
-					Kind:   "direct_effect",
-					Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
-				},
-				{
-					ID:     "mutation_1_outcome_primary_target",
-					Kind:   "outcome_evidence",
-					Target: actionTarget{Resource: "deployment", Namespace: "web", Name: "web-app"},
+		runtimeState: &runtimeState{
+			pendingMutationVerification: &pendingMutationVerification{
+				Shape: contract.VerificationChain,
+				Checks: []verificationRuntimeCheck{
+					{
+						ID:     "mutation_1_verification",
+						Target: actionTarget{Resource: "configmap", Namespace: "web", Name: "app-config"},
+						Status: contract.VerificationCheckActive,
+					},
+					{
+						ID:     "mutation_1_chain_2",
+						Target: actionTarget{Resource: "deployment", Namespace: "web", Name: "web-app"},
+						Status: contract.VerificationCheckPending,
+					},
 				},
 			},
-			Satisfied: map[string]bool{},
 		},
 	}
-	if !loop.mutationVerificationCallsMatch([]gollm.FunctionCall{
+	if loop.mutationVerificationCallsMatch([]gollm.FunctionCall{
 		{
 			Name: "kubectl",
 			Arguments: map[string]any{
@@ -814,20 +948,22 @@ func TestMutationLifecycleAllowsMultipleVerificationActions(t *testing.T) {
 			},
 		},
 	}) {
-		t.Fatal("expected multiple read-only verification actions to be allowed")
+		t.Fatal("multiple verification actions bypassed the ordered active chain check")
 	}
 }
 
-func TestMutationLifecycleAccumulatesSequentialMutationsForSameGoal(t *testing.T) {
+func TestMutationLifecycleDoesNotMergeSecondMutationIntoPendingVerification(t *testing.T) {
 	loop := &Loop{
-		cfg: &config.Config{},
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "deployment", Name: "web-app"},
-			Scope:         requestScope{Namespace: "web"},
-			ResourceClass: "built_in",
+		runtimeState: &runtimeState{
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "deployment", Name: "web-app"},
+				Scope:         requestScope{Namespace: "web"},
+				ResourceClass: "built_in",
+			},
 		},
+		cfg: &config.Config{},
 	}
-	loop.actionSeq = 1
+	loop.mutableRuntime().actionSeq = 1
 	loop.trackMutationVerification(PendingCall{
 		FunctionCall: gollm.FunctionCall{
 			Name: "kubectl",
@@ -841,8 +977,13 @@ func TestMutationLifecycleAccumulatesSequentialMutationsForSameGoal(t *testing.T
 			},
 		},
 		ModifiesResource: "yes",
+		Verification: &contract.VerificationSpec{
+			Shape:         contract.VerificationSingle,
+			Mode:          contract.VerificationImmediate,
+			ExpectedState: "configmap exists",
+		},
 	}, map[string]any{"status": "ok"})
-	loop.actionSeq = 2
+	loop.mutableRuntime().actionSeq = 2
 	loop.trackMutationVerification(PendingCall{
 		FunctionCall: gollm.FunctionCall{
 			Name: "kubectl",
@@ -856,16 +997,21 @@ func TestMutationLifecycleAccumulatesSequentialMutationsForSameGoal(t *testing.T
 			},
 		},
 		ModifiesResource: "yes",
+		Verification: &contract.VerificationSpec{
+			Shape:         contract.VerificationSingle,
+			Mode:          contract.VerificationImmediate,
+			ExpectedState: "deployment restart is recorded",
+		},
 	}, map[string]any{"status": "ok"})
 
-	if loop.pendingMutationVerification == nil {
+	if loop.mutableRuntime().pendingMutationVerification == nil {
 		t.Fatal("expected pending verification")
 	}
-	if len(loop.pendingMutationVerification.Requirements) != 3 {
-		t.Fatalf("expected direct configmap, outcome deployment, and direct deployment requirements, got %#v", loop.pendingMutationVerification.Requirements)
+	if len(loop.mutableRuntime().pendingMutationVerification.Checks) != 1 {
+		t.Fatalf("pending verification must keep one mutation owner, got %#v", loop.mutableRuntime().pendingMutationVerification.Checks)
 	}
-	if loop.control != RuntimeControlAwaitingMutationVerificationEvidence {
-		t.Fatalf("control = %s, want mutation verification evidence", loop.control)
+	if loop.mutableRuntime().control != RuntimeControlAwaitingMutationVerificationEvidence {
+		t.Fatalf("control = %s, want mutation verification evidence", loop.mutableRuntime().control)
 	}
 }
 
@@ -885,7 +1031,7 @@ func TestKubectlCommandUsesUnknownResourceRejectsGetDescribeOnly(t *testing.T) {
 
 func TestRequestContextRejectsNamespaceAsPrimaryTargetWithNamespaceScope(t *testing.T) {
 	_, ok := requestContextFromFunctionCall(gollm.FunctionCall{
-		Name: internalRequestContextCall,
+		Name: protocol.RequestContextCall,
 		Arguments: map[string]any{
 			"primary_target": map[string]any{
 				"resource": "Namespace",
@@ -904,7 +1050,7 @@ func TestRequestContextRejectsNamespaceAsPrimaryTargetWithNamespaceScope(t *test
 
 func TestRequestContextRejectsUnknownPrimaryTargetResource(t *testing.T) {
 	_, ok := requestContextFromFunctionCall(gollm.FunctionCall{
-		Name: internalRequestContextCall,
+		Name: protocol.RequestContextCall,
 		Arguments: map[string]any{
 			"primary_target": map[string]any{
 				"resource": "unknown",
@@ -923,7 +1069,7 @@ func TestRequestContextRejectsUnknownPrimaryTargetResource(t *testing.T) {
 
 func TestRequestContextNormalizesPrimaryTargetResource(t *testing.T) {
 	got, ok := requestContextFromFunctionCall(gollm.FunctionCall{
-		Name: internalRequestContextCall,
+		Name: protocol.RequestContextCall,
 		Arguments: map[string]any{
 			"primary_target": map[string]any{
 				"resource": "Cluster",
@@ -974,7 +1120,7 @@ func TestRequirementAnalysisDerivesRequestContextOnlyForResourceCandidates(t *te
 func TestRequirementAnalysisRejectsLegacyTargetKind(t *testing.T) {
 	legacyCurrentCluster := "current" + "_cluster"
 	_, ok := requirementAnalysisFromFunctionCall(gollm.FunctionCall{
-		Name: internalRequirementAnalysisCall,
+		Name: protocol.RequirementAnalysisCall,
 		Arguments: map[string]any{
 			"request_type": "diagnosis",
 			"action":       "diagnose_problem",
@@ -1010,7 +1156,7 @@ func TestRequirementAnalysisDoesNotDeriveUnknownResourceContext(t *testing.T) {
 
 func TestRequirementAnalysisAllowsOpenTargetCategory(t *testing.T) {
 	got, ok := requirementAnalysisFromFunctionCall(gollm.FunctionCall{
-		Name: internalRequirementAnalysisCall,
+		Name: protocol.RequirementAnalysisCall,
 		Arguments: map[string]any{
 			"request_type": "inspection",
 			"action":       "inspect_certificate_rotation",
@@ -1053,7 +1199,7 @@ func TestRequirementAnalysisNormalizesResourceRoleSynonym(t *testing.T) {
 
 func TestFinalReportRequiresDocumentedFields(t *testing.T) {
 	if _, ok := finalReportFromFunctionCall(gollm.FunctionCall{
-		Name: internalFinalReportCall,
+		Name: protocol.FinalReportCall,
 		Arguments: map[string]any{
 			"conclusive": true,
 		},
@@ -1062,7 +1208,7 @@ func TestFinalReportRequiresDocumentedFields(t *testing.T) {
 	}
 
 	report, ok := finalReportFromFunctionCall(gollm.FunctionCall{
-		Name: internalFinalReportCall,
+		Name: protocol.FinalReportCall,
 		Arguments: map[string]any{
 			"conclusive":        true,
 			"conclusion":        "cluster is healthy",
@@ -1076,7 +1222,7 @@ func TestFinalReportRequiresDocumentedFields(t *testing.T) {
 	}
 
 	report, ok = finalReportFromFunctionCall(gollm.FunctionCall{
-		Name: internalFinalReportCall,
+		Name: protocol.FinalReportCall,
 		Arguments: map[string]any{
 			"conclusive":        false,
 			"attempted":         []any{"checked cluster"},
@@ -1092,7 +1238,7 @@ func TestFinalReportRequiresDocumentedFields(t *testing.T) {
 
 func TestNextDirectionsKeepsAtMostThreeValidOptions(t *testing.T) {
 	got, ok := nextDirectionsFromFunctionCall(gollm.FunctionCall{
-		Name: internalNextDirectionsCall,
+		Name: protocol.NextDirectionsCall,
 		Arguments: map[string]any{
 			"options": []any{
 				map[string]any{"kind": "different_approach", "summary": "A", "instruction": "try A"},
@@ -1140,26 +1286,28 @@ func TestGuideStepCompletedRejectsEvidenceNotUseful(t *testing.T) {
 
 func TestConsumeGuideProgressCompletesNestedGuideStep(t *testing.T) {
 	loop := &Loop{
-		guideStepState: &guideStepState{
-			TotalSteps: 2,
-			Completed:  map[int]bool{},
-			StepDetails: []guideStepDetail{
-				{Index: 1, Description: "inspect first signal"},
-				{Index: 2, Description: "inspect second signal"},
+		runtimeState: &runtimeState{
+			guideStepState: &guideStepState{
+				TotalSteps: 2,
+				Completed:  map[int]bool{},
+				StepDetails: []guideStepDetail{
+					{Index: 1, Description: "inspect first signal"},
+					{Index: 2, Description: "inspect second signal"},
+				},
 			},
-		},
-		phaseStepState: &phaseStepState{
-			PhaseSteps: []phaseStep{{
-				Index: 1,
-				Name:  "guided_diagnosis",
-			}},
-			CurrentPhaseIndex: 1,
-			Completed:         map[int]bool{},
+			phaseStepState: &phaseStepState{
+				PhaseSteps: []phaseStep{{
+					Index: 1,
+					Name:  "guided_diagnosis",
+				}},
+				CurrentPhaseIndex: 1,
+				Completed:         map[int]bool{},
+			},
 		},
 	}
 
 	remaining, handled := loop.consumeGuideProgress([]gollm.FunctionCall{{
-		Name: internalGuideProgressCall,
+		Name: protocol.GuideProgressCall,
 		Arguments: map[string]any{
 			"step_completed":  1,
 			"evidence_useful": true,
@@ -1171,32 +1319,71 @@ func TestConsumeGuideProgressCompletesNestedGuideStep(t *testing.T) {
 	if len(remaining) != 0 {
 		t.Fatalf("unexpected remaining calls: %#v", remaining)
 	}
-	if !loop.guideStepState.Completed[1] {
+	if !loop.mutableRuntime().guideStepState.Completed[1] {
 		t.Fatal("expected guide step 1 to be completed")
 	}
 }
 
-func TestConsumeGuideProgressLastStepRequestsGuidedPhaseProgress(t *testing.T) {
+func TestGuideProgressUsesTextAcknowledgementInShimMode(t *testing.T) {
 	loop := &Loop{
-		guideStepState: &guideStepState{
-			TotalSteps: 1,
-			Completed:  map[int]bool{},
-			StepDetails: []guideStepDetail{
-				{Index: 1, Description: "inspect final signal"},
+		cfg: &config.Config{EnableToolUseShim: true},
+		runtimeState: &runtimeState{
+			guideStepState: &guideStepState{
+				TotalSteps: 1,
+				Completed:  map[int]bool{},
+				StepDetails: []guideStepDetail{{
+					Index:       1,
+					Description: "inspect the signal",
+				}},
+			},
+			phaseStepState: &phaseStepState{
+				PhaseSteps: []phaseStep{{
+					Index: 1,
+					Name:  "guided_diagnosis",
+				}},
+				CurrentPhaseIndex: 1,
+				Completed:         map[int]bool{},
 			},
 		},
-		phaseStepState: &phaseStepState{
-			PhaseSteps: []phaseStep{{
-				Index: 1,
-				Name:  "guided_diagnosis",
-			}},
-			CurrentPhaseIndex: 1,
-			Completed:         map[int]bool{},
+	}
+
+	_, handled := loop.consumeGuideProgress([]gollm.FunctionCall{{
+		ID:   "guide-progress-1",
+		Name: protocol.GuideProgressCall,
+		Arguments: map[string]any{
+			"step_completed":  1,
+			"evidence_useful": true,
+		},
+	}})
+	if !handled {
+		t.Fatal("expected guide_progress to be handled")
+	}
+	assertShimFunctionCallAcknowledgement(t, loop.mutableRuntime().currChatContent, protocol.GuideProgressCall)
+}
+
+func TestConsumeGuideProgressLastStepRequestsGuidedPhaseProgress(t *testing.T) {
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			guideStepState: &guideStepState{
+				TotalSteps: 1,
+				Completed:  map[int]bool{},
+				StepDetails: []guideStepDetail{
+					{Index: 1, Description: "inspect final signal"},
+				},
+			},
+			phaseStepState: &phaseStepState{
+				PhaseSteps: []phaseStep{{
+					Index: 1,
+					Name:  "guided_diagnosis",
+				}},
+				CurrentPhaseIndex: 1,
+				Completed:         map[int]bool{},
+			},
 		},
 	}
 
 	remaining, handled := loop.consumeGuideProgress([]gollm.FunctionCall{{
-		Name: internalGuideProgressCall,
+		Name: protocol.GuideProgressCall,
 		Arguments: map[string]any{
 			"step_completed":  1,
 			"evidence_useful": true,
@@ -1208,176 +1395,140 @@ func TestConsumeGuideProgressLastStepRequestsGuidedPhaseProgress(t *testing.T) {
 	if len(remaining) != 0 {
 		t.Fatalf("unexpected remaining calls: %#v", remaining)
 	}
-	if loop.control != RuntimeControlAwaitingGuidedPhaseProgress {
-		t.Fatalf("control = %s, want guided phase progress", loop.control)
+	if loop.mutableRuntime().control != RuntimeControlAwaitingGuidedPhaseProgress {
+		t.Fatalf("control = %s, want guided phase progress", loop.mutableRuntime().control)
 	}
-	if !strings.Contains(loop.pendingResponseDirective, "phase_progress") {
-		t.Fatalf("expected phase_progress directive, got %q", loop.pendingResponseDirective)
+	if !strings.Contains(loop.mutableRuntime().pendingResponseDirective, "phase_progress") {
+		t.Fatalf("expected phase_progress directive, got %q", loop.mutableRuntime().pendingResponseDirective)
 	}
 }
 
 func TestRequestPostGuideCompletionPreservesPendingMutationVerification(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingMutationVerificationEvidence,
-		guideStepState: &guideStepState{
-			TotalSteps: 1,
-			Completed:  map[int]bool{1: true},
-		},
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps:        []phaseStep{{Index: 1, Name: "guided_diagnosis"}},
-			Completed:         map[int]bool{},
-		},
-		pendingMutationVerification: &pendingMutationVerification{
-			Requirements: []mutationEvidenceRequirement{{ID: "direct"}},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingMutationVerificationEvidence,
+			guideStepState: &guideStepState{
+				TotalSteps: 1,
+				Completed:  map[int]bool{1: true},
+			},
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 1,
+				PhaseSteps:        []phaseStep{{Index: 1, Name: "guided_diagnosis"}},
+				Completed:         map[int]bool{},
+			},
+			pendingMutationVerification: &pendingMutationVerification{
+				Checks: []verificationRuntimeCheck{{ID: "direct", Status: contract.VerificationCheckActive}},
+			},
 		},
 	}
 
 	loop.requestPostGuideCompletionDirective()
-	if loop.control != RuntimeControlAwaitingMutationVerificationEvidence {
-		t.Fatalf("control = %s, want mutation verification evidence", loop.control)
+	if loop.mutableRuntime().control != RuntimeControlAwaitingMutationVerificationEvidence {
+		t.Fatalf("control = %s, want mutation verification evidence", loop.mutableRuntime().control)
 	}
 }
 
-func TestResolvedMutationVerificationRestoresGuidedPhaseProgress(t *testing.T) {
+func TestSatisfiedMutationVerificationRestoresGuidedPhaseProgress(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingMutationVerificationResult,
-		guideStepState: &guideStepState{
-			TotalSteps: 1,
-			Completed:  map[int]bool{1: true},
-		},
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps:        []phaseStep{{Index: 1, Name: "guided_diagnosis"}},
-			Completed:         map[int]bool{},
-		},
-		pendingMutationVerification: &pendingMutationVerification{
-			AwaitingResult: true,
-			Requirements:   []mutationEvidenceRequirement{{ID: "direct"}},
+		runtimeState: &runtimeState{
+			control:   RuntimeControlAwaitingMutationVerificationResult,
+			execution: executionWithStateBearingObservations(t, "observation-1"),
+			guideStepState: &guideStepState{
+				TotalSteps: 1,
+				Completed:  map[int]bool{1: true},
+			},
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 1,
+				PhaseSteps:        []phaseStep{{Index: 1, Name: "guided_diagnosis"}},
+				Completed:         map[int]bool{},
+			},
+			pendingMutationVerification: &pendingMutationVerification{
+				AttemptID:      testMutationAttemptID,
+				AwaitingResult: true,
+				Checks: []verificationRuntimeCheck{{
+					ID:           "direct",
+					Status:       contract.VerificationCheckActive,
+					EvidenceRefs: []string{"observation-1"},
+				}},
+			},
 		},
 	}
 
 	_, handled := loop.consumeMutationVerificationResult([]gollm.FunctionCall{{
-		Name: internalMutationVerificationResultCall,
+		Name: protocol.MutationVerificationResultCall,
 		Arguments: map[string]any{
-			"status":           "resolved",
+			"verification_id":  "direct",
+			"status":           "satisfied",
+			"evidence_refs":    []any{"observation-1"},
 			"evidence_summary": []any{"mutation result observed"},
 		},
 	}})
 	if !handled {
-		t.Fatal("resolved mutation verification should be consumed")
+		t.Fatal("satisfied mutation verification should be consumed")
 	}
-	if loop.control != RuntimeControlAwaitingGuidedPhaseProgress {
-		t.Fatalf("control = %s, want guided phase progress", loop.control)
-	}
-}
-
-func TestConsumeGuideProgressRejectsTrailingCallsAfterFinalStep(t *testing.T) {
-	loop := &Loop{
-		guideStepState: &guideStepState{
-			TotalSteps: 1,
-			Completed:  map[int]bool{},
-		},
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps:        []phaseStep{{Index: 1, Name: "guided_diagnosis"}},
-			Completed:         map[int]bool{},
-		},
-	}
-
-	_, handled := loop.consumeGuideProgress([]gollm.FunctionCall{
-		{Name: internalGuideProgressCall, Arguments: map[string]any{"step_completed": 1, "evidence_useful": true}},
-		{Name: internalPhaseProgressCall, Arguments: map[string]any{"phase_completed": 1}},
-	})
-	if !handled {
-		t.Fatal("final guide_progress with a trailing call must be rejected")
-	}
-	if got := loop.phaseStepState.CurrentPhaseIndex; got != 1 {
-		t.Fatalf("current phase = %d, want unchanged guided_diagnosis", got)
+	if loop.mutableRuntime().control != RuntimeControlAwaitingGuidedPhaseProgress {
+		t.Fatalf("control = %s, want guided phase progress", loop.mutableRuntime().control)
 	}
 }
 
-func TestConsumeGuideProgressPreservesTrailingCalls(t *testing.T) {
-	loop := &Loop{
-		guideStepState: &guideStepState{
-			TotalSteps: 2,
-			Completed:  map[int]bool{},
-		},
-		phaseStepState: &phaseStepState{
-			PhaseSteps: []phaseStep{{
-				Index: 1,
-				Name:  "guided_diagnosis",
-			}},
-			CurrentPhaseIndex: 1,
-			Completed:         map[int]bool{},
-		},
-	}
-	trailing := gollm.FunctionCall{
-		Name: internalPhaseProgressCall,
-		Arguments: map[string]any{
-			"phase_completed": 1,
-			"next_phase":      "final_report",
-		},
-	}
+const testMutationAttemptID = "test-attempt"
 
-	remaining, handled := loop.consumeGuideProgress([]gollm.FunctionCall{
-		{
-			Name: internalGuideProgressCall,
-			Arguments: map[string]any{
-				"step_completed":  1,
-				"evidence_useful": true,
-			},
-		},
-		trailing,
-	})
-	if handled {
-		t.Fatal("guide_progress with trailing calls should flow through to the remaining pipeline")
+func executionWithStateBearingObservations(t *testing.T, refs ...string) *session.GoalExecutionState {
+	t.Helper()
+	execution := &session.GoalExecutionState{
+		SessionID:                    "test-session",
+		RequestID:                    "test-request",
+		VerificationEvidenceAttempts: map[string]int{},
+		Corrections:                  map[contract.CorrectionKey]contract.CorrectionState{},
 	}
-	if len(remaining) != 1 || remaining[0].Name != internalPhaseProgressCall {
-		t.Fatalf("expected trailing phase_progress to be preserved, got %#v", remaining)
+	for _, ref := range refs {
+		if err := execution.AppendObservation(contract.ObservationRecord{
+			ID:            ref,
+			AttemptID:     testMutationAttemptID,
+			Kind:          contract.EvidenceObservation,
+			Qualification: contract.EvidenceStateBearing,
+		}); err != nil {
+			t.Fatalf("append state-bearing observation %q: %v", ref, err)
+		}
 	}
-	if !loop.guideStepState.Completed[1] {
-		t.Fatal("expected guide step to be recorded before trailing calls continue")
+	if err := execution.AppendAttempt(contract.AttemptRecord{
+		ID:              testMutationAttemptID,
+		SessionID:       execution.SessionID,
+		RequestID:       execution.RequestID,
+		StepID:          "test-step",
+		GoalLineageID:   "test-lineage",
+		ObservationRefs: append([]string(nil), refs...),
+		Status:          contract.AttemptVerifying,
+	}); err != nil {
+		t.Fatalf("append mutation attempt: %v", err)
 	}
+	return execution
 }
 
-func TestEnforceRequestedDirectiveAllowsOnlyRequestedCall(t *testing.T) {
-	phaseOnly := &Loop{control: RuntimeControlAwaitingGuidedPhaseProgress}
-	if phaseOnly.enforceRequestedStructuredDirective([]gollm.FunctionCall{{
-		Name: internalPhaseProgressCall,
-	}}) {
-		t.Fatal("sole requested phase_progress should pass through")
+func assertShimFunctionCallAcknowledgement(t *testing.T, values []any, callName string) {
+	t.Helper()
+	found := false
+	for _, value := range values {
+		if _, ok := value.(gollm.FunctionCallResult); ok {
+			t.Fatalf("shim chat content contains native FunctionCallResult: %#v", value)
+		}
+		text, ok := value.(string)
+		if ok && strings.Contains(text, callName) {
+			found = true
+		}
 	}
-
-	phaseWithAction := &Loop{control: RuntimeControlAwaitingGuidedPhaseProgress}
-	if !phaseWithAction.enforceRequestedStructuredDirective([]gollm.FunctionCall{
-		{Name: internalPhaseProgressCall},
-		{Name: "kubectl"},
-	}) {
-		t.Fatal("phase_progress mixed with action should be corrected")
-	}
-
-	finalOnly := &Loop{control: RuntimeControlAwaitingFinalReport}
-	if finalOnly.enforceRequestedStructuredDirective([]gollm.FunctionCall{{
-		Name: internalFinalReportCall,
-	}}) {
-		t.Fatal("sole requested final_report should pass through")
-	}
-
-	finalWithAction := &Loop{control: RuntimeControlAwaitingFinalReport}
-	if !finalWithAction.enforceRequestedStructuredDirective([]gollm.FunctionCall{
-		{Name: internalFinalReportCall},
-		{Name: "kubectl"},
-	}) {
-		t.Fatal("final_report mixed with action should be corrected")
+	if !found {
+		t.Fatalf("shim acknowledgement for %q not found in %#v", callName, values)
 	}
 }
 
 func TestFallbackNextDirectionsUsesPendingFinalReportGaps(t *testing.T) {
 	loop := &Loop{
-		pendingFinalReport: &finalReport{
-			EvidenceMissing: []string{"workload kubeconfig was not available"},
-			Blockers:        []string{"node providerID could not be checked"},
+		runtimeState: &runtimeState{
+			pendingFinalReport: &finalReport{
+				EvidenceMissing: []string{"workload kubeconfig was not available"},
+				Blockers:        []string{"node providerID could not be checked"},
+			},
 		},
 	}
 	got := loop.fallbackNextDirections()
@@ -1398,31 +1549,33 @@ func TestFallbackNextDirectionsAllowsOnlyRuntimeChoicesWithoutReportGaps(t *test
 
 func TestPriorConversationStateUsesExplicitFollowUpMemory(t *testing.T) {
 	loop := &Loop{
-		originalQuery: "namespace tenant-a에서 clst-a cluster 문제 찾아줘",
-		requirementAnalysis: &requirementAnalysis{
-			RequestType: "diagnosis",
-			Action:      "diagnose_problem",
-			Target:      requirementAnalysisTarget{Category: "kubernetes_resource", Description: "Cluster clst-a"},
-			Scope:       requirementScope{Type: "namespaced", Namespace: "tenant-a"},
-			Resources: []requirementResource{{
-				Kind:      "cluster",
-				Name:      "clst-a",
-				Namespace: "tenant-a",
-				Role:      "primary",
-			}},
+		runtimeState: &runtimeState{
+			originalQuery: "namespace tenant-a에서 clst-a cluster 문제 찾아줘",
+			requirementAnalysis: &requirementAnalysis{
+				RequestType: "diagnosis",
+				Action:      "diagnose_problem",
+				Target:      requirementAnalysisTarget{Category: "kubernetes_resource", Description: "Cluster clst-a"},
+				Scope:       requirementScope{Type: "namespaced", Namespace: "tenant-a"},
+				Resources: []requirementResource{{
+					Kind:      "cluster",
+					Name:      "clst-a",
+					Namespace: "tenant-a",
+					Role:      "primary",
+				}},
+			},
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+				Scope:         requestScope{Namespace: "tenant-a"},
+				ResourceClass: "custom_resource",
+			},
+			lastAssistantText: "MachineDeployment has zero available replicas.",
 		},
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
-			Scope:         requestScope{Namespace: "tenant-a"},
-			ResourceClass: "custom_resource",
-		},
-		lastAssistantText: "MachineDeployment has zero available replicas.",
 	}
 	loop.captureConversationMemory()
-	loop.originalQuery = ""
-	loop.requirementAnalysis = nil
-	loop.requestContext = nil
-	loop.lastAssistantText = ""
+	loop.mutableRuntime().originalQuery = ""
+	loop.mutableRuntime().requirementAnalysis = nil
+	loop.mutableRuntime().requestContext = nil
+	loop.mutableRuntime().lastAssistantText = ""
 
 	got := loop.priorConversationStateMessage()
 	for _, want := range []string{
@@ -1440,10 +1593,12 @@ func TestPriorConversationStateUsesExplicitFollowUpMemory(t *testing.T) {
 
 func TestRequirementAnalysisDefaultsFollowUpToPriorRequestContext(t *testing.T) {
 	loop := &Loop{
-		lastRequestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
-			Scope:         requestScope{Namespace: "tenant-a"},
-			ResourceClass: "custom_resource",
+		runtimeState: &runtimeState{
+			lastRequestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+				Scope:         requestScope{Namespace: "tenant-a"},
+				ResourceClass: "custom_resource",
+			},
 		},
 	}
 	got := loop.applyPriorContextToFollowUpRequirementAnalysis(requirementAnalysis{
@@ -1476,22 +1631,24 @@ func TestRequirementAnalysisDefaultsFollowUpToPriorRequestContext(t *testing.T) 
 
 func TestRequirementAnalysisRetriesPreviousAnswerInsteadOfClarification(t *testing.T) {
 	loop := &Loop{
-		originalQuery: "아닌 것 같아. 다시 정확하게.",
-		lastRequirementAnalysis: &requirementAnalysis{
-			RequestType: "inspection",
-			Action:      "summarize_pods",
-			Target:      requirementAnalysisTarget{Category: "kubernetes_resource", Description: "Pods in the cluster"},
-			Scope:       requirementScope{Type: "cluster_scoped"},
-			Resources: []requirementResource{{
-				Kind:   "pod",
-				Role:   "primary",
-				Source: "user_request",
-			}},
-			Evidence: []string{"Pod distribution across nodes and namespaces"},
-		},
-		lastRequestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "pod"},
-			ResourceClass: "built_in",
+		runtimeState: &runtimeState{
+			originalQuery: "아닌 것 같아. 다시 정확하게.",
+			lastRequirementAnalysis: &requirementAnalysis{
+				RequestType: "inspection",
+				Action:      "summarize_pods",
+				Target:      requirementAnalysisTarget{Category: "kubernetes_resource", Description: "Pods in the cluster"},
+				Scope:       requirementScope{Type: "cluster_scoped"},
+				Resources: []requirementResource{{
+					Kind:   "pod",
+					Role:   "primary",
+					Source: "user_request",
+				}},
+				Evidence: []string{"Pod distribution across nodes and namespaces"},
+			},
+			lastRequestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "pod"},
+				ResourceClass: "built_in",
+			},
 		},
 	}
 
@@ -1520,10 +1677,12 @@ func TestRequirementAnalysisRetriesPreviousAnswerInsteadOfClarification(t *testi
 
 func TestRequirementAnalysisDemotesModelInferredPrimaryToOperationalFocusHint(t *testing.T) {
 	loop := &Loop{
-		lastRequestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
-			Scope:         requestScope{Namespace: "tenant-a"},
-			ResourceClass: "custom_resource",
+		runtimeState: &runtimeState{
+			lastRequestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+				Scope:         requestScope{Namespace: "tenant-a"},
+				ResourceClass: "custom_resource",
+			},
 		},
 	}
 	got := loop.applyPriorContextToFollowUpRequirementAnalysis(requirementAnalysis{
@@ -1557,10 +1716,12 @@ func TestRequirementAnalysisDemotesModelInferredPrimaryToOperationalFocusHint(t 
 
 func TestRequirementAnalysisKeepsUserRequestPrimary(t *testing.T) {
 	loop := &Loop{
-		lastRequestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
-			Scope:         requestScope{Namespace: "tenant-a"},
-			ResourceClass: "custom_resource",
+		runtimeState: &runtimeState{
+			lastRequestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+				Scope:         requestScope{Namespace: "tenant-a"},
+				ResourceClass: "custom_resource",
+			},
 		},
 	}
 	got := loop.applyPriorContextToFollowUpRequirementAnalysis(requirementAnalysis{
@@ -1588,11 +1749,13 @@ func TestRequirementAnalysisKeepsUserRequestPrimary(t *testing.T) {
 
 func TestRejectConversationalToolCallsBeforeDispatch(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		requirementAnalysis: &requirementAnalysis{
-			RequestType: "explanation",
-			Action:      "clarify_request",
-			Target:      requirementAnalysisTarget{Category: "conversation"},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+			requirementAnalysis: &requirementAnalysis{
+				RequestType: "explanation",
+				Action:      "clarify_request",
+				Target:      requirementAnalysisTarget{Category: "conversation"},
+			},
 		},
 	}
 
@@ -1641,30 +1804,33 @@ func TestRequirementAnalysisDoesNotClarifyBroadClusterEnvironmentDiagnosis(t *te
 
 func TestInferGuideStepCompletedFromMatchingNextStepCommand(t *testing.T) {
 	loop := &Loop{
-		requestContext: &requestContext{
-			PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
-			Scope:         requestScope{Namespace: "tenant-a"},
-		},
-		guideStepState: &guideStepState{
-			TotalSteps: 2,
-			Completed:  map[int]bool{},
-			StepDetails: []guideStepDetail{
-				{
-					Index:           1,
-					Description:     "Inspect top-level cluster resources",
-					CommandTemplate: "kubectl -n {{namespace}} get cluster/{{cluster_name}} openstackcluster/{{cluster_name}} kamajicontrolplane/{{cluster_name}} -o yaml",
-					RenderedCommand: "kubectl -n tenant-a get cluster/clst-a openstackcluster/clst-a kamajicontrolplane/clst-a -o yaml",
-				},
-				{
-					Index:           2,
-					Description:     "Inspect cloud config Secrets",
-					CommandTemplate: "kubectl -n {{namespace}} get secret/{{cluster_name}}-cloud-conf secret/{{cluster_name}}-ccm-cloud-config -o yaml",
-					RenderedCommand: "kubectl -n tenant-a get secret/clst-a-cloud-conf secret/clst-a-ccm-cloud-config -o yaml",
+		runtimeState: &runtimeState{
+			requestContext: &requestContext{
+				PrimaryTarget: requestPrimaryTarget{Resource: "cluster", Name: "clst-a"},
+				Scope:         requestScope{Namespace: "tenant-a"},
+			},
+			guideStepState: &guideStepState{
+				TotalSteps: 2,
+				Completed:  map[int]bool{},
+				StepDetails: []guideStepDetail{
+					{
+						Index:           1,
+						Description:     "Inspect top-level cluster resources",
+						CommandTemplate: "kubectl -n {{namespace}} get cluster/{{cluster_name}} openstackcluster/{{cluster_name}} kamajicontrolplane/{{cluster_name}} -o yaml",
+						RenderedCommand: "kubectl -n tenant-a get cluster/clst-a openstackcluster/clst-a kamajicontrolplane/clst-a -o yaml",
+					},
+					{
+						Index:           2,
+						Description:     "Inspect cloud config Secrets",
+						CommandTemplate: "kubectl -n {{namespace}} get secret/{{cluster_name}}-cloud-conf secret/{{cluster_name}}-ccm-cloud-config -o yaml",
+						RenderedCommand: "kubectl -n tenant-a get secret/clst-a-cloud-conf secret/clst-a-ccm-cloud-config -o yaml",
+					},
 				},
 			},
 		},
 	}
 	step, ok := loop.inferGuideStepCompletedFromFunctionCall(gollm.FunctionCall{
+		Name: "kubectl",
 		Arguments: map[string]any{
 			"command": "kubectl -n tenant-a get cluster/clst-a openstackcluster/clst-a kamajicontrolplane/clst-a -o yaml",
 		},
@@ -1674,6 +1840,7 @@ func TestInferGuideStepCompletedFromMatchingNextStepCommand(t *testing.T) {
 	}
 
 	if step, ok = loop.inferGuideStepCompletedFromFunctionCall(gollm.FunctionCall{
+		Name: "kubectl",
 		Arguments: map[string]any{
 			"command": "kubectl -n tenant-a get cluster/clst-a -o yaml",
 		},
@@ -1682,6 +1849,7 @@ func TestInferGuideStepCompletedFromMatchingNextStepCommand(t *testing.T) {
 	}
 
 	if step, ok = loop.inferGuideStepCompletedFromFunctionCall(gollm.FunctionCall{
+		Name: "kubectl",
 		Arguments: map[string]any{
 			"command": "kubectl -n tenant-a get events --field-selector=involvedObject.name=clst-a",
 		},

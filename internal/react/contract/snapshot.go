@@ -6,15 +6,18 @@ import (
 )
 
 type PhaseRef struct {
-	Index int
-	Name  string
+	ID        string `json:"id,omitempty"`
+	LineageID string `json:"lineage_id,omitempty"`
+	Index     int    `json:"index,omitempty"`
+	Name      string `json:"name,omitempty"`
 }
 
 type StepRef struct {
-	Phase PhaseRef
-	Kind  StepKind
-	ID    string
-	Index int
+	Phase         PhaseRef `json:"phase,omitempty"`
+	Kind          StepKind `json:"kind,omitempty"`
+	ID            string   `json:"id,omitempty"`
+	GoalLineageID string   `json:"goal_lineage_id,omitempty"`
+	Index         int      `json:"index,omitempty"`
 }
 
 type PhaseRuntime struct {
@@ -42,36 +45,64 @@ type StepRuntime struct {
 }
 
 func (r PhaseRef) Matches(other PhaseRef) bool {
+	matched := false
+	if r.ID != "" && other.ID != "" && r.ID != other.ID {
+		return false
+	} else if r.ID != "" && other.ID != "" {
+		matched = true
+	}
+	if r.LineageID != "" && other.LineageID != "" && r.LineageID != other.LineageID {
+		return false
+	} else if r.LineageID != "" && other.LineageID != "" {
+		matched = true
+	}
 	if r.Index != 0 && other.Index != 0 && r.Index != other.Index {
 		return false
+	} else if r.Index != 0 && other.Index != 0 {
+		matched = true
 	}
 	if strings.TrimSpace(r.Name) != "" && strings.TrimSpace(other.Name) != "" && !strings.EqualFold(r.Name, other.Name) {
 		return false
+	} else if strings.TrimSpace(r.Name) != "" && strings.TrimSpace(other.Name) != "" {
+		matched = true
 	}
-	return (r.Index != 0 || strings.TrimSpace(r.Name) != "") &&
-		(other.Index != 0 || strings.TrimSpace(other.Name) != "")
+	return matched
 }
 
 func (r StepRef) Matches(other StepRef) bool {
+	matched := false
 	if r.Kind != "" && other.Kind != "" && r.Kind != other.Kind {
 		return false
+	} else if r.Kind != "" && other.Kind != "" {
+		matched = true
 	}
 	if r.ID != "" && other.ID != "" && r.ID != other.ID {
 		return false
+	} else if r.ID != "" && other.ID != "" {
+		matched = true
+	}
+	if r.GoalLineageID != "" && other.GoalLineageID != "" && r.GoalLineageID != other.GoalLineageID {
+		return false
+	} else if r.GoalLineageID != "" && other.GoalLineageID != "" {
+		matched = true
 	}
 	if r.Index != 0 && other.Index != 0 && r.Index != other.Index {
 		return false
+	} else if r.Index != 0 && other.Index != 0 {
+		matched = true
 	}
-	if (r.Phase.Index != 0 || strings.TrimSpace(r.Phase.Name) != "") &&
-		(other.Phase.Index != 0 || strings.TrimSpace(other.Phase.Name) != "") &&
-		!r.Phase.Matches(other.Phase) {
+	rHasPhase := r.Phase.ID != "" || r.Phase.LineageID != "" || r.Phase.Index != 0 || strings.TrimSpace(r.Phase.Name) != ""
+	otherHasPhase := other.Phase.ID != "" || other.Phase.LineageID != "" || other.Phase.Index != 0 || strings.TrimSpace(other.Phase.Name) != ""
+	if rHasPhase && otherHasPhase && !r.Phase.Matches(other.Phase) {
 		return false
 	}
-	return (r.Kind != "" || r.ID != "" || r.Index != 0) &&
-		(other.Kind != "" || other.ID != "" || other.Index != 0)
+	return matched
 }
 
 func (r PhaseRef) String() string {
+	if r.ID != "" {
+		return r.ID
+	}
 	if strings.TrimSpace(r.Name) == "" {
 		return fmt.Sprintf("#%d", r.Index)
 	}
@@ -86,6 +117,9 @@ func (r StepRef) String() string {
 	if r.ID != "" {
 		parts = append(parts, "id="+r.ID)
 	}
+	if r.GoalLineageID != "" {
+		parts = append(parts, "lineage="+r.GoalLineageID)
+	}
 	if r.Index != 0 {
 		parts = append(parts, fmt.Sprintf("index=%d", r.Index))
 	}
@@ -93,14 +127,4 @@ func (r StepRef) String() string {
 		parts = append(parts, "phase="+r.Phase.String())
 	}
 	return strings.Join(parts, " ")
-}
-
-// RuntimeSnapshot is the immutable projection exposed outside session.
-type RuntimeSnapshot struct {
-	Lifecycle     LoopLifecycleState
-	Control       RuntimeControlState
-	InputOwner    InputOwner
-	OriginalQuery string
-	Phase         *PhaseRuntime
-	ActiveSteps   []StepRuntime
 }

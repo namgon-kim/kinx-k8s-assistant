@@ -11,7 +11,7 @@ The project intentionally owns the ReAct loop, approval UX, prompt rendering, ou
 - `cmd/k8s-assistant`: main CLI entrypoint and flags.
 - `internal/react/react.go`: public ReAct facade. Callers should not import implementation subpackages directly.
 - `internal/react/coordinator`: ReAct model/input/tool/output orchestration.
-- `internal/react/session`: mutable control, phase, verification, and context state.
+- `internal/react/session`: generic revisioned aggregate, lifecycle projection, and goal/phase/step execution ledger. The package-private workflow root is `coordinator.runtimeState`.
 - `internal/react/flow`, `contract`: I/O-free workflow rules and immutable shared contracts.
 - `internal/react/protocol`, `internal/react/kube`, `internal/react/prompt`, `internal/react/provider`, `internal/react/language`: transport, Kubernetes policy, prompt, provider, and translation boundaries.
 - `internal/toolconnector`: kubectl-ai tool registry integration and MCP config sync.
@@ -38,6 +38,12 @@ The project intentionally owns the ReAct loop, approval UX, prompt rendering, ou
 ## ReAct Loop and Prompt Rules
 
 - `internal/react` owns the ReAct loop; `react.go` is its facade and `coordinator` runs it.
+- Native function calls and shim JSON must normalize to the same typed model-output contract before domain consumers change state.
+- Model-turn state changes must use the revisioned session candidate/commit path. Tool execution, guidance lookup, translation, and user message emission happen after the accepted state commit.
+- Command actions must declare risk metadata. Approved actions become immutable dispatch intents and pending attempts before external invocation; an uncertain mutation is never automatically re-dispatched.
+- Accepted phase plans are projected to stable goal/phase/step/criterion IDs. Actions bind to the runtime-selected active step; model-supplied step references are assertions, not authority.
+- `phase_plan_revision` may replace only the active and remaining nonterminal graph. An active verification blocks replacement; a closed unknown obligation stays outside that graph and must remain preserved. Revisions must cite existing evidence and preserve completed history, lineage, request-fixed budgets, and unresolved obligations.
+- Mutation verification distinguishes an explicitly disproved state from an unknown outcome. Only unknown/cancelled outcomes remain unresolved obligations that force an inconclusive final report.
 - `prompts/default.tmpl` is the main prompt path.
 - Tool/function calling and shim mode must both remain supported.
 - Shim mode expects a single JSON object in a `json` code block and is repaired by `internal/react/protocol/shim.go` before coordinator consumption.
@@ -51,7 +57,7 @@ The project intentionally owns the ReAct loop, approval UX, prompt rendering, ou
 - Config key: `readonly`.
 - CLI flag: `--read-only`.
 - Meta command: `/readonly on|off|status`.
-- Read-only mode must block Kubernetes resource mutations even if the user previously selected “do not ask again.”
+- Read-only mode must block Kubernetes resource mutations independently of command risk approval.
 - Non-mutating kubectl calls such as `get`, `describe`, `logs`, `top`, `api-resources`, `api-versions`, `version`, `config`, and `auth` may run.
 - Read-only pipelines are allowed only when the first segment is read-only kubectl and later segments are safe local text processors such as `tail`, `head`, `grep`, `awk`, `sed`, `sort`, `uniq`, `wc`, `cut`, `jq`, `yq`, or `column`.
 - Pipelines containing mutating kubectl verbs must be blocked. Example: `kubectl get pod app -o yaml | kubectl apply -f -` is forbidden.

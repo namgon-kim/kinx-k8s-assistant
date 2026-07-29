@@ -209,12 +209,18 @@ k8s-assistant는 LLM이 리소스 이름만 보고 custom resource 여부를 맞
 4. 예전 target 값 대신 새 `target.category`와 `resource_candidates` 계약만 사용합니다.
 5. `target.category`와 `scope.type`은 권장값을 우선 쓰되, 자연어 표현을 막지 않도록 런타임 enum으로 강제하지 않습니다.
 6. `resource_candidates`가 비어 있으면 Kubernetes 리소스 컨텍스트와 CRD resource guide/RAG 조회를 만들지 않습니다.
-7. model은 `phase_plan`을 선언하고 필요한 live observation을 먼저 수행합니다.
-8. primary Kubernetes 리소스 후보가 있을 때만 런타임이 discovery로 built-in/CRD 여부를 확인합니다.
-9. CRD 확인만으로 RAG를 자동 실행하지 않습니다. model이 accepted plan의 `guidance_lookup` phase에 진입해야 합니다.
-10. 해당 phase에서만 `resource_guide_lookup`을 받아 resource guide/RAG를 조회합니다.
-11. guide 결과에 근거가 있을 때만 해당 CRD family 전용 주의사항과 nested diagnostic step을 주입합니다.
-12. 조회가 불가능하거나 결과가 없으면 guide를 가정하지 않고 일반 kubectl evidence와 model 판단으로 진행합니다.
+7. model은 `phase_plan`을 선언하고, runtime은 이를 안정적인 goal/phase/step 실행 계약으로 고정합니다.
+8. 각 action은 현재 active step에 연결되고, 실행 시도와 observation은 같은 goal lineage에 누적됩니다.
+9. 기존 계획이 새 observation과 맞지 않으면 model은 근거 observation을 인용한 별도 `phase_plan_revision`으로 남은 계획을 수정할 수 있습니다. runtime은 완료 이력, mutation verification 같은 필수 절차, lineage와 재시도 budget이 보존되는지 확인합니다.
+10. command tool action은 `risk.risky`를 명시합니다. `risky=true` command는 exact command와 이유를 사용자가 확인한 뒤 실행되며 영구 승인 생략 선택은 없습니다.
+11. Runtime admission을 통과한 action은 immutable dispatch intent와 attempt로 먼저 commit됩니다. 실행 결과를 commit하지 못한 mutation은 자동 재실행하지 않고 unknown verification 대상으로 남깁니다.
+12. state-bearing evidence가 expected state를 명시적으로 반증한 verification failure는 다른 action 또는 evidence-backed plan revision으로 이어질 수 있습니다. 실행 여부가 불확실한 unknown만 unresolved obligation으로 남아 conclusive report를 막습니다.
+13. `Forbidden`/`Unauthorized` 관찰은 대상 상태가 아니라 접근 차단을 증명합니다. 같은 명령을 반복하지 않으며, 대체 관찰이 없고 요청 달성에 RBAC 변경이 실제로 필요하면 model은 이를 별도의 `risk.risky=true` mutation으로 제안하고 runtime은 정확한 명령을 사용자에게 승인받습니다.
+14. primary Kubernetes 리소스 후보가 있을 때만 런타임이 discovery로 built-in/CRD 여부를 확인합니다.
+15. CRD 확인만으로 RAG를 자동 실행하지 않습니다. model이 accepted plan의 `guidance_lookup` phase에 진입해야 합니다.
+16. 해당 phase에서만 `resource_guide_lookup`을 받아 resource guide/RAG를 조회합니다.
+17. guide 결과에 근거가 있을 때만 해당 CRD family 전용 주의사항과 nested diagnostic step을 주입합니다.
+18. 조회가 불가능하거나 결과가 없으면 guide를 가정하지 않고 일반 kubectl evidence와 model 판단으로 진행합니다.
 
 예: `tenant-a의 Cluster demo가 준비되지 않는 원인을 확인해줘`라는 요청은 먼저 Cluster와
 관련 객체의 live status를 관찰합니다. discovery가 Cluster를 CRD로 확인하고 plan이

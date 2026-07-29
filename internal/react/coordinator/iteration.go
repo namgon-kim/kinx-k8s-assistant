@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,8 +37,8 @@ func (l *Loop) runIteration(ctx context.Context) error {
 func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
 	var remaining []gollm.FunctionCall
 	for _, call := range calls {
-		if call.Name == internalRequirementAnalysisCall {
-			if l.requirementAnalysis != nil {
+		if call.Name == protocol.RequirementAnalysisCall {
+			if l.mutableRuntime().requirementAnalysis != nil {
 				continue
 			}
 			analysis, ok := requirementAnalysisFromFunctionCall(call)
@@ -46,8 +47,7 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 				return nil, l.applyModelOutputCorrectionGate("invalid_requirement_analysis", "반복된 requirement analysis 오류로 루프를 중단했습니다.", message)
 			}
 			analysis = l.applyPriorContextToFollowUpRequirementAnalysis(analysis)
-			l.requirementAnalysis = &analysis
-			l.mutableSession().Context.Requirement = &analysis
+			l.mutableRuntime().requirementAnalysis = &analysis
 			klog.V(0).InfoS("requirement analysis accepted",
 				"request_type", analysis.RequestType,
 				"action", analysis.Action,
@@ -57,39 +57,40 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 			if message, needsClarification := requirementAnalysisClarificationMessage(analysis); needsClarification {
 				klog.V(0).InfoS("requirement analysis needs clarification", "message_len", len(message))
 				l.addMessage(api.MessageSourceModel, api.MessageTypeText, message)
-				l.pendingCalls = nil
-				l.currIteration = 0
-				l.transitionControl(RuntimeControlAwaitingUserQuery)
-				return nil, true
-			}
-			if err := l.resetChatSessionAfterRequirementAnalysis(); err != nil {
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "requirement analysis 후 세션 초기화 실패: "+err.Error())
-				l.pendingCalls = nil
-				l.currIteration = 0
+				l.mutableRuntime().pendingCalls = nil
+				l.mutableRuntime().currIteration = 0
 				l.transitionControl(RuntimeControlAwaitingUserQuery)
 				return nil, true
 			}
 			if request, ok := requestContextFromRequirementAnalysis(analysis); ok {
-				l.requestContext = &request
-				l.mutableSession().Context.Request = &request
-				classification := l.classifyResourceByDiscovery(ctx, request.PrimaryTarget.Resource)
-				l.resourceClassification = &classification
+				l.mutableRuntime().requestContext = &request
 				klog.V(0).InfoS("request context derived from requirement analysis",
 					"primary_resource", request.PrimaryTarget.Resource,
 					"primary_name_set", strings.TrimSpace(request.PrimaryTarget.Name) != "",
 					"namespace_set", strings.TrimSpace(request.Scope.Namespace) != "",
-					"classification", classification.Kind,
 				)
 			}
-			l.currIteration++
+			if l.activeTransaction == nil {
+				if err := l.resetChatSessionAfterRequirementAnalysis(); err != nil {
+					l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "requirement analysis 후 세션 초기화 실패: "+err.Error())
+					l.mutableRuntime().pendingCalls = nil
+					l.mutableRuntime().currIteration = 0
+					l.transitionControl(RuntimeControlAwaitingUserQuery)
+					return nil, true
+				}
+				l.classifyAcceptedRequestResource(ctx)
+			} else if err := l.queueTurnEffect(contract.Effect{Kind: contract.EffectPrepareRequest}); err != nil {
+				return nil, l.applyModelOutputCorrectionGate("request_prepare_effect_queue", "request 준비 상태를 만들지 못했습니다.", err.Error())
+			}
+			l.mutableRuntime().currIteration++
 			l.transitionControl(RuntimeControlAwaitingPhasePlan)
 			return nil, true
 		}
-		if call.Name != internalRequestContextCall {
+		if call.Name != protocol.RequestContextCall {
 			remaining = append(remaining, call)
 			continue
 		}
-		if l.requestContext != nil {
+		if l.mutableRuntime().requestContext != nil {
 			continue
 		}
 		request, ok := requestContextFromFunctionCall(call)
@@ -97,10 +98,9 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 			message := "Request context was invalid. Return only one corrected request_context object before choosing any action. Namespace is a scope field unless the user explicitly asks about a Namespace object; do not set primary_target.resource=namespace while also setting scope.namespace. Do not use primary_target.resource=unknown; resource_class=unknown is allowed only as a classification hint. If no concrete resource kind is identifiable, return a final answer asking for clarification instead of inventing a kubectl action."
 			return nil, l.applyModelOutputCorrectionGate("invalid_request_context", "반복된 request context 오류로 루프를 중단했습니다.", message)
 		}
-		l.requestContext = &request
-		l.mutableSession().Context.Request = &request
+		l.mutableRuntime().requestContext = &request
 		classification := l.classifyResourceByDiscovery(ctx, request.PrimaryTarget.Resource)
-		l.resourceClassification = &classification
+		l.mutableRuntime().resourceClassification = &classification
 		klog.V(0).InfoS("request context accepted",
 			"primary_resource", request.PrimaryTarget.Resource,
 			"primary_name_set", strings.TrimSpace(request.PrimaryTarget.Name) != "",
@@ -111,9 +111,23 @@ func (l *Loop) consumeRequestContext(ctx context.Context, calls []gollm.Function
 	return remaining, false
 }
 
+func (l *Loop) classifyAcceptedRequestResource(ctx context.Context) {
+	request := l.mutableRuntime().requestContext
+	if request == nil {
+		l.mutableRuntime().resourceClassification = nil
+		return
+	}
+	classification := l.classifyResourceByDiscovery(ctx, request.PrimaryTarget.Resource)
+	l.mutableRuntime().resourceClassification = &classification
+	klog.V(0).InfoS("accepted request resource classified",
+		"primary_resource", request.PrimaryTarget.Resource,
+		"classification", classification.Kind,
+	)
+}
+
 func (l *Loop) applyPriorContextToFollowUpRequirementAnalysis(analysis requirementAnalysis) requirementAnalysis {
 	if l.shouldRetryPreviousRequest(analysis) {
-		if prior := cloneRequirementAnalysis(l.lastRequirementAnalysis); prior != nil {
+		if prior := cloneRequirementAnalysis(l.mutableRuntime().lastRequirementAnalysis); prior != nil {
 			prior.OperationalFocus = retryPreviousOperationalFocus(prior.OperationalFocus)
 			prior.Evidence = append([]string{"Recompute the previous answer accurately from live evidence; do not rely on the prior assistant text."}, prior.Evidence...)
 			prior.Ambiguities = nil
@@ -123,7 +137,7 @@ func (l *Loop) applyPriorContextToFollowUpRequirementAnalysis(analysis requireme
 	if !l.shouldDefaultRequirementAnalysisFromPriorContext(analysis) {
 		return analysis
 	}
-	prior := l.lastRequestContext
+	prior := l.mutableRuntime().lastRequestContext
 	if prior == nil {
 		return analysis
 	}
@@ -168,10 +182,10 @@ func (l *Loop) applyPriorContextToFollowUpRequirementAnalysis(analysis requireme
 }
 
 func (l *Loop) shouldRetryPreviousRequest(analysis requirementAnalysis) bool {
-	if l.lastRequestContext == nil {
+	if l.mutableRuntime().lastRequestContext == nil {
 		return false
 	}
-	query := strings.ToLower(strings.TrimSpace(l.originalQuery))
+	query := strings.ToLower(strings.TrimSpace(l.mutableRuntime().originalQuery))
 	if query == "" {
 		return false
 	}
@@ -214,7 +228,7 @@ func retryPreviousOperationalFocus(focus *requirementOperationalFocus) *requirem
 }
 
 func (l *Loop) shouldDefaultRequirementAnalysisFromPriorContext(analysis requirementAnalysis) bool {
-	if l.lastRequestContext == nil || !isDiagnosticRequestType(analysis.RequestType, analysis.Action) {
+	if l.mutableRuntime().lastRequestContext == nil || !isDiagnosticRequestType(analysis.RequestType, analysis.Action) {
 		return false
 	}
 	if !operationalFocusUsesPreviousPrimary(analysis.OperationalFocus) {
@@ -552,19 +566,6 @@ func stringSliceFromArgument(value any) []string {
 	return out
 }
 
-func (l *Loop) requireRequirementAnalysisBeforeAction(calls []gollm.FunctionCall) bool {
-	if l.requirementAnalysis != nil {
-		return false
-	}
-	for _, call := range calls {
-		if call.Name == internalRequirementAnalysisCall {
-			return false
-		}
-	}
-	message := "The first response for this user request must be only a requirement_analysis object. Identify request_type, action, target.category, target.description, scope.type, resource_candidates, optional operational_focus, evidence_needs, constraints, and ambiguities before selecting any tool, resource guide lookup, or final answer. Do not turn a broad cluster/environment target into a Kubernetes Cluster resource unless the user names a concrete Cluster object."
-	return l.applyModelOutputCorrectionGate("missing_requirement_analysis", "반복된 requirement analysis 누락으로 루프를 중단했습니다.", message)
-}
-
 func requestContextFromFunctionCall(call gollm.FunctionCall) (requestContext, bool) {
 	var request requestContext
 	primaryRaw, ok := call.Arguments["primary_target"].(map[string]any)
@@ -607,18 +608,18 @@ func (l *Loop) resetChatSessionAfterRequirementAnalysis() error {
 	if err := l.resetChatSession(); err != nil {
 		return err
 	}
-	l.currChatContent = []any{
+	l.mutableRuntime().currChatContent = []any{
 		l.requirementAnalysisContextMessage(),
-		l.originalQuery,
+		l.mutableRuntime().originalQuery,
 	}
-	l.contextBlockHashes = nil
+	l.mutableRuntime().contextBlockHashes = nil
 	return nil
 }
 
 func (l *Loop) requirementAnalysisContextMessage() string {
 	var raw []byte
-	if l.requirementAnalysis != nil {
-		raw, _ = json.Marshal(l.requirementAnalysis)
+	if l.mutableRuntime().requirementAnalysis != nil {
+		raw, _ = json.Marshal(l.mutableRuntime().requirementAnalysis)
 	}
 	return fmt.Sprintf("Accepted requirement_analysis:\n%s\nUse this analysis as the request classification. If resource_candidates is empty, do not invent a Kubernetes resource target. If operational_focus is present, treat it as the current diagnostic angle, not as an automatic RAG request. Your next response must be only a `phase_plan` object that defines ordered `phase_steps`, each with goal, completion_condition, and allowed_next. Do not choose an action, resource_guide_lookup, final_report, or answer until the phase_plan is accepted.", string(raw))
 }
@@ -629,10 +630,10 @@ func (l *Loop) requirementAnalysisContextMessage() string {
 // appendGuideObservation; this anchor re-emits just enough lifecycle for the
 // model to know which step it is on and what is left to do.
 func (l *Loop) guideStepAnchor() string {
-	if l.phaseStepState != nil && !strings.EqualFold(l.phaseStepState.currentStep().Name, "guided_diagnosis") {
+	if l.mutableRuntime().phaseStepState != nil && !strings.EqualFold(l.mutableRuntime().phaseStepState.currentStep().Name, "guided_diagnosis") {
 		return ""
 	}
-	guide := l.guideStepState
+	guide := l.mutableRuntime().guideStepState
 	if guide == nil || guide.TotalSteps == 0 {
 		return ""
 	}
@@ -711,19 +712,19 @@ func formatStepIndices(indices []int) string {
 // the analysis JSON because (a) chat history attention decays over many
 // iterations and (b) tool observations otherwise dominate the recent context.
 func (l *Loop) requirementAnalysisAnchor() string {
-	if l.requirementAnalysis == nil {
+	if l.mutableRuntime().requirementAnalysis == nil {
 		return ""
 	}
-	raw, err := json.Marshal(l.requirementAnalysis)
+	raw, err := json.Marshal(l.mutableRuntime().requirementAnalysis)
 	if err != nil {
 		return ""
 	}
 	var b strings.Builder
 	b.WriteString("Active request anchor. Treat this as the authoritative classification of the user request you are still serving; reaffirm it on every iteration.\n")
-	fmt.Fprintf(&b, "original_query: %s\n", l.originalQuery)
+	fmt.Fprintf(&b, "original_query: %s\n", l.mutableRuntime().originalQuery)
 	fmt.Fprintf(&b, "requirement_analysis: %s\n", string(raw))
-	if l.requestContext != nil {
-		if ctx, err := json.Marshal(l.requestContext); err == nil {
+	if l.mutableRuntime().requestContext != nil {
+		if ctx, err := json.Marshal(l.mutableRuntime().requestContext); err == nil {
 			fmt.Fprintf(&b, "request_context: %s\n", string(ctx))
 		}
 	}
@@ -753,11 +754,11 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 	var remaining []gollm.FunctionCall
 	var accepted *phasePlan
 	for _, call := range calls {
-		if call.Name != internalPhasePlanCall {
+		if call.Name != protocol.PhasePlanCall {
 			remaining = append(remaining, call)
 			continue
 		}
-		if l.phaseStepState != nil {
+		if l.mutableRuntime().phaseStepState != nil {
 			continue
 		}
 		plan, ok := phasePlanFromFunctionCall(call)
@@ -771,24 +772,16 @@ func (l *Loop) consumePhasePlan(calls []gollm.FunctionCall) ([]gollm.FunctionCal
 			}
 		}
 		accepted = &plan
-		l.phaseStepState = newPhaseStepState(plan)
-		l.mutableSession().Phase.Plan = &plan
-		l.session.Phase.Current = reactPhaseRef(l.phaseStepState.activePhaseRef())
+		l.mutableRuntime().phaseStepState = newPhaseStepState(plan)
+		l.acceptGoalExecutionPlan(plan)
 		klog.V(1).InfoS("phase plan accepted", "request_goal", trimForLog(plan.RequestGoal, 160), "phase_steps", len(plan.PhaseSteps), "current_phase_index", plan.CurrentPhaseIndex)
 		continue
 	}
 	if accepted != nil {
 		if len(remaining) == 0 {
-			l.currIteration++
+			l.mutableRuntime().currIteration++
 			l.transitionAfterPhaseAdvance()
 			return nil, true
-		}
-		if !phasePlanAllowsTrailingCalls(*accepted, remaining) {
-			message := "Phase plan was accepted, but the same response also included additional structured output. Return only the phase_plan object first, except for a single-step lightweight_lookup phase where exactly one action may be included with the phase_plan."
-			l.phaseStepState = nil
-			l.mutableSession().Phase.Reset()
-			l.transitionControl(RuntimeControlAwaitingPhasePlan)
-			return nil, l.applyModelOutputCorrectionGate("phase_plan_unexpected_trailing_calls", "반복된 phase plan 동시 출력 오류로 루프를 중단했습니다.", message)
 		}
 		// The lightweight_lookup exception can retain one action after its plan.
 		// It still needs the same explicit phase-derived control transition as a
@@ -851,16 +844,10 @@ func (l *Loop) validatePhasePlanForRequest(plan phasePlan) phasePlanValidationRe
 }
 
 func (l *Loop) consumePhaseProgress(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
-	for _, call := range calls {
-		if call.Name == internalPhaseProgressCall && !onlyFunctionCall(calls, internalPhaseProgressCall) {
-			message := "phase_progress must be the only structured output in a response. Do not combine phase_progress with an action, guide_progress, final_report, or another internal call. Return phase_progress first; wait for the runtime to accept the phase transition before choosing the next action."
-			return nil, l.applyModelOutputCorrectionGate("phase_progress_mixed_output", "phase_progress와 다른 call을 함께 반환해 현재 phase를 전진시키지 않았습니다.", message)
-		}
-	}
 	var remaining []gollm.FunctionCall
 	handled := false
 	for _, call := range calls {
-		if call.Name != internalPhaseProgressCall {
+		if call.Name != protocol.PhaseProgressCall {
 			remaining = append(remaining, call)
 			continue
 		}
@@ -873,22 +860,160 @@ func (l *Loop) consumePhaseProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 			message := "The active guided_diagnosis phase still has incomplete resource-guide steps. Continue with exactly one remaining guide step or return guide_progress only after useful live evidence completes that step. Do not emit phase_progress until all nested guide steps are complete."
 			return nil, l.applyModelOutputCorrectionGate("guided_diagnosis_incomplete", "남은 guide step이 있어 guided_diagnosis phase를 완료하지 않았습니다.", message)
 		}
-		if !ok || l.phaseStepState == nil || !l.phaseStepState.acceptProgress(progress) {
+		if ok && !l.executionPhaseReadyForProgress(progress.PhaseCompleted) {
+			message := "The active phase cannot complete until every execution step is achieved. Return step_result for the active step with its criterion IDs and existing observation references, or continue with another action within the remaining attempt budget."
+			return nil, l.applyModelOutputCorrectionGate("phase_progress_incomplete_execution_step", "완료되지 않은 execution step이 있어 phase를 전진시키지 않았습니다.", message)
+		}
+		if !ok || l.mutableRuntime().phaseStepState == nil || !l.mutableRuntime().phaseStepState.acceptProgress(progress) {
 			message := "Phase progress was invalid. Return one corrected phase_progress object for the active phase, or continue the active phase with one valid action. Do not use guide_progress for top-level phase completion."
 			return nil, l.applyModelOutputCorrectionGate("invalid_phase_progress", "반복된 phase progress 오류로 루프를 중단했습니다.", message)
 		}
-		if l.guideStepState != nil && strings.EqualFold(l.phaseStepState.phaseName(progress.PhaseCompleted), "guided_diagnosis") {
-			l.guideStepState = nil
+		l.completeExecutionPhase(progress)
+		if l.mutableRuntime().guideStepState != nil && strings.EqualFold(l.mutableRuntime().phaseStepState.phaseName(progress.PhaseCompleted), "guided_diagnosis") {
+			l.mutableRuntime().guideStepState = nil
 		}
-		klog.V(0).InfoS("phase progress accepted", "phase_completed", progress.PhaseCompleted, "current_phase", l.phaseStepState.CurrentPhaseIndex)
+		klog.V(0).InfoS("phase progress accepted", "phase_completed", progress.PhaseCompleted, "current_phase", l.mutableRuntime().phaseStepState.CurrentPhaseIndex)
 		handled = true
 	}
 	if handled && len(remaining) == 0 {
-		l.currIteration++
+		l.mutableRuntime().currIteration++
 		l.transitionAfterPhaseAdvance()
 		return nil, true
 	}
 	return remaining, false
+}
+
+func (l *Loop) consumeStepResult(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
+	var remaining []gollm.FunctionCall
+	for _, call := range calls {
+		if call.Name != protocol.StepResultCall {
+			remaining = append(remaining, call)
+			continue
+		}
+		result, ok := stepResultFromFunctionCall(call)
+		if !ok || !l.applyStepResult(result) {
+			return nil, l.applyModelOutputCorrectionGate(
+				"invalid_step_result",
+				"step_result가 active execution contract와 맞지 않아 step을 변경하지 않았습니다.",
+				"Return one corrected step_result for the active step. Use the exact active step_id and criterion_id values from the goal execution anchor, and reference only existing observation IDs. achieved requires every completion criterion to be satisfied with evidence.",
+			)
+		}
+		l.appendFunctionCallResult(call, map[string]any{
+			"status":  "recorded",
+			"step_id": result.StepID,
+		})
+		l.mutableRuntime().currIteration++
+		return nil, true
+	}
+	return remaining, false
+}
+
+func stepResultFromFunctionCall(call gollm.FunctionCall) (stepResult, bool) {
+	raw, err := json.Marshal(call.Arguments)
+	if err != nil {
+		return stepResult{}, false
+	}
+	var result stepResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return stepResult{}, false
+	}
+	if strings.TrimSpace(result.StepID) == "" {
+		return stepResult{}, false
+	}
+	switch result.Status {
+	case contract.StepResultAchieved, contract.StepResultBlocked, contract.StepResultReplanRequired:
+		return result, true
+	default:
+		return stepResult{}, false
+	}
+}
+
+func (l *Loop) applyStepResult(result stepResult) bool {
+	snapshot := l.RuntimeSnapshot()
+	var active *StepRuntimeState
+	for i := range snapshot.ActiveSteps {
+		if snapshot.ActiveSteps[i].Status == StepActive && snapshot.ActiveSteps[i].Ref.ID == result.StepID {
+			active = &snapshot.ActiveSteps[i]
+			break
+		}
+	}
+	if active == nil {
+		return false
+	}
+	for _, ref := range result.EvidenceRefs {
+		if !l.observationExists(ref) {
+			return false
+		}
+	}
+	if active.Ref.Kind == StepResourceGuideDiagnostic {
+		if result.Status != contract.StepResultAchieved || len(result.EvidenceRefs) == 0 {
+			return false
+		}
+		l.markGuideStepCompleted(active.Ref.Index)
+		l.resetCorrectionScope(string(RetryScopeCurrentStep), "", result.StepID)
+		l.requestPostGuideCompletionDirective()
+		return true
+	}
+	if active.Ref.Kind == StepMutationEvidenceRequirement {
+		// Mutation verification is closed only by the dedicated typed result;
+		// step_result must not bypass its satisfied/waiting/failed decision.
+		return false
+	}
+	execution := l.mutableRuntime().execution
+	step := l.activeExecutionStep()
+	if execution == nil || step == nil || step.ID != result.StepID {
+		return false
+	}
+	criteria := make(map[string]contract.CriterionContract, len(step.CompletionCriteria))
+	for _, criterion := range step.CompletionCriteria {
+		criteria[criterion.ID] = criterion
+	}
+	seen := map[string]bool{}
+	validatedResults := make(map[string]contract.CriterionResult, len(result.Criteria))
+	for _, criterionResult := range result.Criteria {
+		if _, ok := criteria[criterionResult.CriterionID]; !ok {
+			return false
+		}
+		if _, duplicate := validatedResults[criterionResult.CriterionID]; duplicate {
+			return false
+		}
+		for _, ref := range criterionResult.EvidenceRefs {
+			if !l.observationExists(ref) {
+				return false
+			}
+		}
+		validatedResults[criterionResult.CriterionID] = criterionResult
+		if criterionResult.Satisfied && len(criterionResult.EvidenceRefs) > 0 {
+			seen[criterionResult.CriterionID] = true
+		}
+	}
+	if result.Status == contract.StepResultAchieved {
+		for id := range criteria {
+			if !seen[id] {
+				return false
+			}
+		}
+	} else if strings.TrimSpace(result.RemainingGap) == "" {
+		return false
+	}
+	for id, criterionResult := range validatedResults {
+		execution.CriterionResults[id] = criterionResult
+	}
+	if result.Status == contract.StepResultAchieved {
+		execution.StepStatus[step.ID] = StepAchieved
+		l.resetCorrectionScope(string(RetryScopeCurrentStep), "", step.ID)
+		if l.activateNextExecutionStep() {
+			l.queueResponseDirective("The previous execution step is achieved. Continue with the newly active step and bind the next action to it.")
+		} else {
+			l.queueResponseDirective("All execution steps in the active phase are achieved. Return phase_progress for the active phase before choosing another action.")
+		}
+		return true
+	}
+	execution.StepStatus[step.ID] = StepBlocked
+	execution.ActiveStepID = ""
+	l.resetCorrectionScope(string(RetryScopeCurrentStep), "", step.ID)
+	l.queueResponseDirective("The active step is recorded as blocked or replan_required. Return one evidence-grounded phase_plan_revision when the active or remaining graph must change; otherwise return an inconclusive final_report. Do not repeat the same action.")
+	return true
 }
 
 // transitionAfterPhaseAdvance selects the next runtime obligation at the one
@@ -896,19 +1021,11 @@ func (l *Loop) consumePhaseProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 // derive control for snapshots; it records the explicit transition caused by
 // an accepted phase plan or phase_progress event.
 func (l *Loop) transitionAfterPhaseAdvance() {
-	if l.phaseStepState != nil {
-		state := l.mutableSession()
-		state.Phase.Current = reactPhaseRef(l.phaseStepState.activePhaseRef())
-		state.Phase.Completed = make(map[int]bool, len(l.phaseStepState.Completed))
-		for index, completed := range l.phaseStepState.Completed {
-			state.Phase.Completed[index] = completed
-		}
-	}
 	if l.phaseStepRequiresResourceGuideLookup() {
 		l.transitionControl(RuntimeControlAwaitingResourceGuideLookup)
 		return
 	}
-	if l.guideStepState != nil && len(l.guideStepState.remainingSteps()) > 0 {
+	if l.mutableRuntime().guideStepState != nil && len(l.mutableRuntime().guideStepState.remainingSteps()) > 0 {
 		l.transitionControl(RuntimeControlAwaitingGuidedDiagnosisStep)
 		return
 	}
@@ -916,63 +1033,31 @@ func (l *Loop) transitionAfterPhaseAdvance() {
 }
 
 func (l *Loop) phaseProgressBlockedByGuidanceLookup(progress phaseProgress) bool {
-	if l.phaseStepState == nil {
+	if l.mutableRuntime().phaseStepState == nil {
 		return false
 	}
-	current := l.phaseStepState.currentStep()
+	current := l.mutableRuntime().phaseStepState.currentStep()
 	if !strings.EqualFold(strings.TrimSpace(current.Name), "guidance_lookup") {
 		return false
 	}
 	if progress.PhaseCompleted != current.Index {
 		return false
 	}
-	if l.resourceGuideInjected {
+	if l.mutableRuntime().resourceGuideInjected {
 		return false
 	}
-	if l.resourceClassification == nil || l.resourceClassification.Kind != resourceClassificationCRD {
+	if l.mutableRuntime().resourceClassification == nil || l.mutableRuntime().resourceClassification.Kind != resourceClassificationCRD {
 		return false
 	}
 	return true
 }
 
 func (l *Loop) phaseProgressBlockedByIncompleteGuide(progress phaseProgress) bool {
-	if l.phaseStepState == nil || l.guideStepState == nil || l.guideStepState.allCompleted() {
+	if l.mutableRuntime().phaseStepState == nil || l.mutableRuntime().guideStepState == nil || l.mutableRuntime().guideStepState.allCompleted() {
 		return false
 	}
-	current := l.phaseStepState.currentStep()
+	current := l.mutableRuntime().phaseStepState.currentStep()
 	return strings.EqualFold(strings.TrimSpace(current.Name), "guided_diagnosis") && progress.PhaseCompleted == current.Index
-}
-
-func (l *Loop) requirePhasePlanBeforeAction(calls []gollm.FunctionCall) bool {
-	if l.requirementAnalysis == nil || l.phaseStepState != nil {
-		return false
-	}
-	for _, call := range calls {
-		switch call.Name {
-		case internalPhasePlanCall, internalRequirementAnalysisCall, internalRequestContextCall:
-			return false
-		}
-	}
-	message := "After requirement_analysis is accepted, return only one phase_plan object before choosing any action, resource_guide_lookup, final_report, or answer. The plan must define ordered phase_steps, each with a goal, completion_condition, and allowed_next values that reference only declared phase_steps[].name entries."
-	return l.applyModelOutputCorrectionGate("missing_phase_plan", "반복된 phase plan 누락으로 루프를 중단했습니다.", message)
-}
-
-func (l *Loop) rejectInvalidShimStructuredCalls(calls []gollm.FunctionCall) bool {
-	for _, call := range calls {
-		var code, message string
-		switch call.Name {
-		case internalInvalidActionCall:
-			code = "invalid_action"
-			message = "Action payload was invalid. Re-emit one corrected response with `action` as an object containing name, reason, target, command, and modifies_resource. Do not encode action as a string."
-		case internalInvalidStructuredOutputCall:
-			code = "mixed_answer_structured_output"
-			message = "The previous response included `answer` together with another structured output. Return exactly one structured output. If a tool, phase_plan, phase_progress, resource_guide_lookup, final_report, or next_directions is needed, omit `answer`; if you are answering the user, omit all other structured fields."
-		default:
-			continue
-		}
-		return l.applyModelOutputCorrectionGate(code, "반복된 shim structured output 오류로 루프를 중단했습니다.", message)
-	}
-	return false
 }
 
 func phasePlanFromFunctionCall(call gollm.FunctionCall) (phasePlan, bool) {
@@ -1001,13 +1086,6 @@ func phasePlanFromFunctionCall(call gollm.FunctionCall) (phasePlan, bool) {
 	return plan, phasePlanValid(plan)
 }
 
-func phasePlanAllowsTrailingCalls(plan phasePlan, calls []gollm.FunctionCall) bool {
-	if len(calls) != 1 || !singleLightweightPhase(plan) {
-		return false
-	}
-	return !isInternalReactCall(calls[0].Name)
-}
-
 func singleLightweightPhase(plan phasePlan) bool {
 	if len(plan.PhaseSteps) != 1 {
 		return false
@@ -1020,9 +1098,9 @@ func (l *Loop) phasePlanRequiresMutationVerification(plan phasePlan) bool {
 	if l != nil && l.cfg != nil && l.cfg.ReadOnly {
 		return false
 	}
-	if l != nil && l.requirementAnalysis != nil {
-		requestType := strings.ToLower(strings.TrimSpace(l.requirementAnalysis.RequestType))
-		action := strings.ToLower(strings.TrimSpace(l.requirementAnalysis.Action))
+	if l != nil && l.mutableRuntime().requirementAnalysis != nil {
+		requestType := strings.ToLower(strings.TrimSpace(l.mutableRuntime().requirementAnalysis.RequestType))
+		action := strings.ToLower(strings.TrimSpace(l.mutableRuntime().requirementAnalysis.Action))
 		if requestType == "mutation" || actionRequiresMutationVerification(action) {
 			return true
 		}
@@ -1092,12 +1170,8 @@ func normalizedPhaseName(name string) string {
 
 func (l *Loop) phasePlanAllowsResourceGuidance() bool {
 	return l != nil &&
-		l.resourceClassification != nil &&
-		l.resourceClassification.Kind == resourceClassificationCRD
-}
-
-func isInternalReactCall(name string) bool {
-	return strings.HasPrefix(strings.TrimSpace(name), "__")
+		l.mutableRuntime().resourceClassification != nil &&
+		l.mutableRuntime().resourceClassification.Kind == resourceClassificationCRD
 }
 
 func phaseStepsFromValue(value any) ([]phaseStep, bool) {
@@ -1181,10 +1255,6 @@ func phaseExecutionStepValid(step phaseExecutionStep) bool {
 	return phaseflow.ExecutionStepValid(step)
 }
 
-func phaseExecutionStepsValid(steps []phaseExecutionStep) bool {
-	return phaseflow.ExecutionStepsValid(steps)
-}
-
 func phasePlanValid(plan phasePlan) bool {
 	return phaseflow.Validate(plan)
 }
@@ -1223,10 +1293,18 @@ func (s *phaseStepState) activePhaseRef() PhaseRef {
 }
 
 func (l *Loop) currentPhaseRef() PhaseRef {
-	if l == nil || l.phaseStepState == nil {
+	if l == nil || l.mutableRuntime().phaseStepState == nil {
 		return PhaseRef{}
 	}
-	return l.phaseStepState.activePhaseRef()
+	if phase := l.activeExecutionPhase(); phase != nil {
+		return PhaseRef{
+			ID:        phase.ID,
+			LineageID: phase.PhaseLineageID,
+			Index:     phase.Index,
+			Name:      phase.Name,
+		}
+	}
+	return l.mutableRuntime().phaseStepState.activePhaseRef()
 }
 
 func (s *phaseStepState) runtimeState() *PhaseRuntimeState {
@@ -1482,7 +1560,7 @@ func (s *phaseStepState) firstIncompleteAfter(index int) int {
 }
 
 func (l *Loop) phaseStepAnchor() string {
-	state := l.phaseStepState
+	state := l.mutableRuntime().phaseStepState
 	if state == nil {
 		return ""
 	}
@@ -1506,13 +1584,13 @@ func (l *Loop) phaseStepAnchor() string {
 	if len(current.AllowedNext) > 0 {
 		fmt.Fprintf(&b, "allowed_next_phases: %s\n", strings.Join(current.AllowedNext, ","))
 	}
-	if l.resourceClassification != nil {
-		fmt.Fprintf(&b, "resource_classification: %s\n", l.resourceClassification.Kind)
-		if l.resourceClassification.Source != "" {
-			fmt.Fprintf(&b, "resource_classification_source: %s\n", l.resourceClassification.Source)
+	if l.mutableRuntime().resourceClassification != nil {
+		fmt.Fprintf(&b, "resource_classification: %s\n", l.mutableRuntime().resourceClassification.Kind)
+		if l.mutableRuntime().resourceClassification.Source != "" {
+			fmt.Fprintf(&b, "resource_classification_source: %s\n", l.mutableRuntime().resourceClassification.Source)
 		}
-		if l.resourceClassification.APIGroup != "" {
-			fmt.Fprintf(&b, "resource_api_group: %s\n", l.resourceClassification.APIGroup)
+		if l.mutableRuntime().resourceClassification.APIGroup != "" {
+			fmt.Fprintf(&b, "resource_api_group: %s\n", l.mutableRuntime().resourceClassification.APIGroup)
 		}
 	}
 	b.WriteString("Rules:\n")
@@ -1547,56 +1625,55 @@ func (l *Loop) requestOnlyGuidedDiagnosisPhaseProgress() bool {
 }
 
 func (l *Loop) enterGuidedDiagnosisPhase() bool {
-	if l.phaseStepState == nil {
+	if l.mutableRuntime().phaseStepState == nil {
 		return false
 	}
-	if index := l.phaseStepState.indexByName("guided_diagnosis"); index != 0 {
-		l.phaseStepState.CurrentPhaseIndex = index
-		delete(l.phaseStepState.Completed, index)
+	if index := l.mutableRuntime().phaseStepState.indexByName("guided_diagnosis"); index != 0 {
+		observationID := l.recordInternalObservation("resource_guide_lookup", "resource guide lookup completed and guidance context was recorded")
+		l.achieveActiveExecutionStep("resource guide lookup completed", []string{observationID})
+		currentIndex := l.mutableRuntime().phaseStepState.CurrentPhaseIndex
+		l.completeExecutionPhase(phaseProgress{
+			PhaseCompleted:   currentIndex,
+			EvidenceUseful:   true,
+			CompletionReason: "resource guide lookup completed",
+			NextPhase:        "guided_diagnosis",
+		})
+		l.mutableRuntime().phaseStepState.CurrentPhaseIndex = index
+		delete(l.mutableRuntime().phaseStepState.Completed, index)
+		l.activateExecutionPhase(index)
 		return true
 	}
 	return false
 }
 
 func (l *Loop) rewindPhaseBeforeGuidance() {
-	if l.phaseStepState == nil {
+	if l.mutableRuntime().phaseStepState == nil {
 		return
 	}
-	index := l.phaseStepState.preferredPreGuidanceIndex()
+	index := l.mutableRuntime().phaseStepState.preferredPreGuidanceIndex()
 	if index == 0 {
 		return
 	}
-	l.phaseStepState.CurrentPhaseIndex = index
-	for _, step := range l.phaseStepState.PhaseSteps {
+	l.mutableRuntime().phaseStepState.CurrentPhaseIndex = index
+	for _, step := range l.mutableRuntime().phaseStepState.PhaseSteps {
 		if step.Index >= index {
-			delete(l.phaseStepState.Completed, step.Index)
+			delete(l.mutableRuntime().phaseStepState.Completed, step.Index)
 		}
 	}
+	l.rewindExecutionToPhase(index)
 }
 
 func (l *Loop) phaseAllowsPlainAnswer() bool {
-	if l.phaseStepState == nil {
+	if l.mutableRuntime().phaseStepState == nil {
 		return true
 	}
-	name := strings.ToLower(strings.TrimSpace(l.phaseStepState.currentStep().Name))
+	name := strings.ToLower(strings.TrimSpace(l.mutableRuntime().phaseStepState.currentStep().Name))
 	switch name {
 	case lightweightLookupPhase, "response_synthesis", "clarification", "explanation", "final_report":
 		return true
 	default:
 		return false
 	}
-}
-
-func (l *Loop) rejectPlainAnswerOutsideResponsePhase() bool {
-	current := ""
-	if l.phaseStepState != nil {
-		current = l.phaseStepState.currentStep().Name
-	}
-	message := "Plain answers are only allowed from response_synthesis, clarification, explanation, or final_report phases. Complete or advance the active phase with phase_progress, or continue it with one valid action."
-	if current != "" {
-		message = fmt.Sprintf("Active phase is %q. %s", current, message)
-	}
-	return l.applyModelOutputCorrectionGate("plain_answer_wrong_phase", "잘못된 phase의 일반 응답이 반복되어 루프를 중단했습니다.", message)
 }
 
 func (s *phaseStepState) compactPlan() map[string]any {
@@ -1699,9 +1776,9 @@ func intFromAny(value any) int {
 	}
 }
 
-func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []gollm.FunctionCall) bool {
+func (l *Loop) handleRequestedResourceGuideLookup(calls []gollm.FunctionCall) bool {
 	for _, call := range calls {
-		if call.Name != internalResourceGuideLookupCall {
+		if call.Name != protocol.ResourceGuideLookupCall {
 			continue
 		}
 		klog.V(0).InfoS("resource guide lookup requested")
@@ -1712,7 +1789,7 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 		if !ok {
 			return l.applyModelOutputCorrectionGate("invalid_resource_guide_lookup", "resource_guide_lookup 형식 오류가 반복되어 진단을 중단합니다.", "Resource guide lookup request was invalid. Continue with the next safest kubectl diagnostic.")
 		}
-		if l.resourceClassification == nil || l.resourceClassification.Kind != resourceClassificationCRD {
+		if l.mutableRuntime().resourceClassification == nil || l.mutableRuntime().resourceClassification.Kind != resourceClassificationCRD {
 			return l.applyModelOutputCorrectionGate("resource_guide_without_confirmed_crd", "확인되지 않은 CRD resource_guide_lookup 요청이 반복되어 진단을 중단합니다.", "Resource guide lookup is only available after runtime discovery confirms the primary target is a CRD. Continue with the next safest kubectl diagnostic and do not infer a CRD or Cluster API family from the name alone.")
 		}
 		query := l.resourceGuideRefinementQuery(request)
@@ -1720,41 +1797,30 @@ func (l *Loop) handleRequestedResourceGuideLookup(ctx context.Context, calls []g
 			return l.applyModelOutputCorrectionGate("duplicate_resource_guide_lookup", "중복 resource_guide_lookup 요청이 반복되어 진단을 중단합니다.", "That refined resource-guide lookup was already performed for the same problem focus and evidence. Do not repeat it; choose the next kubectl diagnostic or answer from the evidence.")
 		}
 		klog.V(0).InfoS("resource guide lookup accepted", "resource_family", request.ResourceFamily, "query_len", len(query))
-		l.searchAndInjectResourceGuide(ctx, request.ResourceFamily, query)
+		if err := l.queueTurnEffect(contract.Effect{
+			Kind: contract.EffectLookupGuidance,
+			Payload: resourceGuideEffect{
+				Resource: request.ResourceFamily,
+				Query:    query,
+			},
+		}); err != nil {
+			return l.applyModelOutputCorrectionGate("resource_guide_effect_queue", "resource guide 실행 상태를 만들지 못했습니다.", err.Error())
+		}
 		return true
 	}
 	return false
 }
 
-func (l *Loop) rejectActionDuringGuidanceLookupWithoutGuide(calls []gollm.FunctionCall) bool {
-	if l.phaseStepState == nil || l.resourceGuideInjected {
-		return false
-	}
-	if l.resourceClassification == nil || l.resourceClassification.Kind != resourceClassificationCRD {
-		return false
-	}
-	current := l.phaseStepState.currentStep()
-	if !strings.EqualFold(strings.TrimSpace(current.Name), "guidance_lookup") {
-		return false
-	}
-	for _, call := range calls {
-		if call.Name == internalResourceGuideLookupCall || call.Name == internalPhaseProgressCall {
-			continue
-		}
-		if _, ok := kubectlCommandFromFunctionCall(call); !ok {
-			continue
-		}
-		message := "Active phase is guidance_lookup for a CRD-backed primary target. This phase must request a top-level `resource_guide_lookup` before any kubectl action. Return one `resource_guide_lookup` object for the accepted primary resource and operational problem focus."
-		return l.applyModelOutputCorrectionGate("guidance_lookup_action_before_lookup", "resource_guide_lookup 전 kubectl action이 반복되어 진단을 중단합니다.", message)
-	}
-	return false
+type resourceGuideEffect struct {
+	Resource string
+	Query    string
 }
 
 func (l *Loop) phaseAllowsResourceGuideLookup() bool {
-	if l.phaseStepState == nil {
+	if l.mutableRuntime().phaseStepState == nil {
 		return false
 	}
-	name := strings.ToLower(strings.TrimSpace(l.phaseStepState.currentStep().Name))
+	name := strings.ToLower(strings.TrimSpace(l.mutableRuntime().phaseStepState.currentStep().Name))
 	switch name {
 	case "guidance_lookup":
 		return true
@@ -1765,7 +1831,8 @@ func (l *Loop) phaseAllowsResourceGuideLookup() bool {
 
 func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query string) {
 	klog.V(0).InfoS("resource guidance search starting", "resource", resource, "query_len", len(query))
-	client, err := newGuidanceClient(l.cfg)
+	l.deps = l.deps.withDefaults()
+	client, err := l.deps.guidanceClient(l.cfg)
 	if err != nil {
 		klog.Warningf("resource guidance client init failed: %v", err)
 		l.markResourceGuideQuery(query)
@@ -1804,119 +1871,119 @@ func (l *Loop) searchAndInjectResourceGuide(ctx context.Context, resource, query
 }
 
 func (l *Loop) resourceGuideQueryAlreadyUsed(query string) bool {
-	if l.resourceGuideQueries == nil {
+	if l.mutableRuntime().resourceGuideQueries == nil {
 		return false
 	}
-	_, ok := l.resourceGuideQueries[query]
+	_, ok := l.mutableRuntime().resourceGuideQueries[query]
 	return ok
 }
 
 func (l *Loop) markResourceGuideQuery(query string) {
-	if l.resourceGuideQueries == nil {
-		l.resourceGuideQueries = make(map[string]struct{})
+	if l.mutableRuntime().resourceGuideQueries == nil {
+		l.mutableRuntime().resourceGuideQueries = make(map[string]struct{})
 	}
-	l.resourceGuideQueries[query] = struct{}{}
+	l.mutableRuntime().resourceGuideQueries[query] = struct{}{}
 }
 
 func (l *Loop) injectResourceGuideAttempt(resource string, found *guidance.GuideSearchResult) bool {
-	l.guideStepState = l.buildGuideStepState(found)
+	l.mutableRuntime().guideStepState = l.buildGuideStepState(found)
 	caseCount := 0
 	if found != nil {
 		caseCount = len(found.Cases)
 	}
-	klog.V(0).InfoS("injecting resource guide attempt", "resource", resource, "cases", caseCount, "has_steps", l.guideStepState != nil)
-	l.pendingResponseDirective = ""
-	if l.guideStepState != nil {
+	klog.V(0).InfoS("injecting resource guide attempt", "resource", resource, "cases", caseCount, "has_steps", l.mutableRuntime().guideStepState != nil)
+	l.mutableRuntime().pendingResponseDirective = ""
+	if l.mutableRuntime().guideStepState != nil {
 		if !l.enterGuidedDiagnosisPhase() {
-			l.guideStepState = nil
-			l.phaseStepState = nil
+			l.mutableRuntime().guideStepState = nil
+			l.mutableRuntime().phaseStepState = nil
 			message := "A resource guide was found, but the accepted phase_plan has no guided_diagnosis phase_step. Return one corrected phase_plan that declares guidance_lookup, guided_diagnosis, and the final response phase as explicit phase_steps before using guide steps. guidance_step entries can run only inside a declared guided_diagnosis phase_step."
 			l.applyModelOutputCorrectionGate("guided_diagnosis_phase_missing", "guided_diagnosis phase 누락 오류가 반복되어 진단을 중단합니다.", message)
 			return false
 		}
 	}
-	l.resourceGuideInjected = true
+	l.mutableRuntime().resourceGuideInjected = true
 	includeClusterAPI := guideResultImpliesClusterAPI(found)
-	l.promptOptions = l.newPromptOptions(l.requestIntent, true, includeClusterAPI)
+	l.mutableRuntime().promptOptions = l.newPromptOptions(l.mutableRuntime().requestIntent, true, includeClusterAPI)
 	if l.shouldCompactForStateRewrite() {
-		before := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
+		before := l.mutableRuntime().contextApproxTokens + estimateContextTokens(l.mutableRuntime().currChatContent...)
 		limit := l.contextLimitTokens()
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("↻ context compacting: injecting CRD guide context for %s; preserving question, procedure order, clues, and next action. estimated context %d/%d tokens.", resource, before, limit))
 		if err := l.resetChatSession(); err != nil {
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
-			l.pendingCalls = nil
+			l.mutableRuntime().pendingCalls = nil
 			l.transitionControl(RuntimeControlAwaitingUserQuery)
 			return false
 		}
-		l.currChatContent = []any{l.compactedStateMessage("Use the following guide context as decision support, then choose the next safest step.")}
+		l.mutableRuntime().currChatContent = []any{l.compactedStateMessage("Use the following guide context as decision support, then choose the next safest step.")}
 		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
-		after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
+		after := l.mutableRuntime().contextApproxTokens + estimateContextTokens(l.mutableRuntime().currChatContent...)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("✓ context compacted: CRD guide context injected for %s. estimated context %d/%d tokens.", resource, after, limit))
 	} else {
 		if err := l.resetChatSessionPreservingCurrentContent(); err != nil {
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
-			l.pendingCalls = nil
+			l.mutableRuntime().pendingCalls = nil
 			l.transitionControl(RuntimeControlAwaitingUserQuery)
 			return false
 		}
 		l.appendGuideObservation(guideRefFromResult(resource, found), formatResourceGuideObservation(resource, found))
 		klog.Infof("resource guide injected for CRD %s without context compact", resource)
 	}
-	l.pendingCalls = nil
-	l.currIteration++
+	l.mutableRuntime().pendingCalls = nil
+	l.mutableRuntime().currIteration++
 	l.transitionAfterPhaseAdvance()
 	return true
 }
 
 func (l *Loop) injectResourceGuideUnavailable(resource, reason string) {
-	l.resourceGuideInjected = true
-	l.guideStepState = nil
-	l.pendingResponseDirective = ""
-	l.promptOptions = l.newPromptOptions(l.requestIntent, true, false)
+	l.mutableRuntime().resourceGuideInjected = true
+	l.mutableRuntime().guideStepState = nil
+	l.mutableRuntime().pendingResponseDirective = ""
+	l.mutableRuntime().promptOptions = l.newPromptOptions(l.mutableRuntime().requestIntent, true, false)
 	content := formatResourceGuideUnavailableObservation(resource, reason)
 	if l.shouldCompactForStateRewrite() {
-		before := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
+		before := l.mutableRuntime().contextApproxTokens + estimateContextTokens(l.mutableRuntime().currChatContent...)
 		limit := l.contextLimitTokens()
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("↻ context compacting: recording unavailable CRD guide context for %s; preserving question, procedure order, clues, and next action. estimated context %d/%d tokens.", resource, before, limit))
 		if err := l.resetChatSession(); err != nil {
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
-			l.pendingCalls = nil
+			l.mutableRuntime().pendingCalls = nil
 			l.transitionControl(RuntimeControlAwaitingUserQuery)
 			return
 		}
-		l.currChatContent = []any{l.compactedStateMessage("Resource guide lookup was unavailable; continue with custom-resource-aware diagnostics.")}
+		l.mutableRuntime().currChatContent = []any{l.compactedStateMessage("Resource guide lookup was unavailable; continue with custom-resource-aware diagnostics.")}
 		l.appendGuideObservation(guideRef{GuideID: "unavailable:" + resource + ":" + reason, Hash: contextHash(content)}, content)
-		after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
+		after := l.mutableRuntime().contextApproxTokens + estimateContextTokens(l.mutableRuntime().currChatContent...)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("✓ context compacted: unavailable CRD guide context recorded for %s. estimated context %d/%d tokens.", resource, after, limit))
 	} else {
 		if err := l.resetChatSessionPreservingCurrentContent(); err != nil {
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
-			l.pendingCalls = nil
+			l.mutableRuntime().pendingCalls = nil
 			l.transitionControl(RuntimeControlAwaitingUserQuery)
 			return
 		}
 		l.appendGuideObservation(guideRef{GuideID: "unavailable:" + resource + ":" + reason, Hash: contextHash(content)}, content)
 		klog.Infof("resource guide unavailable for CRD %s (%s); continuing without context compact", resource, reason)
 	}
-	l.pendingCalls = nil
-	l.currIteration++
+	l.mutableRuntime().pendingCalls = nil
+	l.mutableRuntime().currIteration++
 	l.transitionControl(RuntimeControlAwaitingModelStep)
 }
 
 func (l *Loop) resetChatSessionPreservingCurrentContent() error {
-	current := append([]any(nil), l.currChatContent...)
-	hashes := l.contextBlockHashes
+	current := append([]any(nil), l.mutableRuntime().currChatContent...)
+	hashes := l.mutableRuntime().contextBlockHashes
 	if err := l.resetChatSession(); err != nil {
 		return err
 	}
-	l.currChatContent = current
-	l.contextBlockHashes = hashes
+	l.mutableRuntime().currChatContent = current
+	l.mutableRuntime().contextBlockHashes = hashes
 	return nil
 }
 
 func (l *Loop) resourceGuideRefinementQuery(request resourceGuideLookup) string {
 	return strings.Join([]string{
-		l.originalQuery,
+		l.mutableRuntime().originalQuery,
 		"resource family: " + request.ResourceFamily,
 		"problem focus: " + request.ProblemFocus,
 		"reason for refinement: " + request.Reason,
@@ -1928,7 +1995,7 @@ func (l *Loop) filterResourceGuidesForRequest(found *guidance.GuideSearchResult,
 	if found == nil || len(found.Cases) == 0 {
 		return found
 	}
-	if requestOrQuerySuggestsDeletion(l.originalQuery, query) {
+	if requestOrQuerySuggestsDeletion(l.mutableRuntime().originalQuery, query) {
 		return found
 	}
 	filtered := *found
@@ -2201,11 +2268,11 @@ func (l *Loop) renderGuideStepCommand(step guidance.PlanStep) string {
 		return ""
 	}
 	replacements := map[string]string{}
-	if l.requestContext != nil {
-		replacements["namespace"] = l.requestContext.Scope.Namespace
-		replacements["name"] = l.requestContext.PrimaryTarget.Name
-		replacements["cluster_name"] = l.requestContext.PrimaryTarget.Name
-		replacements["kind"] = l.requestContext.PrimaryTarget.Resource
+	if l.mutableRuntime().requestContext != nil {
+		replacements["namespace"] = l.mutableRuntime().requestContext.Scope.Namespace
+		replacements["name"] = l.mutableRuntime().requestContext.PrimaryTarget.Name
+		replacements["cluster_name"] = l.mutableRuntime().requestContext.PrimaryTarget.Name
+		replacements["kind"] = l.mutableRuntime().requestContext.PrimaryTarget.Resource
 	}
 	for key, value := range step.Variables {
 		replacements[key] = value
@@ -2280,16 +2347,16 @@ func (l *Loop) classifyResourceByDiscovery(ctx context.Context, resource string)
 	if isBuiltinKubernetesResource(normalized) {
 		return resourceClassification{Kind: resourceClassificationBuiltin, Source: "builtin_catalog"}
 	}
-	if l.resourceDiscoveryCache != nil {
-		if cached, ok := l.resourceDiscoveryCache[resource]; ok {
+	if l.mutableRuntime().resourceDiscoveryCache != nil {
+		if cached, ok := l.mutableRuntime().resourceDiscoveryCache[resource]; ok {
 			return cached
 		}
 	} else {
-		l.resourceDiscoveryCache = make(map[string]resourceClassification)
+		l.mutableRuntime().resourceDiscoveryCache = make(map[string]resourceClassification)
 	}
 
 	classification := l.classifyNonBuiltinResourceByDiscovery(ctx, resource)
-	l.resourceDiscoveryCache[resource] = classification
+	l.mutableRuntime().resourceDiscoveryCache[resource] = classification
 	return classification
 }
 
@@ -2327,7 +2394,7 @@ func (l *Loop) classifyNonBuiltinResourceByDiscovery(ctx context.Context, resour
 }
 
 func (l *Loop) lookupCRDResource(ctx context.Context, resource string) (resourceClassification, bool, error) {
-	out, err := l.runDiscoveryCommand(ctx, "kubectl get customresourcedefinitions.apiextensions.k8s.io -o json")
+	out, err := l.runDiscoveryOperation(ctx, discoveryListCRDs)
 	if err != nil {
 		return resourceClassification{}, false, err
 	}
@@ -2355,7 +2422,7 @@ func (l *Loop) lookupCRDResource(ctx context.Context, resource string) (resource
 }
 
 func (l *Loop) lookupAPIResource(ctx context.Context, resource string) (bool, error) {
-	out, err := l.runDiscoveryCommand(ctx, "kubectl api-resources -o name")
+	out, err := l.runDiscoveryOperation(ctx, discoveryListAPIResources)
 	if err != nil {
 		return false, err
 	}
@@ -2371,7 +2438,32 @@ func (l *Loop) lookupAPIResource(ctx context.Context, resource string) (bool, er
 	return false, nil
 }
 
-func (l *Loop) runDiscoveryCommand(ctx context.Context, command string) (string, error) {
+type discoveryOperation string
+
+const (
+	discoveryListCRDs         discoveryOperation = "list_crds"
+	discoveryListAPIResources discoveryOperation = "list_api_resources"
+)
+
+func discoveryCommand(operation discoveryOperation) (string, error) {
+	switch operation {
+	case discoveryListCRDs:
+		return "kubectl get customresourcedefinitions.apiextensions.k8s.io -o json", nil
+	case discoveryListAPIResources:
+		return "kubectl api-resources -o name", nil
+	default:
+		return "", fmt.Errorf("unsupported discovery operation %q", operation)
+	}
+}
+
+func (l *Loop) runDiscoveryOperation(ctx context.Context, operation discoveryOperation) (string, error) {
+	command, err := discoveryCommand(operation)
+	if err != nil {
+		return "", err
+	}
+	if !kube.IsReadOnlyKubectlPipeline(command) {
+		return "", fmt.Errorf("discovery operation %q is not read-only", operation)
+	}
 	discoveryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -2420,7 +2512,7 @@ func (l *Loop) consumeGuideProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 	var remaining []gollm.FunctionCall
 	handled := false
 	for _, call := range calls {
-		if call.Name != internalGuideProgressCall {
+		if call.Name != protocol.GuideProgressCall {
 			remaining = append(remaining, call)
 			continue
 		}
@@ -2434,37 +2526,29 @@ func (l *Loop) consumeGuideProgress(calls []gollm.FunctionCall) ([]gollm.Functio
 		}
 		completedAll := l.markGuideStepCompleted(step)
 		klog.V(0).InfoS("guide progress consumed", "step_completed", step, "completed_all", completedAll)
-		l.currChatContent = append(l.currChatContent, gollm.FunctionCallResult{
-			ID:   call.ID,
-			Name: call.Name,
-			Result: map[string]any{
-				"status":         "recorded",
-				"step_completed": step,
-			},
+		l.appendFunctionCallResult(call, map[string]any{
+			"status":         "recorded",
+			"step_completed": step,
 		})
 		if completedAll {
 			l.requestPostGuideCompletionDirective()
 		}
 	}
-	if l.controlState() == RuntimeControlAwaitingGuidedPhaseProgress && len(remaining) > 0 {
-		message := "The final guide_progress completed the nested guide steps. Return it alone; the runtime will request phase_progress in the next response. Do not combine final guide_progress with phase_progress, an action, final_report, or another internal call."
-		return nil, l.applyModelOutputCorrectionGate("guide_progress_mixed_after_completion", "마지막 guide_progress와 다른 call을 함께 반환해 phase를 전진시키지 않았습니다.", message)
-	}
 	if handled && len(remaining) == 0 {
-		l.currIteration++
+		l.mutableRuntime().currIteration++
 		return nil, true
 	}
 	return remaining, false
 }
 
 func (l *Loop) guideProgressAllowedForCurrentPhase() bool {
-	if l.guideStepState == nil {
+	if l.mutableRuntime().guideStepState == nil {
 		return false
 	}
-	if l.phaseStepState == nil {
-		return true
+	if l.mutableRuntime().phaseStepState == nil {
+		return false
 	}
-	return strings.EqualFold(l.phaseStepState.currentStep().Name, "guided_diagnosis")
+	return strings.EqualFold(l.mutableRuntime().phaseStepState.currentStep().Name, "guided_diagnosis")
 }
 
 func guideProgressObservationUseful(result map[string]any) bool {
@@ -2492,11 +2576,11 @@ func guideStepCompletedFromArguments(raw map[string]any) (int, bool) {
 }
 
 func (l *Loop) inferGuideStepCompletedFromFunctionCall(call gollm.FunctionCall) (int, bool) {
-	guide := l.guideStepState
+	guide := l.mutableRuntime().guideStepState
 	if guide == nil {
 		return 0, false
 	}
-	command, ok := commandString(call.Arguments["command"])
+	command, ok := shellScriptFromFunctionCall(call)
 	if !ok {
 		return 0, false
 	}
@@ -2523,8 +2607,6 @@ func normalizeGuideCommand(command string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(command)), " ")
 }
 
-type GateOutcomeKind = gateflow.OutcomeKind
-
 const (
 	GateOutcomeModelOutputCorrection = gateflow.ModelOutputCorrection
 	GateOutcomeAgentCommandRetry     = gateflow.AgentCommandRetry
@@ -2538,7 +2620,6 @@ const (
 type RetryScope = gateflow.RetryScope
 
 const (
-	RetryScopeNone          = gateflow.RetryNone
 	RetryScopeCurrentStep   = gateflow.RetryCurrentStep
 	RetryScopeCurrentPhase  = gateflow.RetryCurrentPhase
 	RetryScopeAgentCommand  = gateflow.RetryAgentCommand
@@ -2560,7 +2641,6 @@ type BranchPolicy = gateflow.BranchPolicy
 const (
 	BranchStayCurrent      = gateflow.StayCurrent
 	BranchRetryStep        = gateflow.RetryStep
-	BranchRecheckStep      = gateflow.RecheckStep
 	BranchSkipStep         = gateflow.SkipStep
 	BranchMovePhase        = gateflow.MovePhase
 	BranchRewindPhase      = gateflow.RewindPhase
@@ -2595,8 +2675,8 @@ func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repea
 	)
 	if err := outcome.Validate(l.RuntimeSnapshot()); err != nil {
 		klog.ErrorS(err, "runtime gate outcome validation failed", "code", outcome.Code, "kind", outcome.Kind)
-		l.pendingCalls = nil
-		l.currIteration = 0
+		l.mutableRuntime().pendingCalls = nil
+		l.mutableRuntime().currIteration = 0
 		l.transitionControl(RuntimeControlAwaitingUserQuery)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime gate outcome이 현재 runtime snapshot과 맞지 않아 루프를 중단했습니다.\n"+err.Error())
 		return true
@@ -2610,42 +2690,42 @@ func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repea
 	if mode == "" {
 		mode = CorrectionModeAppendCompacted
 	}
+	count, threshold, exhausted := l.recordCorrectionState(outcome, code)
 	if mode != CorrectionModeUserMessageOnly && mode != CorrectionModeNone {
-		appended := false
 		if mode == CorrectionModeAppendPlain {
-			appended = l.appendCorrection(code, message)
+			l.appendCorrection(code, message)
 		} else {
-			appended = l.appendCorrectionWithCompaction(code, message)
+			l.appendCorrectionWithCompaction(code, message)
 		}
-		if !appended {
-			klog.V(0).InfoS("runtime gate correction repeated", "code", code)
-			if repeated != nil {
-				return repeated(message)
-			}
-			userMessage := strings.TrimSpace(outcome.UserMessage)
-			if userMessage == "" {
-				userMessage = "runtime gate correction이 반복되어 루프를 중단했습니다."
-			}
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, userMessage+"\n"+message)
-			l.pendingCalls = nil
-			l.currIteration = 0
-			l.transitionControl(RuntimeControlAwaitingUserQuery)
-			return true
+	}
+	if exhausted {
+		klog.V(0).InfoS("runtime gate correction budget exhausted", "code", code, "count", count, "threshold", threshold)
+		if repeated != nil {
+			return repeated(message)
 		}
+		userMessage := strings.TrimSpace(outcome.UserMessage)
+		if userMessage == "" {
+			userMessage = "runtime gate correction budget이 소진되어 루프를 중단했습니다."
+		}
+		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, userMessage+"\n"+message)
+		l.mutableRuntime().pendingCalls = nil
+		l.mutableRuntime().currIteration = 0
+		l.transitionControl(RuntimeControlAwaitingUserQuery)
+		return true
 	}
 	if outcome.UserVisible && strings.TrimSpace(outcome.UserMessage) != "" {
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, strings.TrimSpace(outcome.UserMessage))
 	}
 	if err := l.applyGateBranch(outcome); err != nil {
 		klog.ErrorS(err, "runtime gate branch failed", "code", code, "branch_policy", outcome.BranchPolicy)
-		l.pendingCalls = nil
-		l.currIteration = 0
+		l.mutableRuntime().pendingCalls = nil
+		l.mutableRuntime().currIteration = 0
 		l.transitionControl(RuntimeControlAwaitingUserQuery)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime gate branch 적용 실패로 루프를 중단했습니다.\n"+err.Error())
 		return true
 	}
-	l.pendingCalls = nil
-	l.currIteration++
+	l.mutableRuntime().pendingCalls = nil
+	l.mutableRuntime().currIteration++
 	// A correction retries the same control obligation. Gate branches that
 	// intentionally change phase or step own their explicit control transition.
 	// This is a post-condition assertion only. Branch side effects are not
@@ -2653,13 +2733,13 @@ func (l *Loop) applyGateOutcomeWithRepeatedCorrection(outcome GateOutcome, repea
 	// unless the branch outcome is already safe to keep if the assertion fails.
 	if err := outcome.AssertExpectedControl(l.RuntimeSnapshot()); err != nil {
 		klog.ErrorS(err, "runtime gate expected control assertion failed", "code", code, "expected", outcome.ExpectedControl)
-		l.pendingCalls = nil
-		l.currIteration = 0
+		l.mutableRuntime().pendingCalls = nil
+		l.mutableRuntime().currIteration = 0
 		l.transitionControl(RuntimeControlAwaitingUserQuery)
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime gate outcome 적용 후 control assertion이 맞지 않아 루프를 중단했습니다.\n"+err.Error())
 		return true
 	}
-	klog.V(1).InfoS("runtime gate outcome applied", "code", code, "next_iteration", l.currIteration+1)
+	klog.V(1).InfoS("runtime gate outcome applied", "code", code, "next_iteration", l.mutableRuntime().currIteration+1)
 	return true
 }
 
@@ -2671,16 +2751,15 @@ func (l *Loop) applyGateBranch(outcome GateOutcome) error {
 	switch outcome.BranchPolicy {
 	case "", BranchStayCurrent, BranchRetryStep, BranchBlockUserRequest:
 		return nil
-	case BranchRecheckStep:
-		return l.applyRecheckStepBranch(outcome)
 	case BranchMovePhase:
 		target, err := l.validateMovePhaseBranch(outcome)
 		if err != nil {
 			return err
 		}
-		if err := l.phaseStepState.moveToPhase(PhaseRef{Index: target.Index, Name: strings.TrimSpace(target.Name)}); err != nil {
+		if err := l.mutableRuntime().phaseStepState.moveToPhase(PhaseRef{Index: target.Index, Name: strings.TrimSpace(target.Name)}); err != nil {
 			return err
 		}
+		l.activateExecutionPhase(target.Index)
 		l.transitionAfterPhaseAdvance()
 		return nil
 	case BranchSkipStep:
@@ -2690,7 +2769,7 @@ func (l *Loop) applyGateBranch(outcome GateOutcome) error {
 		if !l.SkipStep(*outcome.TargetStep) {
 			return fmt.Errorf("branch policy %s cannot skip target step %s", outcome.BranchPolicy, outcome.TargetStep.String())
 		}
-		if outcome.TargetStep.Kind == StepResourceGuideDiagnostic && l.guideStepState != nil && l.guideStepState.allCompleted() {
+		if outcome.TargetStep.Kind == StepResourceGuideDiagnostic && l.mutableRuntime().guideStepState != nil && l.mutableRuntime().guideStepState.allCompleted() {
 			l.requestPostGuideCompletionDirective()
 		}
 		if outcome.TargetStep.Kind == StepMutationEvidenceRequirement {
@@ -2702,11 +2781,12 @@ func (l *Loop) applyGateBranch(outcome GateOutcome) error {
 		if err != nil {
 			return err
 		}
-		targetRef, err := l.phaseStepState.rewindToPhase(PhaseRef{Index: target.Index, Name: strings.TrimSpace(target.Name)})
+		targetRef, err := l.mutableRuntime().phaseStepState.rewindToPhase(PhaseRef{Index: target.Index, Name: strings.TrimSpace(target.Name)})
 		if err != nil {
 			return err
 		}
-		l.resetPhaseScopedState(targetRef, l.defaultPhaseScopedResetPolicy(targetRef))
+		l.resetPhaseScopedState(l.defaultPhaseScopedResetPolicy(targetRef))
+		l.rewindExecutionToPhase(target.Index)
 		l.transitionAfterPhaseAdvance()
 		return nil
 	default:
@@ -2718,27 +2798,37 @@ func (l *Loop) validateMovePhaseBranch(outcome GateOutcome) (phaseStep, error) {
 	if outcome.TargetPhase == nil {
 		return phaseStep{}, fmt.Errorf("branch policy %s requires target phase", outcome.BranchPolicy)
 	}
-	if l == nil || l.phaseStepState == nil {
+	if l == nil || l.mutableRuntime().phaseStepState == nil {
 		return phaseStep{}, fmt.Errorf("branch policy %s requires active phase state", outcome.BranchPolicy)
 	}
-	target, ok := l.phaseStepState.phaseStepForRef(*outcome.TargetPhase)
+	target, ok := l.mutableRuntime().phaseStepState.phaseStepForRef(*outcome.TargetPhase)
 	if !ok {
 		return phaseStep{}, fmt.Errorf("target phase does not exist: %s", outcome.TargetPhase.String())
 	}
-	if l.phaseStepState.Completed != nil && l.phaseStepState.Completed[target.Index] {
-		return phaseStep{}, fmt.Errorf("target phase %s is already completed", PhaseRef{Index: target.Index, Name: target.Name}.String())
-	}
-	current := l.phaseStepState.currentStep()
+	current := l.mutableRuntime().phaseStepState.currentStep()
 	if current.Index == 0 {
 		return phaseStep{}, fmt.Errorf("branch policy %s requires current phase", outcome.BranchPolicy)
+	}
+	var mandatoryOwner *StepRef
+	if verification := l.mutableRuntime().pendingMutationVerification; verification != nil {
+		owner := verification.Owner
+		mandatoryOwner = &owner
+	}
+	targetCompleted := l.mutableRuntime().phaseStepState.Completed != nil &&
+		l.mutableRuntime().phaseStepState.Completed[target.Index]
+	if err := phaseflow.ValidateMovement(phaseflow.MovementInput{
+		Kind:             phaseflow.MovementForward,
+		Current:          PhaseRef{Index: current.Index, Name: current.Name},
+		Target:           PhaseRef{Index: target.Index, Name: target.Name},
+		MandatoryOwner:   mandatoryOwner,
+		TargetIsComplete: targetCompleted,
+	}); err != nil {
+		return phaseStep{}, fmt.Errorf("branch policy %s rejected: %w", outcome.BranchPolicy, err)
 	}
 	if target.Index == current.Index {
 		return target, nil
 	}
-	if target.Index < current.Index {
-		return phaseStep{}, fmt.Errorf("branch policy %s cannot move backward from %s to %s; use %s with cleanup instead", outcome.BranchPolicy, PhaseRef{Index: current.Index, Name: current.Name}.String(), PhaseRef{Index: target.Index, Name: target.Name}.String(), BranchRewindPhase)
-	}
-	if l.phaseStepState.allowedNextIndex(current, target.Name) == target.Index {
+	if l.mutableRuntime().phaseStepState.allowedNextIndex(current, target.Name) == target.Index {
 		return target, nil
 	}
 	if l.runtimeAllowsPhaseMove(outcome, current, target) {
@@ -2754,19 +2844,29 @@ func (l *Loop) validateRewindPhaseBranch(outcome GateOutcome) (phaseStep, error)
 	if strings.TrimSpace(outcome.Code) == "" {
 		return phaseStep{}, fmt.Errorf("branch policy %s requires source gate code for cleanup audit", outcome.BranchPolicy)
 	}
-	if l == nil || l.phaseStepState == nil {
+	if l == nil || l.mutableRuntime().phaseStepState == nil {
 		return phaseStep{}, fmt.Errorf("branch policy %s requires active phase state", outcome.BranchPolicy)
 	}
-	target, ok := l.phaseStepState.phaseStepForRef(*outcome.TargetPhase)
+	target, ok := l.mutableRuntime().phaseStepState.phaseStepForRef(*outcome.TargetPhase)
 	if !ok {
 		return phaseStep{}, fmt.Errorf("target phase does not exist: %s", outcome.TargetPhase.String())
 	}
-	current := l.phaseStepState.currentStep()
+	current := l.mutableRuntime().phaseStepState.currentStep()
 	if current.Index == 0 {
 		return phaseStep{}, fmt.Errorf("branch policy %s requires current phase", outcome.BranchPolicy)
 	}
-	if target.Index > current.Index {
-		return phaseStep{}, fmt.Errorf("branch policy %s cannot rewind forward from %s to %s", outcome.BranchPolicy, PhaseRef{Index: current.Index, Name: current.Name}.String(), PhaseRef{Index: target.Index, Name: target.Name}.String())
+	var mandatoryOwner *StepRef
+	if verification := l.mutableRuntime().pendingMutationVerification; verification != nil {
+		owner := verification.Owner
+		mandatoryOwner = &owner
+	}
+	if err := phaseflow.ValidateMovement(phaseflow.MovementInput{
+		Kind:           phaseflow.MovementRewind,
+		Current:        PhaseRef{Index: current.Index, Name: current.Name},
+		Target:         PhaseRef{Index: target.Index, Name: target.Name},
+		MandatoryOwner: mandatoryOwner,
+	}); err != nil {
+		return phaseStep{}, fmt.Errorf("branch policy %s rejected: %w", outcome.BranchPolicy, err)
 	}
 	return target, nil
 }
@@ -2785,22 +2885,6 @@ func (l *Loop) runtimeAllowsPhaseMove(outcome GateOutcome, current, target phase
 	default:
 		return false
 	}
-}
-
-func (l *Loop) applyRecheckStepBranch(outcome GateOutcome) error {
-	if l == nil || l.controlState() != RuntimeControlAwaitingMutationContinuation {
-		return fmt.Errorf("branch policy %s requires active external-state mutation continuation", outcome.BranchPolicy)
-	}
-	attempt, exhausted := l.consumeMutationContinuationAttempt()
-	if exhausted {
-		l.transitionControl(RuntimeControlAwaitingFinalReport)
-		l.finalReportMustBeInconclusive = true
-		l.queueResponseDirective(fmt.Sprintf("External state recheck budget is exhausted after %d recheck attempts for source_gate=%s. Return final_report with conclusive=false, summarize the recheck attempts, and explain that the external state did not reach a resolved condition within the runtime budget.", attempt, strings.TrimSpace(outcome.Code)))
-		return nil
-	}
-	l.transitionControl(RuntimeControlAwaitingMutationContinuation)
-	l.queueResponseDirective(fmt.Sprintf("External state still needs verification for source_gate=%s. Continue with one read-only recheck action or a valid mutation_verification_result after the observation. recheck_attempt: %d/%d.", strings.TrimSpace(outcome.Code), attempt, maxMutationContinuationAttempts))
-	return nil
 }
 
 func (l *Loop) applyModelOutputCorrectionGate(code, userMessage, correction string) bool {
@@ -2854,70 +2938,34 @@ func (s RuntimeSnapshot) hasStepRef(ref StepRef) bool {
 type pendingMutationVerification struct {
 	MutationStep    int
 	MutationCommand string
-	Requirements    []mutationEvidenceRequirement
-	Satisfied       map[string]bool
-	Skipped         map[string]bool
+	AttemptID       string
+	Owner           StepRef
+	Shape           contract.VerificationShape
+	Checks          []verificationRuntimeCheck
+	ActiveIndex     int
 	AwaitingResult  bool
-}
-
-type mutationEvidenceRequirement struct {
-	ID               string
-	Kind             string
-	Target           actionTarget
-	Purpose          string
-	SuggestedCommand string
 }
 
 const maxMutationContinuationAttempts = 3
 
+func (l *Loop) mutationContinuationLimit() int {
+	if execution := l.mutableRuntime().execution; execution != nil && execution.AppliedBudget.MutationContinuationAttempts > 0 {
+		return execution.AppliedBudget.MutationContinuationAttempts
+	}
+	return maxMutationContinuationAttempts
+}
+
 func (l *Loop) mutationVerificationAnchor() string {
-	if l.pendingMutationVerification == nil {
+	if l.mutableRuntime().pendingMutationVerification == nil {
 		return ""
 	}
-	return "Active mutation verification obligation:\n" + l.pendingMutationVerification.requiredMessage()
-}
-
-func (l *Loop) rejectMissingMutationVerificationOnNoCalls() bool {
-	if l.controlState() != RuntimeControlAwaitingMutationVerificationEvidence && l.controlState() != RuntimeControlAwaitingMutationVerificationResult {
-		return false
-	}
-	return l.rejectMissingMutationVerification("mutation_verification_required_no_call")
-}
-
-func (l *Loop) rejectMutationContinuationOnNoCalls() bool {
-	if l.controlState() != RuntimeControlAwaitingMutationContinuation {
-		return false
-	}
-	return l.rejectMutationContinuationRequired("mutation_continuation_required_no_call")
-}
-
-func (l *Loop) enforceMutationContinuation(calls []gollm.FunctionCall) bool {
-	if l.controlState() != RuntimeControlAwaitingMutationContinuation || len(calls) == 0 {
-		return false
-	}
-	for _, call := range calls {
-		switch call.Name {
-		case internalFinalReportCall, internalPhaseProgressCall, internalNextDirectionsCall:
-			return l.rejectMutationContinuationRequired("mutation_continuation_required")
-		}
-	}
-	return false
-}
-
-func (l *Loop) rejectMutationContinuationRequired(kind string) bool {
-	message := "The previous mutation verification result was progressing or unresolved. Continue the ReAct loop with the next best action based on the verification evidence; do not emit final_report, phase_progress, next_directions, or a plain answer yet."
-	return l.applyModelOutputCorrectionGate(kind, "mutation continuation 요구가 반복적으로 무시되어 루프를 중단했습니다.", message)
+	return "Active mutation verification obligation:\n" + l.mutableRuntime().pendingMutationVerification.requiredMessage()
 }
 
 func (l *Loop) enforcePendingMutationVerification(calls []gollm.FunctionCall) bool {
-	if (l.controlState() != RuntimeControlAwaitingMutationVerificationEvidence && l.controlState() != RuntimeControlAwaitingMutationVerificationResult) || len(calls) == 0 {
+	verification := l.mutableRuntime().pendingMutationVerification
+	if verification == nil || !verification.matchesEvidenceControl(l.controlState()) || len(calls) == 0 {
 		return false
-	}
-	if l.controlState() == RuntimeControlAwaitingMutationVerificationResult {
-		if len(calls) == 1 && calls[0].Name == internalMutationVerificationResultCall {
-			return false
-		}
-		return l.rejectMissingMutationVerification("mutation_verification_result_required")
 	}
 	if l.mutationVerificationCallsMatch(calls) {
 		return false
@@ -2926,7 +2974,7 @@ func (l *Loop) enforcePendingMutationVerification(calls []gollm.FunctionCall) bo
 }
 
 func (l *Loop) rejectMissingMutationVerification(kind string) bool {
-	verification := l.pendingMutationVerification
+	verification := l.mutableRuntime().pendingMutationVerification
 	if verification == nil {
 		return false
 	}
@@ -2935,50 +2983,104 @@ func (l *Loop) rejectMissingMutationVerification(kind string) bool {
 }
 
 func (l *Loop) consumeMutationVerificationResult(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
-	if l.controlState() == RuntimeControlAwaitingMutationVerificationResult && !onlyFunctionCall(calls, internalMutationVerificationResultCall) {
-		return nil, l.rejectMissingMutationVerification("mutation_verification_result_required")
-	}
 	var remaining []gollm.FunctionCall
 	for _, call := range calls {
-		if call.Name != internalMutationVerificationResultCall {
+		if call.Name != protocol.MutationVerificationResultCall {
 			remaining = append(remaining, call)
 			continue
 		}
-		if l.controlState() != RuntimeControlAwaitingMutationVerificationResult || l.pendingMutationVerification == nil {
+		verification := l.mutableRuntime().pendingMutationVerification
+		if verification == nil || !verification.matchesResultControl(l.controlState()) {
 			return remaining, l.applyModelOutputCorrectionGate("unexpected_mutation_verification_result", "unexpected mutation_verification_result가 반복되어 루프를 중단했습니다.", "mutation_verification_result is only valid immediately after all required mutation verification evidence has been collected. Continue with the active phase using a valid action, phase_progress, or final_report.")
 		}
 		result, ok := mutationVerificationResultFromFunctionCall(call)
 		if !ok {
-			return remaining, l.applyModelOutputCorrectionGate("invalid_mutation_verification_result", "mutation_verification_result 형식 오류가 반복되어 루프를 중단했습니다.", "mutation_verification_result payload was invalid. Return status as one of resolved, progressing, or unresolved. Include evidence_summary and a next_action when status is progressing or unresolved.")
+			return remaining, l.applyModelOutputCorrectionGate("invalid_mutation_verification_result", "mutation_verification_result 형식 오류가 반복되어 루프를 중단했습니다.", "mutation_verification_result payload was invalid. Return the exact active verification_id, status as satisfied, waiting, or failed, and evidence_refs from the active verification.")
 		}
-		l.pendingMutationVerification = nil
+		check := verification.activeCheck()
+		if check == nil || result.VerificationID != check.ID || !verificationResultReferencesActiveEvidence(result, *check) {
+			return remaining, l.applyModelOutputCorrectionGate("invalid_mutation_verification_reference", "mutation verification reference 오류가 반복되어 루프를 중단했습니다.", "Use the exact active verification_id and evidence_refs collected for that verification, including its latest observation. Do not refer to a different step, verification, or stale recheck.")
+		}
+		if !l.verificationEvidenceSupportsStatus(result) {
+			return remaining, l.applyModelOutputCorrectionGate(
+				"invalid_mutation_verification_evidence_qualification",
+				"mutation verification evidence 자격 오류가 반복되어 루프를 중단했습니다.",
+				"Forbidden or RBAC-denied observations prove only that the target state could not be inspected. They may support status=failed, but cannot support satisfied or waiting. Use state-bearing evidence for satisfied/waiting.",
+			)
+		}
 		switch result.Status {
-		case "resolved":
-			l.mutationContinuationAttempts = 0
-			if l.guideStepState != nil && l.guideStepState.allCompleted() {
-				l.requestPostGuideCompletionDirective()
-			} else {
-				l.queueResponseDirective("Mutation verification result is resolved. You may now complete the active phase or emit a final_report grounded in the verification evidence. Do not claim more than the evidence supports.")
+		case contract.VerificationSatisfied:
+			nextIndex := -1
+			for i := verification.ActiveIndex + 1; i < len(verification.Checks); i++ {
+				if verification.Checks[i].Status == contract.VerificationCheckPending {
+					nextIndex = i
+					break
+				}
 			}
-		case "progressing":
-			l.requestMutationContinuationOrBudgetReport(result)
-		case "unresolved":
+			hasNext := nextIndex >= 0
+			if hasNext {
+				next := &verification.Checks[nextIndex]
+				if err := l.queueVerificationWait(next.ID, next.InitialDelaySeconds); err != nil {
+					return remaining, l.applyModelOutputCorrectionGate("verification_wait_effect_failed", "verification wait 상태를 만들지 못해 요청을 중단했습니다.", err.Error())
+				}
+			}
+			l.resetCorrectionObligation(fmt.Sprintf("mutation-%d", verification.MutationStep))
+			check.Status = contract.VerificationCheckSatisfied
+			l.mutableRuntime().mutationContinuationAttempts = 0
+			if hasNext && verification.advanceCheck() {
+				l.transitionMutationVerification()
+				l.queueResponseDirective(verification.requiredMessage())
+			} else {
+				l.mutableRuntime().pendingMutationVerification = nil
+				l.completeMutationAttemptVerification(verification.AttemptID, contract.AttemptSucceeded)
+				l.achieveActiveExecutionStep("mutation verification satisfied", l.activePhaseAttemptObservationRefs())
+				if l.mutableRuntime().guideStepState != nil && l.mutableRuntime().guideStepState.allCompleted() {
+					l.requestPostGuideCompletionDirective()
+				} else {
+					l.queueResponseDirective("The mutation's direct verification is satisfied. Continue with the next declared plan step. Verify the original user-visible outcome in its own step when it differs from the mutated target.")
+				}
+			}
+		case contract.VerificationWaiting:
+			if check.Mode != contract.VerificationAwaitState {
+				return remaining, l.applyModelOutputCorrectionGate(
+					"invalid_mutation_verification_waiting",
+					"immediate verification에 waiting을 반환하여 요청을 중단했습니다.",
+					"status=waiting is valid only when the mutating action declared this verification as mode=await_state. Return satisfied or failed for an immediate verification; do not change the verification contract after execution.",
+				)
+			}
+			l.resetCorrectionObligation(fmt.Sprintf("mutation-%d", verification.MutationStep))
+			if check.RechecksUsed >= check.MaxRechecks {
+				check.Status = contract.VerificationCheckFailed
+				result.Status = contract.VerificationFailed
+				result.Reason = firstNonEmptyString(result.Reason, "verification did not reach the expected state within the runtime recheck budget")
+				l.finalizePendingMutationVerification(result.Reason, contract.AttemptUnknown)
+				l.requestMutationContinuationOrBudgetReport(result)
+				break
+			}
+			if err := l.queueVerificationWait(check.ID, check.RecheckIntervalSeconds); err != nil {
+				return remaining, l.applyModelOutputCorrectionGate("verification_wait_effect_failed", "verification wait 상태를 만들지 못해 요청을 중단했습니다.", err.Error())
+			}
+			check.RechecksUsed++
+			check.Status = contract.VerificationCheckActive
+			verification.AwaitingResult = false
+			l.transitionMutationVerification()
+			l.queueResponseDirective(fmt.Sprintf("Verification %s is waiting for external state convergence. After the runtime wait, repeat the same read-only verification for the same target and expected state. recheck: %d/%d. Do not repeat the mutation.", check.ID, check.RechecksUsed, check.MaxRechecks))
+		case contract.VerificationFailed:
+			l.resetCorrectionObligation(fmt.Sprintf("mutation-%d", verification.MutationStep))
+			check.Status = contract.VerificationCheckFailed
+			l.finalizePendingMutationVerification(firstNonEmptyString(result.Reason, "model classified direct verification as failed"), contract.AttemptFailed)
 			l.requestMutationContinuationOrBudgetReport(result)
 		}
-		l.currChatContent = append(l.currChatContent, gollm.FunctionCallResult{
-			ID:   call.ID,
-			Name: call.Name,
-			Result: map[string]any{
-				"status":           result.Status,
-				"evidence_summary": result.EvidenceSummary,
-				"reason":           result.Reason,
-				"next_action":      result.NextAction,
-			},
+		l.appendFunctionCallResult(call, map[string]any{
+			"status":           result.Status,
+			"evidence_summary": result.EvidenceSummary,
+			"reason":           result.Reason,
+			"next_action":      result.NextAction,
 		})
 	}
 	if len(remaining) == 0 {
-		l.currIteration++
-		if l.controlState() == RuntimeControlAwaitingMutationVerificationResult {
+		l.mutableRuntime().currIteration++
+		if isMutationVerificationResultControl(l.controlState()) {
 			l.transitionControl(RuntimeControlAwaitingModelStep)
 		}
 		return nil, true
@@ -2989,10 +3091,8 @@ func (l *Loop) consumeMutationVerificationResult(calls []gollm.FunctionCall) ([]
 func mutationContinuationDirective(result mutationVerificationResult) string {
 	var b strings.Builder
 	switch result.Status {
-	case "progressing":
-		b.WriteString("Mutation verification result is progressing. Continue the ReAct loop with the next best read-only observation after an appropriate wait/recheck interval. Do not emit a conclusive final_report yet.")
-	case "unresolved":
-		b.WriteString("Mutation verification result is unresolved. Continue the ReAct loop with a different diagnostic or remediation approach based on the observed evidence. Do not emit a conclusive final_report yet.")
+	case contract.VerificationFailed:
+		b.WriteString("Mutation verification failed to establish the expected state. Continue the ReAct loop with a different diagnostic or remediation approach based on the observed evidence. Do not emit a conclusive final_report yet.")
 	default:
 		return ""
 	}
@@ -3005,30 +3105,30 @@ func mutationContinuationDirective(result mutationVerificationResult) string {
 func (l *Loop) requestMutationContinuationOrBudgetReport(result mutationVerificationResult) {
 	attempt, exhausted := l.consumeMutationContinuationAttempt()
 	if exhausted {
+		l.mutableRuntime().finalReportMustBeInconclusive = true
 		l.transitionControl(RuntimeControlAwaitingFinalReport)
-		l.finalReportMustBeInconclusive = true
 		l.queueResponseDirective(mutationContinuationBudgetExhaustedDirective(result, attempt))
 		return
 	}
 	l.transitionControl(RuntimeControlAwaitingMutationContinuation)
 	directive := mutationContinuationDirective(result)
 	if directive != "" {
-		directive = fmt.Sprintf("%s\nrecheck_attempt: %d/%d", directive, attempt, maxMutationContinuationAttempts)
+		directive = fmt.Sprintf("%s\ncontinuation_attempt: %d/%d", directive, attempt, l.mutationContinuationLimit())
 	}
 	l.queueResponseDirective(directive)
 }
 
 func (l *Loop) consumeMutationContinuationAttempt() (int, bool) {
-	l.mutationContinuationAttempts++
-	if l.mutationContinuationAttempts > maxMutationContinuationAttempts {
-		return maxMutationContinuationAttempts, true
+	l.mutableRuntime().mutationContinuationAttempts++
+	if l.mutableRuntime().mutationContinuationAttempts > l.mutationContinuationLimit() {
+		return l.mutationContinuationLimit(), true
 	}
-	return l.mutationContinuationAttempts, false
+	return l.mutableRuntime().mutationContinuationAttempts, false
 }
 
 func mutationContinuationBudgetExhaustedDirective(result mutationVerificationResult, attempts int) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Mutation verification continuation budget is exhausted after %d recheck attempts. Your next response MUST be exactly one final_report object with conclusive=false. Summarize the mutation verification evidence, lifecycle that the external lifecycle did not settle within the runtime recheck budget, and recommend the next manual or follow-up observation. Do not emit another action, phase_progress, next_directions, or plain answer.", attempts)
+	fmt.Fprintf(&b, "Mutation verification continuation budget is exhausted after %d failed continuation strategies. Your next response MUST be exactly one final_report object with conclusive=false. Summarize the mutation verification evidence, explain why the attempted strategies did not establish the required state, and recommend the next manual or follow-up observation. Do not emit another action, phase_plan_revision, phase_progress, next_directions, or plain answer.", attempts)
 	if next := strings.TrimSpace(result.NextAction); next != "" {
 		fmt.Fprintf(&b, "\nlast_model_proposed_next_action: %s", next)
 	}
@@ -3039,245 +3139,225 @@ func mutationContinuationBudgetExhaustedDirective(result mutationVerificationRes
 }
 
 func mutationVerificationResultFromFunctionCall(call gollm.FunctionCall) (mutationVerificationResult, bool) {
+	status := contract.VerificationResultStatus(strings.ToLower(strings.TrimSpace(stringFromAny(call.Arguments["status"]))))
 	result := mutationVerificationResult{
-		Status:          strings.ToLower(strings.TrimSpace(stringFromAny(call.Arguments["status"]))),
+		VerificationID:  strings.TrimSpace(stringFromAny(call.Arguments["verification_id"])),
+		Status:          status,
+		EvidenceRefs:    stringSliceFromAnyLoose(call.Arguments["evidence_refs"]),
 		EvidenceSummary: stringSliceFromAnyLoose(call.Arguments["evidence_summary"]),
 		Reason:          stringFromAny(call.Arguments["reason"]),
 		NextAction:      stringFromAny(call.Arguments["next_action"]),
 	}
 	switch result.Status {
-	case "resolved":
-		return result, len(result.EvidenceSummary) > 0 || strings.TrimSpace(result.Reason) != ""
-	case "progressing", "unresolved":
-		return result, (len(result.EvidenceSummary) > 0 || strings.TrimSpace(result.Reason) != "") && strings.TrimSpace(result.NextAction) != ""
+	case contract.VerificationSatisfied:
+		return result, result.VerificationID != "" && len(result.EvidenceRefs) > 0 &&
+			(len(result.EvidenceSummary) > 0 || strings.TrimSpace(result.Reason) != "")
+	case contract.VerificationWaiting:
+		return result, result.VerificationID != "" && len(result.EvidenceRefs) > 0 &&
+			(len(result.EvidenceSummary) > 0 || strings.TrimSpace(result.Reason) != "")
+	case contract.VerificationFailed:
+		return result, result.VerificationID != "" && len(result.EvidenceRefs) > 0 &&
+			(len(result.EvidenceSummary) > 0 || strings.TrimSpace(result.Reason) != "") &&
+			strings.TrimSpace(result.NextAction) != ""
 	default:
 		return mutationVerificationResult{}, false
 	}
 }
 
+func verificationResultReferencesActiveEvidence(result mutationVerificationResult, check verificationRuntimeCheck) bool {
+	allowed := make(map[string]struct{}, len(check.EvidenceRefs))
+	for _, ref := range check.EvidenceRefs {
+		allowed[ref] = struct{}{}
+	}
+	if len(allowed) == 0 || len(result.EvidenceRefs) == 0 {
+		return false
+	}
+	latest := check.EvidenceRefs[len(check.EvidenceRefs)-1]
+	referencesLatest := false
+	for _, ref := range result.EvidenceRefs {
+		if _, ok := allowed[ref]; !ok {
+			return false
+		}
+		if ref == latest {
+			referencesLatest = true
+		}
+	}
+	return referencesLatest
+}
+
 func (v pendingMutationVerification) requiredMessage() string {
 	var b strings.Builder
+	check := v.activeCheck()
+	if check == nil {
+		return "The active mutation verification state is invalid. Do not repeat the mutation."
+	}
 	if v.AwaitingResult {
-		b.WriteString("Required mutation verification evidence has been collected. Your next response MUST be exactly one `mutation_verification_result` object. Do not emit final_report, phase_progress, next_directions, answer, or action in the same response.\n")
-		b.WriteString("Set status to `resolved` only when the evidence shows the original target is healthy or the requested mutation goal is achieved. Set `progressing` when the system is still rolling out or not yet settled; set `unresolved` when the evidence shows the problem remains or a new blocker is visible. If status is progressing or unresolved, include the next read-only observation or remediation angle in next_action.")
+		b.WriteString("Evidence for the active mutation verification has been collected. Your next response MUST be exactly one `mutation_verification_result` object. Do not emit final_report, phase_progress, next_directions, answer, or action in the same response.\n")
+		fmt.Fprintf(&b, "verification_id: %s\n", check.ID)
+		fmt.Fprintf(&b, "verification_mode: %s\n", check.Mode)
+		fmt.Fprintf(&b, "expected_state: %s\n", check.ExpectedState)
+		fmt.Fprintf(&b, "allowed_evidence_refs: %s\n", strings.Join(check.EvidenceRefs, ", "))
+		b.WriteString("Return status=satisfied when the expected state is established, waiting only when the same external state is still converging, or failed when the expected state is disproved or blocked. waiting repeats this same verification ID and never repeats the mutation.")
 		return b.String()
 	}
-	b.WriteString("A Kubernetes mutation has just been executed. Do not emit final_report, answer, phase_progress, next_directions, or another mutation yet. The next response must be exactly one read-only kubectl action that satisfies one remaining verification evidence requirement.\n")
+	b.WriteString("A Kubernetes mutation has just been executed. Do not emit final_report, answer, phase_progress, next_directions, or another mutation yet. The next response must be exactly one read-only kubectl action for the active verification.\n")
 	if v.MutationCommand != "" {
 		fmt.Fprintf(&b, "mutation_command: %s\n", v.MutationCommand)
 	}
-	remaining := v.remainingRequirements()
-	if len(remaining) > 0 {
-		b.WriteString("remaining_evidence_requirements:\n")
-		for _, req := range remaining {
-			fmt.Fprintf(&b, "- id: %s\n", req.ID)
-			if req.Kind != "" {
-				fmt.Fprintf(&b, "  kind: %s\n", req.Kind)
-			}
-			if req.Target.Resource != "" {
-				fmt.Fprintf(&b, "  resource: %s\n", req.Target.Resource)
-			}
-			if req.Target.Name != "" {
-				fmt.Fprintf(&b, "  name: %s\n", req.Target.Name)
-			}
-			if req.Target.Namespace != "" {
-				fmt.Fprintf(&b, "  namespace: %s\n", req.Target.Namespace)
-			}
-			if req.Purpose != "" {
-				fmt.Fprintf(&b, "  purpose: %s\n", req.Purpose)
-			}
-			if req.SuggestedCommand != "" {
-				fmt.Fprintf(&b, "  suggested_command: %s\n", req.SuggestedCommand)
-			}
-		}
+	fmt.Fprintf(&b, "verification_id: %s\n", check.ID)
+	fmt.Fprintf(&b, "verification_mode: %s\n", check.Mode)
+	if len(v.Checks) > 1 {
+		fmt.Fprintf(&b, "verification_chain_position: %d/%d (ordered)\n", v.ActiveIndex+1, len(v.Checks))
 	}
-	b.WriteString("Use read-only kubectl observations only. Preserve namespace scope exactly when it is known. Direct-effect evidence proves the mutation was applied; outcome evidence proves the original user-visible problem improved.")
+	if check.Target.Resource != "" {
+		fmt.Fprintf(&b, "resource: %s\n", check.Target.Resource)
+	}
+	if check.Target.Name != "" {
+		fmt.Fprintf(&b, "name: %s\n", check.Target.Name)
+	}
+	if check.Target.Namespace != "" {
+		fmt.Fprintf(&b, "namespace: %s\n", check.Target.Namespace)
+	}
+	if check.ExpectedState != "" {
+		fmt.Fprintf(&b, "expected_state: %s\n", check.ExpectedState)
+	}
+	if check.SuggestedCommand != "" {
+		fmt.Fprintf(&b, "suggested_command: %s\n", check.SuggestedCommand)
+	}
+	b.WriteString("Use read-only kubectl observations only. Preserve namespace scope exactly when it is known. Distinct chain checks execute in order; a temporal recheck retains this verification ID.")
 	return b.String()
 }
 
-func (v pendingMutationVerification) remainingRequirements() []mutationEvidenceRequirement {
-	var out []mutationEvidenceRequirement
-	for _, req := range v.Requirements {
-		if v.Satisfied != nil && v.Satisfied[req.ID] {
-			continue
-		}
-		if v.Skipped != nil && v.Skipped[req.ID] {
-			continue
-		}
-		out = append(out, req)
-	}
-	return out
-}
-
 func (v pendingMutationVerification) stepRuntimeStates(phase PhaseRef) []StepRuntimeState {
-	steps := make([]StepRuntimeState, 0, len(v.Requirements))
-	for _, req := range v.Requirements {
+	steps := make([]StepRuntimeState, 0, len(v.Checks))
+	for i, check := range v.Checks {
 		status := StepPending
-		if v.Satisfied != nil && v.Satisfied[req.ID] {
+		switch check.Status {
+		case contract.VerificationCheckSatisfied:
 			status = StepCompleted
-		} else if v.Skipped != nil && v.Skipped[req.ID] {
+		case contract.VerificationCheckSkipped:
 			status = StepSkipped
-		} else if !v.AwaitingResult {
+		case contract.VerificationCheckFailed:
+			status = StepBlocked
+		case contract.VerificationCheckActive:
 			status = StepActive
 		}
 		steps = append(steps, StepRuntimeState{
 			Ref: StepRef{
-				Phase: phase,
-				Kind:  StepMutationEvidenceRequirement,
-				ID:    strings.TrimSpace(req.ID),
+				Phase:         phase,
+				Kind:          StepMutationEvidenceRequirement,
+				ID:            strings.TrimSpace(check.ID),
+				GoalLineageID: strings.TrimSpace(check.ID) + ".lineage",
+				Index:         i + 1,
 			},
 			Status:          status,
-			Description:     strings.TrimSpace(req.Purpose),
-			Command:         strings.TrimSpace(req.SuggestedCommand),
-			ExpectedOutcome: strings.TrimSpace(req.Kind),
+			Description:     strings.TrimSpace(check.ExpectedState),
+			Command:         strings.TrimSpace(check.SuggestedCommand),
+			ExpectedOutcome: string(check.Mode),
 		})
 	}
 	return steps
 }
 
-func (v pendingMutationVerification) allSatisfied() bool {
-	return len(v.remainingRequirements()) == 0
-}
-
-func (l *Loop) trackMutationVerification(call PendingCall, result map[string]any) {
+func (l *Loop) trackMutationVerification(call PendingCall, result map[string]any) error {
 	if l.controlState() == RuntimeControlAwaitingMutationContinuation && toolResultSucceeded(result) {
 		l.transitionControl(RuntimeControlAwaitingModelStep)
 	}
-	if l.pendingMutationVerification != nil {
+	if l.mutableRuntime().pendingMutationVerification != nil {
 		if l.shouldStartMutationVerification(call, result) {
-			if verification, ok := l.mutationVerificationFromCall(call); ok {
-				l.mergeMutationVerification(verification)
-				l.mutationContinuationAttempts = 0
-			}
-			l.transitionMutationVerification()
-			return
+			// A pending mutation verification is a mandatory single-owner
+			// obligation. Admission rejects another mutation before this path.
+			return nil
 		}
-		if reqID, ok := l.mutationVerificationCallMatchID(call.FunctionCall); ok && toolResultSucceeded(result) {
-			if l.pendingMutationVerification.Satisfied == nil {
-				l.pendingMutationVerification.Satisfied = map[string]bool{}
+		qualification := verificationEvidenceQualification(result)
+		if checkID, ok := l.mutationVerificationCallMatchID(call.FunctionCall); ok &&
+			verificationflow.CanRequestResult(qualification) {
+			check := l.mutableRuntime().pendingMutationVerification.activeCheck()
+			if check != nil && check.ID == checkID {
+				l.resetCorrectionScope(string(RetryScopeCurrentStep), "", checkID)
+				check.Status = contract.VerificationCheckActive
 			}
-			l.pendingMutationVerification.Satisfied[reqID] = true
+			l.mutableRuntime().pendingMutationVerification.AwaitingResult = true
 		}
-		if l.pendingMutationVerification.allSatisfied() {
-			l.pendingMutationVerification.AwaitingResult = true
+		if !l.mutableRuntime().pendingMutationVerification.AwaitingResult && l.verificationEvidenceBudgetExhausted(call) {
+			l.blockMutationEvidenceBudget(call)
+			return nil
 		}
 		l.transitionMutationVerification()
-		return
+		return nil
 	}
 	if !l.shouldStartMutationVerification(call, result) {
-		return
+		return nil
 	}
 	verification, ok := l.mutationVerificationFromCall(call)
 	if !ok {
-		return
+		return nil
 	}
-	l.pendingMutationVerification = &verification
-	l.mutationContinuationAttempts = 0
+	if check := verification.activeCheck(); check != nil {
+		if err := l.queueVerificationWait(check.ID, check.InitialDelaySeconds); err != nil {
+			return err
+		}
+	}
+	l.mutableRuntime().pendingMutationVerification = &verification
+	l.markMutationAttemptVerifying(verification.AttemptID)
+	l.mutableRuntime().mutationContinuationAttempts = 0
 	l.transitionMutationVerification()
+	return nil
 }
 
 func (l *Loop) transitionMutationVerification() {
-	if l == nil || l.pendingMutationVerification == nil {
+	if l == nil || l.mutableRuntime().pendingMutationVerification == nil {
 		return
 	}
-	next := verificationflow.Next(
-		len(l.pendingMutationVerification.remainingRequirements()) > 0,
-		l.pendingMutationVerification.AwaitingResult,
-	)
-	if next == verificationflow.ContinueResult {
+	verification := l.mutableRuntime().pendingMutationVerification
+	if verification.isChain() {
+		if verification.AwaitingResult {
+			l.transitionControl(RuntimeControlAwaitingMutationVerificationChainResult)
+			return
+		}
+		l.transitionControl(RuntimeControlAwaitingMutationVerificationChainEvidence)
+		return
+	}
+	if verification.AwaitingResult {
 		l.transitionControl(RuntimeControlAwaitingMutationVerificationResult)
 		return
 	}
 	l.transitionControl(RuntimeControlAwaitingMutationVerificationEvidence)
 }
 
-func (l *Loop) mergeMutationVerification(next pendingMutationVerification) {
-	if l.pendingMutationVerification == nil {
-		l.pendingMutationVerification = &next
-		l.mutationContinuationAttempts = 0
-		return
-	}
-	if next.MutationCommand != "" {
-		if l.pendingMutationVerification.MutationCommand == "" {
-			l.pendingMutationVerification.MutationCommand = next.MutationCommand
-		} else if !strings.Contains(l.pendingMutationVerification.MutationCommand, next.MutationCommand) {
-			l.pendingMutationVerification.MutationCommand += "\n" + next.MutationCommand
-		}
-	}
-	if l.pendingMutationVerification.Satisfied == nil {
-		l.pendingMutationVerification.Satisfied = map[string]bool{}
-	}
-	if l.pendingMutationVerification.Skipped == nil {
-		l.pendingMutationVerification.Skipped = map[string]bool{}
-	}
-	seen := map[string]bool{}
-	for _, req := range l.pendingMutationVerification.Requirements {
-		seen[req.ID] = true
-	}
-	expanded := false
-	for _, req := range next.Requirements {
-		if seen[req.ID] || l.hasPendingEquivalentOutcomeEvidence(req) {
-			continue
-		}
-		l.pendingMutationVerification.Requirements = append(l.pendingMutationVerification.Requirements, req)
-		seen[req.ID] = true
-		expanded = true
-	}
-	if expanded {
-		l.mutationContinuationAttempts = 0
-		l.pendingMutationVerification.AwaitingResult = false
-	}
-}
-
-func (l *Loop) hasPendingEquivalentOutcomeEvidence(next mutationEvidenceRequirement) bool {
-	if l == nil || l.pendingMutationVerification == nil || next.Kind != "outcome_evidence" {
-		return false
-	}
-	verification := l.pendingMutationVerification
-	for _, existing := range verification.Requirements {
-		if existing.Kind != next.Kind || verification.Satisfied[existing.ID] || verification.Skipped[existing.ID] {
-			continue
-		}
-		if sameActionTarget(existing.Target, next.Target) {
-			return true
-		}
-	}
-	return false
+func isMutationVerificationResultControl(control RuntimeControlState) bool {
+	return control == RuntimeControlAwaitingMutationVerificationResult ||
+		control == RuntimeControlAwaitingMutationVerificationChainResult
 }
 
 func (l *Loop) shouldStartMutationVerification(call PendingCall, result map[string]any) bool {
 	if l == nil || l.cfg == nil || l.cfg.ReadOnly {
 		return false
 	}
-	if strings.TrimSpace(call.ModifiesResource) == "" || call.ModifiesResource == "no" {
+	modifiesResource := strings.TrimSpace(call.ModifiesResource)
+	if modifiesResource == "" || strings.EqualFold(modifiesResource, "no") {
 		return false
 	}
-	return toolResultSucceeded(result)
+	return toolResultSucceeded(result) || mutationExecutionUncertain(result)
+}
+
+func mutationExecutionUncertain(result map[string]any) bool {
+	return strings.EqualFold(strings.TrimSpace(stringFromAny(result["execution_state"])), "uncertain")
 }
 
 func (l *Loop) mutationVerificationFromCall(call PendingCall) (pendingMutationVerification, bool) {
-	command, _ := commandString(call.FunctionCall.Arguments["command"])
-	if command == "" {
-		command = strings.TrimSpace(stringFromAny(call.FunctionCall.Arguments["command"]))
+	if call.Verification == nil {
+		return pendingMutationVerification{}, false
 	}
+	command, _ := rawCommandString(call.FunctionCall.Arguments["command"])
 	target, hasTarget := actionTargetFromFunctionCall(call.FunctionCall)
 	if !hasTarget {
 		target = actionTarget{}
 	}
-	if target.Resource == "" {
-		if resource, ok := primaryMutatingKubectlResource(command); ok {
-			target.Resource = resource
-		}
-	}
-	if target.Name == "" {
-		if name, ok := primaryKubectlObjectName(command); ok {
-			target.Name = name
-		}
-	}
 	if target.Namespace == "" {
 		if namespace, ok := commandNamespaceValue(command); ok {
 			target.Namespace = namespace
-		} else if l.requestContext != nil {
+		} else if l.mutableRuntime().requestContext != nil {
 			target.Namespace = l.requestScopeNamespace()
 		}
 	}
@@ -3287,163 +3367,68 @@ func (l *Loop) mutationVerificationFromCall(call PendingCall) (pendingMutationVe
 	if target.Resource == "unknown" {
 		target.Resource = ""
 	}
-	requirements := l.mutationEvidenceRequirements(target, command, stringFromAny(call.FunctionCall.Arguments["expected_observation"]))
-	if len(requirements) == 0 {
+	idPrefix := fmt.Sprintf("mutation_%d_verification", l.mutableRuntime().actionSeq)
+	checks := verificationChecksFromSpec(call.Verification, idPrefix, target)
+	if len(checks) == 0 {
 		return pendingMutationVerification{}, false
 	}
+	maxRechecks := defaultVerificationRechecks
+	if execution := l.mutableRuntime().execution; execution != nil &&
+		execution.AppliedBudget.VerificationEvidenceAttempts > 0 {
+		maxRechecks = execution.AppliedBudget.VerificationEvidenceAttempts - 1
+		if maxRechecks < 0 {
+			maxRechecks = 0
+		}
+	}
+	for i := range checks {
+		checks[i].MaxRechecks = maxRechecks
+	}
+	for i := 1; i < len(checks); i++ {
+		checks[i].Status = contract.VerificationCheckPending
+	}
 	verification := pendingMutationVerification{
-		MutationStep:    l.actionSeq,
+		MutationStep:    l.mutableRuntime().actionSeq,
 		MutationCommand: command,
-		Requirements:    requirements,
-		Satisfied:       map[string]bool{},
-		Skipped:         map[string]bool{},
+		AttemptID:       l.latestAttemptIDForCall(call),
+		Owner:           stepRefValue(call.StepRef),
+		Shape:           call.Verification.Shape,
+		Checks:          checks,
+		ActiveIndex:     0,
 	}
 	return verification, true
 }
 
 func (l *Loop) mutationVerificationCallsMatch(calls []gollm.FunctionCall) bool {
-	if len(calls) == 0 || l.pendingMutationVerification == nil {
+	if len(calls) != 1 || l.mutableRuntime().pendingMutationVerification == nil {
 		return false
 	}
-	satisfied := map[string]bool{}
-	for key, value := range l.pendingMutationVerification.Satisfied {
-		satisfied[key] = value
-	}
-	for key, value := range l.pendingMutationVerification.Skipped {
-		if value {
-			satisfied[key] = true
-		}
-	}
-	for _, call := range calls {
-		reqID, ok := l.mutationVerificationCallMatchIDWithSatisfied(call, satisfied)
-		if !ok {
-			return false
-		}
-		satisfied[reqID] = true
-	}
-	return true
+	_, ok := l.mutationVerificationCallMatchID(calls[0])
+	return ok
 }
 
 func (l *Loop) mutationVerificationCallMatchID(call gollm.FunctionCall) (string, bool) {
-	if l.pendingMutationVerification == nil {
+	if l.mutableRuntime().pendingMutationVerification == nil {
 		return "", false
 	}
-	return l.mutationVerificationCallMatchIDWithSatisfied(call, l.pendingMutationVerification.Satisfied)
-}
-
-func (l *Loop) mutationVerificationCallMatchIDWithSatisfied(call gollm.FunctionCall, satisfied map[string]bool) (string, bool) {
-	verification := l.pendingMutationVerification
-	if verification == nil {
+	verification := l.mutableRuntime().pendingMutationVerification
+	check := verification.activeCheck()
+	if check == nil || verification.AwaitingResult {
 		return "", false
 	}
 	command, ok := kubectlCommandFromFunctionCall(call)
 	if !ok || !isNonMutatingKubectlInvocation(call) {
 		return "", false
 	}
-	bestID := ""
-	bestScore := -1
-	for _, req := range verification.Requirements {
-		if satisfied != nil && satisfied[req.ID] {
-			continue
-		}
-		if verification.Skipped != nil && verification.Skipped[req.ID] {
-			continue
-		}
-		if evidenceRequirementMatchesCommand(req, command) {
-			score := evidenceRequirementSpecificity(req)
-			if score > bestScore {
-				bestID = req.ID
-				bestScore = score
-			}
-		}
-	}
-	if bestID == "" {
+	if !verificationCheckMatchesCommand(*check, command) {
 		return "", false
 	}
-	return bestID, true
+	return check.ID, true
 }
 
-func (l *Loop) mutationEvidenceRequirements(target actionTarget, command, expectedObservation string) []mutationEvidenceRequirement {
-	var requirements []mutationEvidenceRequirement
-	idPrefix := fmt.Sprintf("mutation_%d", l.actionSeq)
-	if target.Resource == "" && target.Name == "" && isKubectlApplyFileCommand(command) {
-		return nil
-	}
-	if target.Resource != "" || target.Name != "" {
-		direct := mutationEvidenceRequirement{
-			ID:               idPrefix + "_direct_effect",
-			Kind:             "direct_effect",
-			Target:           target,
-			Purpose:          strings.TrimSpace(expectedObservation),
-			SuggestedCommand: verificationCommandHint(target),
-		}
-		if direct.Purpose == "" {
-			direct.Purpose = "Verify this specific mutation was applied to the changed resource."
-		}
-		requirements = append(requirements, direct)
-	}
-
-	if outcome, ok := l.outcomeEvidenceRequirement(idPrefix, target); ok {
-		requirements = append(requirements, outcome)
-	}
-	return requirements
-}
-
-func isKubectlApplyFileCommand(command string) bool {
-	fields := strings.Fields(strings.ToLower(strings.TrimSpace(command)))
-	for i := 0; i < len(fields); i++ {
-		if strings.Trim(fields[i], "'\"") != "kubectl" {
-			continue
-		}
-		verb, verbIndex, ok := kube.KubectlVerbAndIndexFromFields(fields, i)
-		if !ok || verb != "apply" {
-			continue
-		}
-		for j := verbIndex + 1; j < len(fields); j++ {
-			field := strings.Trim(fields[j], "'\"")
-			if field == "-f" || field == "--filename" || strings.HasPrefix(field, "--filename=") {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (l *Loop) outcomeEvidenceRequirement(idPrefix string, directTarget actionTarget) (mutationEvidenceRequirement, bool) {
-	if l == nil || l.requestContext == nil {
-		return mutationEvidenceRequirement{}, false
-	}
-	target := actionTarget{
-		Resource:  normalizeKubectlResource(strings.ToLower(strings.TrimSpace(l.requestContext.PrimaryTarget.Resource))),
-		Name:      cleanUnknownPlaceholder(l.requestContext.PrimaryTarget.Name),
-		Namespace: l.requestScopeNamespace(),
-	}
-	if target.Resource == "" || target.Resource == "unknown" {
-		return mutationEvidenceRequirement{}, false
-	}
-	if sameActionTarget(target, directTarget) {
-		return mutationEvidenceRequirement{}, false
-	}
-	req := mutationEvidenceRequirement{
-		ID:               idPrefix + "_outcome_primary_target",
-		Kind:             "outcome_evidence",
-		Target:           target,
-		Purpose:          "Verify the original user-visible target after the mutation. Prefer the highest-signal object first; if it is still progressing, wait or collect the next most relevant clue instead of concluding.",
-		SuggestedCommand: verificationCommandHint(target),
-	}
-	return req, true
-}
-
-func sameActionTarget(a, b actionTarget) bool {
-	return normalizeKubectlResource(strings.ToLower(strings.TrimSpace(a.Resource))) == normalizeKubectlResource(strings.ToLower(strings.TrimSpace(b.Resource))) &&
-		strings.EqualFold(strings.TrimSpace(a.Name), strings.TrimSpace(b.Name)) &&
-		strings.EqualFold(strings.TrimSpace(a.Namespace), strings.TrimSpace(b.Namespace))
-}
-
-func evidenceRequirementMatchesCommand(req mutationEvidenceRequirement, command string) bool {
-	target := req.Target
+func verificationCheckMatchesCommand(check verificationRuntimeCheck, command string) bool {
+	target := check.Target
 	return verificationflow.Matches(
-		verificationflow.Requirement{ID: req.ID, Target: target},
+		verificationflow.Requirement{ID: check.ID, Target: target},
 		verificationflow.MatchEvidence{
 			Namespace: target.Namespace == "" ||
 				(target.Resource != "" && !kubectlResourceUsuallyNamespaced(target.Resource)) ||
@@ -3452,20 +3437,6 @@ func evidenceRequirementMatchesCommand(req mutationEvidenceRequirement, command 
 			Name:     commandMentionsToken(command, target.Name) || commandUsesSelectorForName(command, target.Name),
 		},
 	)
-}
-
-func evidenceRequirementSpecificity(req mutationEvidenceRequirement) int {
-	score := 0
-	if strings.TrimSpace(req.Target.Resource) != "" {
-		score++
-	}
-	if strings.TrimSpace(req.Target.Name) != "" {
-		score++
-	}
-	if strings.TrimSpace(req.Target.Namespace) != "" {
-		score++
-	}
-	return score
 }
 
 func commandMentionsResourceKind(command, resource string) bool {
@@ -3496,64 +3467,60 @@ func toolResultSucceeded(result map[string]any) bool {
 	if err, ok := result["error"].(string); ok && strings.TrimSpace(err) != "" {
 		return false
 	}
+	if rawExitCode, ok := result["exit_code"]; ok && intFromAny(rawExitCode) != 0 {
+		return false
+	}
+	if classifyToolFailure(toolFailureDetail(result)) != toolFailureUnknown {
+		return false
+	}
 	status, _ := result["status"].(string)
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "blocked", "declined", "denied", "failed", "failure", "error", "partial", "partial_success", "partially_succeeded":
+	case "blocked", "declined", "denied", "failed", "failure", "error",
+		"cancelled", "canceled", "unknown", "uncertain",
+		"partial", "partial_success", "partially_succeeded":
 		return false
 	default:
 		return true
 	}
 }
 
-func primaryKubectlObjectName(command string) (string, bool) {
-	fields := strings.Fields(strings.ToLower(strings.TrimSpace(command)))
-	for i := 0; i < len(fields); i++ {
-		if strings.Trim(fields[i], "'\"") != "kubectl" {
-			continue
-		}
-		verb, verbIndex, ok := kube.KubectlVerbAndIndexFromFields(fields, i)
-		if !ok || !kube.IsKubectlMutatingVerb(verb) {
-			continue
-		}
-		if name, ok := kubectlObjectNameAfterResource(fields, verbIndex+1); ok {
-			return name, true
-		}
+func verificationEvidenceQualification(result map[string]any) contract.EvidenceQualification {
+	if result == nil || mutationExecutionUncertain(result) {
+		return contract.EvidenceUncertain
 	}
-	return "", false
+	status := strings.ToLower(strings.TrimSpace(stringFromAny(result["status"])))
+	switch status {
+	case "blocked", "declined", "denied", "cancelled", "canceled":
+		return contract.EvidenceUnusable
+	case "unknown", "uncertain":
+		return contract.EvidenceUncertain
+	}
+	switch classifyToolFailure(toolFailureDetail(result)) {
+	case toolFailureNotFound:
+		return contract.EvidenceStateBearing
+	case toolFailureRBAC:
+		return contract.EvidenceAccessBlocker
+	case toolFailureTimeout:
+		return contract.EvidenceRetryableError
+	}
+	if toolResultSucceeded(result) {
+		return contract.EvidenceStateBearing
+	}
+	return contract.EvidenceUnusable
 }
 
-func kubectlObjectNameAfterResource(fields []string, start int) (string, bool) {
-	seenResource := false
-	for i := start; i < len(fields); i++ {
-		field := strings.Trim(fields[i], "'\"")
-		if field == "" {
-			continue
-		}
-		if strings.HasPrefix(field, "--") {
-			if strings.Contains(field, "=") {
-				continue
-			}
-			if kubectlFlagRequiresValue(field) && i+1 < len(fields) {
-				i++
-			}
-			continue
-		}
-		if strings.HasPrefix(field, "-") {
-			if kubectlShortFlagRequiresValue(field) && len(field) == 2 && i+1 < len(fields) {
-				i++
-			}
-			continue
-		}
-		if !seenResource {
-			seenResource = true
-			if slash := strings.Index(field, "/"); slash > 0 && slash+1 < len(field) {
-				return strings.TrimSpace(field[slash+1:]), true
-			}
-			continue
-		}
-		return field, true
+func (l *Loop) verificationEvidenceSupportsStatus(result mutationVerificationResult) bool {
+	execution := l.mutableRuntime().execution
+	if execution == nil {
+		return false
 	}
-	return "", false
+	qualifications := map[contract.EvidenceQualification]bool{}
+	for _, ref := range result.EvidenceRefs {
+		if observation, ok := execution.ObservationByID(ref); ok {
+			qualifications[observation.Qualification] = true
+		}
+	}
+	return verificationflow.SupportsResult(result.Status, qualifications)
 }
 
 func verificationCommandHint(target actionTarget) string {
@@ -3582,7 +3549,7 @@ func verificationCommandHint(target actionTarget) string {
 // step. Called after an action observation is appended. Returns true if the
 // lifecycle transitioned to "all steps completed" on this call.
 func (l *Loop) markGuideStepCompleted(stepIndex int) bool {
-	guide := l.guideStepState
+	guide := l.mutableRuntime().guideStepState
 	if guide == nil || stepIndex < 1 || stepIndex > guide.TotalSteps {
 		return false
 	}
@@ -3593,17 +3560,22 @@ func (l *Loop) markGuideStepCompleted(stepIndex int) bool {
 		guide.TotalSteps,
 	)
 	guide.Completed = completed
+	if changed {
+		step := guideRuntimeStepRef(l.currentPhaseRef(), stepIndex)
+		l.resetCorrectionScope(string(RetryScopeCurrentStep), "", step.ID)
+	}
 	return changed && allCompleted
 }
 
 func (l *Loop) requestPostGuideCompletionDirective() {
-	if l.guideStepState == nil || !l.guideStepState.allCompleted() {
+	if l.mutableRuntime().guideStepState == nil || !l.mutableRuntime().guideStepState.allCompleted() {
 		return
 	}
-	if l.pendingMutationVerification != nil {
+	if l.mutableRuntime().pendingMutationVerification != nil {
 		return
 	}
-	if l.phaseStepState != nil && strings.EqualFold(l.phaseStepState.currentStep().Name, "guided_diagnosis") {
+	l.achieveActiveExecutionStep("all nested resource-guide steps completed", l.activePhaseAttemptObservationRefs())
+	if l.mutableRuntime().phaseStepState != nil && strings.EqualFold(l.mutableRuntime().phaseStepState.currentStep().Name, "guided_diagnosis") {
 		l.requestGuidedDiagnosisPhaseProgress()
 		return
 	}
@@ -3650,7 +3622,7 @@ func (l *Loop) requestOnlyFinalReport() bool {
 func (l *Loop) consumeFinalReport(ctx context.Context, calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
 	var remaining []gollm.FunctionCall
 	for _, call := range calls {
-		if call.Name != internalFinalReportCall {
+		if call.Name != protocol.FinalReportCall {
 			remaining = append(remaining, call)
 			continue
 		}
@@ -3658,30 +3630,42 @@ func (l *Loop) consumeFinalReport(ctx context.Context, calls []gollm.FunctionCal
 		if !ok {
 			return nil, l.applyPlainModelOutputCorrectionGate("invalid_final_report", "final_report 형식 오류가 반복되어 진단을 중단합니다.", "final_report payload was invalid. Re-emit a final_report with required fields. Conclusive reports require attempted, evidence_known, most_likely_cause, and conclusion. Inconclusive reports require attempted, most_likely_cause, and at least one of evidence_known, evidence_missing, or blockers.")
 		}
-		if l.finalReportMustBeInconclusive && report.Conclusive {
-			message := "Mutation verification recheck budget was exhausted without a resolved result. Return exactly one final_report with conclusive=false, summarize the unresolved evidence and exhausted rechecks, and recommend the next manual or follow-up observation."
+		if l.finalReportMustBeInconclusive() && report.Conclusive {
+			message := "Mutation verification recheck budget was exhausted without a satisfied result. Return exactly one final_report with conclusive=false, summarize the remaining evidence gap and exhausted rechecks, and recommend the next manual or follow-up observation."
 			l.queueResponseDirective(message)
 			return nil, l.applyPlainModelOutputCorrectionGate("mutation_budget_final_report_must_be_inconclusive", "mutation verification budget 소진 후 conclusive=true 보고가 반복되어 진단을 중단합니다.", message)
 		}
-		l.pendingFinalReport = &report
+		l.mutableRuntime().pendingFinalReport = &report
+		l.recordFinalReportExecution(report)
 		l.emitFinalReportMessage(ctx, report)
-		l.guideStepState = nil
+		l.mutableRuntime().guideStepState = nil
 		if report.Conclusive {
 			if l.promptProblematicResourceInvestigation(report) {
 				return nil, true
 			}
 			l.transitionControl(RuntimeControlAwaitingUserQuery)
-			l.pendingCalls = nil
-			l.currIteration = 0
+			l.mutableRuntime().pendingCalls = nil
+			l.mutableRuntime().currIteration = 0
 			return nil, true
 		}
 		l.requestNextDirectionsFromModel(report)
-		l.pendingCalls = nil
-		l.currIteration++
+		l.mutableRuntime().pendingCalls = nil
+		l.mutableRuntime().currIteration++
 		l.transitionControl(RuntimeControlAwaitingNextDirections)
 		return nil, true
 	}
 	return remaining, false
+}
+
+func (l *Loop) finalReportMustBeInconclusive() bool {
+	if l == nil {
+		return false
+	}
+	if l.mutableRuntime().finalReportMustBeInconclusive {
+		return true
+	}
+	execution := l.mutableRuntime().execution
+	return execution != nil && len(execution.BlockedObligations) > 0
 }
 
 func finalReportFromFunctionCall(call gollm.FunctionCall) (finalReport, bool) {
@@ -3772,10 +3756,9 @@ func problematicResourcesFromAny(value any) []problematicResource {
 
 func (l *Loop) emitFinalReportMessage(ctx context.Context, report finalReport) {
 	rendered := renderFinalReport(report)
-	l.contextApproxTokens += estimateContextTokens(rendered)
-	l.lastAssistantText = rendered
-	displayText := l.translateModelText(ctx, rendered)
-	l.addMessage(api.MessageSourceModel, api.MessageTypeText, displayText)
+	l.mutableRuntime().contextApproxTokens += estimateContextTokens(rendered)
+	l.mutableRuntime().lastAssistantText = rendered
+	l.addTranslatedModelMessage(ctx, rendered)
 }
 
 func renderFinalReport(report finalReport) string {
@@ -3878,11 +3861,11 @@ func (l *Loop) queueResponseDirective(directive string) {
 	if directive == "" {
 		return
 	}
-	if directive == strings.TrimSpace(l.pendingResponseDirective) {
+	if directive == strings.TrimSpace(l.mutableRuntime().pendingResponseDirective) {
 		return
 	}
-	l.pendingResponseDirective = directive
-	l.currChatContent = append(l.currChatContent, directive)
+	l.mutableRuntime().pendingResponseDirective = directive
+	l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, directive)
 }
 
 // consumeNextDirections handles the model's next_directions response after an
@@ -3892,7 +3875,7 @@ func (l *Loop) queueResponseDirective(directive string) {
 func (l *Loop) consumeNextDirections(calls []gollm.FunctionCall) ([]gollm.FunctionCall, bool) {
 	var remaining []gollm.FunctionCall
 	for _, call := range calls {
-		if call.Name != internalNextDirectionsCall {
+		if call.Name != protocol.NextDirectionsCall {
 			remaining = append(remaining, call)
 			continue
 		}
@@ -3911,13 +3894,13 @@ func (l *Loop) consumeNextDirections(calls []gollm.FunctionCall) ([]gollm.Functi
 			}, func(message string) bool {
 				klog.Warning("next_directions remained invalid after correction; falling back to runtime continuation choices")
 				nd = l.fallbackNextDirections()
-				l.pendingNextDirections = &nd
+				l.mutableRuntime().pendingNextDirections = &nd
 				l.promptDirectionChoice(nd)
 				return true
 			})
 			return nil, true
 		}
-		l.pendingNextDirections = &nd
+		l.mutableRuntime().pendingNextDirections = &nd
 		l.promptDirectionChoice(nd)
 		return nil, true
 	}
@@ -3936,7 +3919,7 @@ func (l *Loop) fallbackNextDirections() nextDirections {
 }
 
 func (l *Loop) genericNextDirectionOption() nextDirectionOption {
-	report := l.pendingFinalReport
+	report := l.mutableRuntime().pendingFinalReport
 	if report == nil {
 		return nextDirectionOption{}
 	}
@@ -3984,7 +3967,7 @@ func (l *Loop) promptDirectionChoice(nd nextDirections) {
 		label := opt.Summary
 		switch opt.Kind {
 		case "another_guide":
-			if l.pendingFinalReport != nil {
+			if l.mutableRuntime().pendingFinalReport != nil {
 				label = fmt.Sprintf("[추가 추론] %s", opt.Summary)
 			} else {
 				label = fmt.Sprintf("[가이드 재검색] %s", opt.Summary)
@@ -4005,7 +3988,7 @@ func (l *Loop) promptDirectionChoice(nd nextDirections) {
 	promptState.HasFreeInput = true
 	promptState.FinalizeIdx = len(options) + 1
 	options = append(options, api.UserChoiceOption{Value: "finalize", Label: "여기서 진단 종료"})
-	l.pendingDirectionPrompt = promptState
+	l.mutableRuntime().pendingDirectionPrompt = promptState
 	l.transitionControl(RuntimeControlAwaitingContinuationChoice)
 	l.refreshInputOwner()
 
@@ -4013,7 +3996,7 @@ func (l *Loop) promptDirectionChoice(nd nextDirections) {
 		Prompt:  prompt.String(),
 		Options: options,
 	})
-	l.pendingCalls = nil
+	l.mutableRuntime().pendingCalls = nil
 }
 
 // waitForDirectionChoice is invoked when the loop is in
@@ -4025,15 +4008,23 @@ func (l *Loop) waitForDirectionChoice(ctx context.Context) bool {
 		return false
 	case raw := <-l.input:
 		if raw == io.EOF {
-			l.applyRuntimeCleanup(cleanupExitPolicy())
-			l.transitionControl(RuntimeControlExited)
+			if err := l.mutateRuntimeAtomically(func() error {
+				if warning := l.finalizePendingMutationVerification("continuation choice input stream reached EOF", contract.AttemptUnknown); warning != "" {
+					l.addMessage(api.MessageSourceAgent, api.MessageTypeError, warning)
+				}
+				l.applyRuntimeCleanup(cleanupExitPolicy())
+				l.transitionControl(RuntimeControlExited)
+				return nil
+			}); err != nil {
+				klog.ErrorS(err, "react direction-choice EOF cleanup rejected")
+			}
 			return false
 		}
 		resp, ok := raw.(*api.UserChoiceResponse)
 		if !ok {
 			return true
 		}
-		promptState := l.pendingDirectionPrompt
+		promptState := l.mutableRuntime().pendingDirectionPrompt
 		if promptState == nil {
 			l.transitionControl(RuntimeControlAwaitingUserQuery)
 			return true
@@ -4046,20 +4037,36 @@ func (l *Loop) waitForDirectionChoice(ctx context.Context) bool {
 			return true
 		}
 		if promptState.HasFreeInput && choice == promptState.FreeInputIdx {
-			l.pendingDirectionPrompt = nil
-			l.transitionControl(RuntimeControlAwaitingContinuationText)
-			l.refreshInputOwner()
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeUserInputRequest, "어떤 방향으로 계속할지 알려주세요")
+			if err := l.mutateRuntimeAtomically(func() error {
+				l.mutableRuntime().pendingDirectionPrompt = nil
+				l.transitionControl(RuntimeControlAwaitingContinuationText)
+				l.refreshInputOwner()
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeUserInputRequest, "어떤 방향으로 계속할지 알려주세요")
+				return nil
+			}); err != nil {
+				klog.ErrorS(err, "react continuation-text transition rejected")
+			}
 			return true
 		}
 		if choice == promptState.FinalizeIdx {
-			l.applyRuntimeCleanup(cleanupDirectionPromptPolicy())
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "진단을 여기서 종료합니다.")
-			l.transitionControl(RuntimeControlAwaitingUserQuery)
+			if err := l.mutateRuntimeAtomically(func() error {
+				l.applyRuntimeCleanup(cleanupDirectionPromptPolicy())
+				l.mutableRuntime().continuationResumePending = false
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "진단을 여기서 종료합니다.")
+				l.transitionControl(RuntimeControlAwaitingUserQuery)
+				return nil
+			}); err != nil {
+				klog.ErrorS(err, "react direction finalize rejected")
+			}
 			return true
 		}
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, fmt.Sprintf("잘못된 방향 선택: %d", choice))
-		l.transitionControl(RuntimeControlAwaitingUserQuery)
+		if err := l.mutateRuntimeAtomically(func() error {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, fmt.Sprintf("잘못된 방향 선택: %d", choice))
+			l.transitionControl(RuntimeControlAwaitingUserQuery)
+			return nil
+		}); err != nil {
+			klog.ErrorS(err, "react invalid direction cleanup rejected")
+		}
 		return true
 	}
 }
@@ -4072,8 +4079,16 @@ func (l *Loop) waitForDirectionText(ctx context.Context) bool {
 		return false
 	case raw := <-l.input:
 		if raw == io.EOF {
-			l.applyRuntimeCleanup(cleanupExitPolicy())
-			l.transitionControl(RuntimeControlExited)
+			if err := l.mutateRuntimeAtomically(func() error {
+				if warning := l.finalizePendingMutationVerification("continuation text input stream reached EOF", contract.AttemptUnknown); warning != "" {
+					l.addMessage(api.MessageSourceAgent, api.MessageTypeError, warning)
+				}
+				l.applyRuntimeCleanup(cleanupExitPolicy())
+				l.transitionControl(RuntimeControlExited)
+				return nil
+			}); err != nil {
+				klog.ErrorS(err, "react direction-text EOF cleanup rejected")
+			}
 			return false
 		}
 		resp, ok := raw.(*api.UserInputResponse)
@@ -4082,9 +4097,14 @@ func (l *Loop) waitForDirectionText(ctx context.Context) bool {
 		}
 		text := strings.TrimSpace(resp.Query)
 		if text == "" {
-			l.applyRuntimeCleanup(cleanupDirectionPromptPolicy())
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "입력이 비어 있어 진단을 종료합니다.")
-			l.transitionControl(RuntimeControlAwaitingUserQuery)
+			if err := l.mutateRuntimeAtomically(func() error {
+				l.applyRuntimeCleanup(cleanupDirectionPromptPolicy())
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "입력이 비어 있어 진단을 종료합니다.")
+				l.transitionControl(RuntimeControlAwaitingUserQuery)
+				return nil
+			}); err != nil {
+				klog.ErrorS(err, "react empty direction cleanup rejected")
+			}
 			return true
 		}
 		l.applyDirectionOption(nextDirectionOption{
@@ -4099,7 +4119,28 @@ func (l *Loop) waitForDirectionText(ctx context.Context) bool {
 // applyDirectionOption translates a chosen direction into runtime lifecycle and
 // resumes the ReAct loop.
 func (l *Loop) applyDirectionOption(opt nextDirectionOption) {
-	continuingAfterFinalReport := l.pendingFinalReport != nil
+	if l.activeTransaction == nil {
+		if err := l.mutateRuntimeAtomically(func() error {
+			l.applyDirectionOptionInTransaction(opt)
+			return nil
+		}); err != nil {
+			klog.ErrorS(err, "react direction option rejected", "kind", opt.Kind)
+		}
+		return
+	}
+	l.applyDirectionOptionInTransaction(opt)
+}
+
+func (l *Loop) applyDirectionOptionInTransaction(opt nextDirectionOption) {
+	if l.mutableRuntime().continuationResumePending {
+		l.resumeContinuationSegment(opt)
+		return
+	}
+	continuingAfterFinalReport := l.mutableRuntime().pendingFinalReport != nil
+	l.recordInternalObservation(
+		"user_input",
+		firstNonEmptyString(opt.Instruction, opt.Summary, "the user selected a continuation direction"),
+	)
 	l.applyRuntimeCleanup(cleanupDirectionPromptPolicy())
 
 	switch opt.Kind {
@@ -4120,10 +4161,10 @@ func (l *Loop) applyDirectionOption(opt nextDirectionOption) {
 		}
 		fmt.Fprintf(&b, "directive: %s\n", opt.Instruction)
 		b.WriteString("Treat this as the active goal alongside the original_query. Choose the single next action that advances it.")
-		l.currChatContent = append(l.currChatContent, b.String())
+		l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, b.String())
 		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("선택한 방향으로 진단을 계속합니다: %s", opt.Summary))
-		l.pendingCalls = nil
-		l.currIteration++
+		l.mutableRuntime().pendingCalls = nil
+		l.mutableRuntime().currIteration++
 		l.transitionControl(RuntimeControlAwaitingModelStep)
 		return
 	case "investigate_resource":
@@ -4138,8 +4179,8 @@ func (l *Loop) continueAfterFinalReport(opt nextDirectionOption) {
 }
 
 func (l *Loop) continueWithGuideFocus(opt nextDirectionOption) {
-	l.guideStepState = nil
-	l.resourceGuideInjected = false
+	l.mutableRuntime().guideStepState = nil
+	l.mutableRuntime().resourceGuideInjected = false
 	l.rewindPhaseBeforeGuidance()
 
 	var b strings.Builder
@@ -4160,10 +4201,10 @@ func (l *Loop) continueWithGuideFocus(opt nextDirectionOption) {
 		fmt.Fprintf(&b, "directive: %s\n", opt.Instruction)
 	}
 	b.WriteString("Choose the next response according to the active phase_plan: continue the pre-guidance phase with one valid action, complete it with phase_progress, or produce a final_report when enough evidence exists.")
-	l.currChatContent = append(l.currChatContent, b.String())
+	l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, b.String())
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("선택한 방향으로 추가 추론을 계속합니다: %s", opt.Summary))
-	l.pendingCalls = nil
-	l.currIteration++
+	l.mutableRuntime().pendingCalls = nil
+	l.mutableRuntime().currIteration++
 	l.transitionControl(RuntimeControlAwaitingModelStep)
 }
 
@@ -4183,14 +4224,14 @@ func (l *Loop) promptProblematicResourceInvestigation(report finalReport) bool {
 	}
 	promptState.FinalizeIdx = len(choices) + 1
 	choices = append(choices, api.UserChoiceOption{Value: "no", Label: "여기서 종료"})
-	l.pendingDirectionPrompt = promptState
+	l.mutableRuntime().pendingDirectionPrompt = promptState
 	l.transitionControl(RuntimeControlAwaitingContinuationChoice)
 	l.refreshInputOwner()
 	l.addMessage(api.MessageSourceAgent, api.MessageTypeUserChoiceRequest, &api.UserChoiceRequest{
 		Prompt:  "문제가 있는 관련 리소스가 확인되었습니다. 추가 조사할 리소스를 선택해 주세요.",
 		Options: choices,
 	})
-	l.pendingCalls = nil
+	l.mutableRuntime().pendingCalls = nil
 	return true
 }
 
@@ -4218,17 +4259,17 @@ func (l *Loop) investigationOptionsFromReport(report finalReport) []nextDirectio
 }
 
 func (l *Loop) problematicResourceIsPrimarySymptom(res problematicResource) bool {
-	if l.requestContext == nil {
+	if l.mutableRuntime().requestContext == nil {
 		return false
 	}
-	primary := l.requestContext.PrimaryTarget
+	primary := l.mutableRuntime().requestContext.PrimaryTarget
 	if primary.Resource == "" || primary.Name == "" {
 		return false
 	}
 	if !resourceNamesEquivalent(res.Kind, primary.Resource) || !strings.EqualFold(strings.TrimSpace(res.Name), strings.TrimSpace(primary.Name)) {
 		return false
 	}
-	if l.requestContext.Scope.Namespace != "" && res.Namespace != "" && !strings.EqualFold(strings.TrimSpace(res.Namespace), strings.TrimSpace(l.requestContext.Scope.Namespace)) {
+	if l.mutableRuntime().requestContext.Scope.Namespace != "" && res.Namespace != "" && !strings.EqualFold(strings.TrimSpace(res.Namespace), strings.TrimSpace(l.mutableRuntime().requestContext.Scope.Namespace)) {
 		return false
 	}
 	reason := strings.ToLower(strings.TrimSpace(res.Reason))
@@ -4269,6 +4310,8 @@ type reActResponse struct {
 	RequirementAnalysis        *requirementAnalysis        `json:"requirement_analysis,omitempty"`
 	RequestContext             *requestContext             `json:"request_context,omitempty"`
 	PhasePlan                  *phasePlan                  `json:"phase_plan,omitempty"`
+	PhasePlanRevision          *phasePlanRevision          `json:"phase_plan_revision,omitempty"`
+	StepResult                 *stepResult                 `json:"step_result,omitempty"`
 	PhaseProgress              *phaseProgress              `json:"phase_progress,omitempty"`
 	Action                     *action                     `json:"action,omitempty"`
 	GuideProgress              *guideProgress              `json:"guide_progress,omitempty"`
@@ -4276,12 +4319,14 @@ type reActResponse struct {
 	FinalReport                *finalReport                `json:"final_report,omitempty"`
 	NextDirections             *nextDirections             `json:"next_directions,omitempty"`
 	MutationVerificationResult *mutationVerificationResult `json:"mutation_verification_result,omitempty"`
+	ContinuationHandoff        *continuationHandoff        `json:"continuation_handoff,omitempty"`
 	InvalidPhaseProgress       bool                        `json:"-"`
 	InvalidAction              bool                        `json:"-"`
 	InvalidResourceGuideLookup bool                        `json:"-"`
 	InvalidFinalReport         bool                        `json:"-"`
 	InvalidDirections          bool                        `json:"-"`
 	InvalidStructuredAnswer    bool                        `json:"-"`
+	InvalidStructuredKeys      []string                    `json:"-"`
 }
 
 type requirementAnalysis = contract.RequirementAnalysis
@@ -4297,6 +4342,8 @@ type action = contract.Action
 type actionTarget = contract.ActionTarget
 type guideProgress = contract.GuideProgress
 type phasePlan = contract.PhasePlan
+type phasePlanRevision = contract.PhasePlanRevision
+type stepResult = contract.StepResult
 type phaseStep = contract.PhaseStep
 type phaseExecutionStep = contract.PhaseExecutionStep
 type phaseProgress = contract.PhaseProgress
@@ -4306,6 +4353,7 @@ type problematicResource = contract.ProblematicResource
 type nextDirections = contract.NextDirections
 type nextDirectionOption = contract.NextDirectionOption
 type mutationVerificationResult = contract.MutationVerificationResult
+type continuationHandoff = contract.ContinuationHandoff
 
 func candidateToShimCandidate(iterator gollm.ChatResponseIterator) (gollm.ChatResponseIterator, error) {
 	return func(yield func(gollm.ChatResponse, error) bool) {
@@ -4325,7 +4373,7 @@ func candidateToShimCandidate(iterator gollm.ChatResponseIterator) (gollm.ChatRe
 			for _, part := range response.Candidates()[0].Parts() {
 				text, ok := part.AsText()
 				if !ok {
-					yield(nil, fmt.Errorf("shim mode expects text-only LLM response"))
+					yield(nil, &shimOutputError{Raw: buffer.String(), Err: fmt.Errorf("shim mode expects text-only LLM response")})
 					return
 				}
 				buffer.WriteString(text)
@@ -4339,11 +4387,30 @@ func candidateToShimCandidate(iterator gollm.ChatResponseIterator) (gollm.ChatRe
 
 		parsed, err := parseReActResponse(buffer.String())
 		if err != nil {
-			yield(nil, err)
+			yield(nil, &shimOutputError{Raw: buffer.String(), Err: err})
 			return
 		}
 		yield(&shimResponse{candidate: parsed}, nil)
 	}, nil
+}
+
+type shimOutputError struct {
+	Raw string
+	Err error
+}
+
+func (e *shimOutputError) Error() string {
+	if e == nil || e.Err == nil {
+		return "invalid shim output"
+	}
+	return e.Err.Error()
+}
+
+func (e *shimOutputError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 func parseReActResponse(input string) (*reActResponse, error) {
@@ -4369,6 +4436,20 @@ func unmarshalReActResponse(data []byte) (*reActResponse, error) {
 		return nil, err
 	}
 	parsed := &reActResponse{}
+	knownKeys := map[string]struct{}{
+		"thought": {}, "answer": {}, "requirement_analysis": {}, "request_context": {},
+		"phase_plan": {}, "phase_plan_revision": {}, "phase_progress": {}, "action": {}, "guide_progress": {},
+		"step_result":           {},
+		"resource_guide_lookup": {}, "final_report": {}, "next_directions": {},
+		"mutation_verification_result": {},
+		"continuation_handoff":         {},
+	}
+	for key := range raw {
+		if _, ok := knownKeys[key]; !ok {
+			parsed.InvalidStructuredKeys = append(parsed.InvalidStructuredKeys, key)
+		}
+	}
+	sort.Strings(parsed.InvalidStructuredKeys)
 	if err := unmarshalOptional(raw, "thought", &parsed.Thought); err != nil {
 		return nil, err
 	}
@@ -4382,6 +4463,12 @@ func unmarshalReActResponse(data []byte) (*reActResponse, error) {
 		return nil, err
 	}
 	if err := unmarshalOptionalPhasePlan(raw, &parsed.PhasePlan); err != nil {
+		return nil, err
+	}
+	if err := unmarshalOptionalPointer(raw, "phase_plan_revision", &parsed.PhasePlanRevision); err != nil {
+		return nil, err
+	}
+	if err := unmarshalOptionalPointer(raw, "step_result", &parsed.StepResult); err != nil {
 		return nil, err
 	}
 	unmarshalOptionalPointerOrInvalid(raw, "phase_progress", &parsed.PhaseProgress, &parsed.InvalidPhaseProgress)
@@ -4411,6 +4498,9 @@ func unmarshalReActResponse(data []byte) (*reActResponse, error) {
 		}
 	}
 	if err := unmarshalOptionalPointer(raw, "mutation_verification_result", &parsed.MutationVerificationResult); err != nil {
+		return nil, err
+	}
+	if err := unmarshalOptionalPointer(raw, "continuation_handoff", &parsed.ContinuationHandoff); err != nil {
 		return nil, err
 	}
 	if parsed.Answer != "" && parsed.hasStructuredOutput() {
@@ -4507,7 +4597,7 @@ type shimCandidate struct {
 }
 
 func (c *shimCandidate) String() string {
-	return fmt.Sprintf("Thought: %s\nAnswer: %s\nRequirementAnalysis: %v\nRequestContext: %v\nPhasePlan: %v\nPhaseProgress: %v\nAction: %v\nGuideProgress: %v\nResourceGuideLookup: %v\nFinalReport: %v\nInvalidFinalReport: %v\nNextDirections: %v\nInvalidDirections: %v", c.candidate.Thought, c.candidate.Answer, c.candidate.RequirementAnalysis, c.candidate.RequestContext, c.candidate.PhasePlan, c.candidate.PhaseProgress, c.candidate.Action, c.candidate.GuideProgress, c.candidate.ResourceGuideLookup, c.candidate.FinalReport, c.candidate.InvalidFinalReport, c.candidate.NextDirections, c.candidate.InvalidDirections)
+	return fmt.Sprintf("Thought: %s\nAnswer: %s\nRequirementAnalysis: %v\nRequestContext: %v\nPhasePlan: %v\nPhasePlanRevision: %v\nPhaseProgress: %v\nAction: %v\nGuideProgress: %v\nResourceGuideLookup: %v\nFinalReport: %v\nInvalidFinalReport: %v\nNextDirections: %v\nInvalidDirections: %v", c.candidate.Thought, c.candidate.Answer, c.candidate.RequirementAnalysis, c.candidate.RequestContext, c.candidate.PhasePlan, c.candidate.PhasePlanRevision, c.candidate.PhaseProgress, c.candidate.Action, c.candidate.GuideProgress, c.candidate.ResourceGuideLookup, c.candidate.FinalReport, c.candidate.InvalidFinalReport, c.candidate.NextDirections, c.candidate.InvalidDirections)
 }
 
 func (c *shimCandidate) Parts() []gollm.Part {
@@ -4519,6 +4609,12 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	if c.candidate.Answer != "" && !structured {
 		parts = append(parts, &shimPart{text: c.candidate.Answer})
 	}
+	if c.candidate.InvalidStructuredAnswer || len(c.candidate.InvalidStructuredKeys) > 0 {
+		return append(parts, &shimPart{
+			invalidStructuredAnswer: c.candidate.InvalidStructuredAnswer,
+			invalidStructuredKeys:   append([]string(nil), c.candidate.InvalidStructuredKeys...),
+		})
+	}
 	if c.candidate.RequirementAnalysis != nil {
 		parts = append(parts, &shimPart{requirementAnalysis: c.candidate.RequirementAnalysis})
 	}
@@ -4527,6 +4623,12 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	}
 	if c.candidate.PhasePlan != nil {
 		parts = append(parts, &shimPart{phasePlan: c.candidate.PhasePlan})
+	}
+	if c.candidate.PhasePlanRevision != nil {
+		parts = append(parts, &shimPart{phasePlanRevision: c.candidate.PhasePlanRevision})
+	}
+	if c.candidate.StepResult != nil {
+		parts = append(parts, &shimPart{stepResult: c.candidate.StepResult})
 	}
 	if c.candidate.PhaseProgress != nil {
 		parts = append(parts, &shimPart{phaseProgress: c.candidate.PhaseProgress})
@@ -4559,8 +4661,8 @@ func (c *shimCandidate) Parts() []gollm.Part {
 	if c.candidate.MutationVerificationResult != nil {
 		parts = append(parts, &shimPart{mutationVerificationResult: c.candidate.MutationVerificationResult})
 	}
-	if c.candidate.InvalidStructuredAnswer {
-		parts = append(parts, &shimPart{invalidStructuredAnswer: true})
+	if c.candidate.ContinuationHandoff != nil {
+		parts = append(parts, &shimPart{continuationHandoff: c.candidate.ContinuationHandoff})
 	}
 	return parts
 }
@@ -4587,6 +4689,8 @@ func (c *reActResponse) hasStructuredOutput() bool {
 	return c.RequirementAnalysis != nil ||
 		c.RequestContext != nil ||
 		c.PhasePlan != nil ||
+		c.PhasePlanRevision != nil ||
+		c.StepResult != nil ||
 		c.PhaseProgress != nil ||
 		c.InvalidPhaseProgress ||
 		c.Action != nil ||
@@ -4598,7 +4702,10 @@ func (c *reActResponse) hasStructuredOutput() bool {
 		c.InvalidFinalReport ||
 		c.NextDirections != nil ||
 		c.InvalidDirections ||
-		c.MutationVerificationResult != nil
+		c.MutationVerificationResult != nil ||
+		c.ContinuationHandoff != nil ||
+		c.InvalidStructuredAnswer ||
+		len(c.InvalidStructuredKeys) > 0
 }
 
 type shimPart struct {
@@ -4606,6 +4713,8 @@ type shimPart struct {
 	requirementAnalysis        *requirementAnalysis
 	requestContext             *requestContext
 	phasePlan                  *phasePlan
+	phasePlanRevision          *phasePlanRevision
+	stepResult                 *stepResult
 	phaseProgress              *phaseProgress
 	invalidPhaseProgress       bool
 	action                     *action
@@ -4618,7 +4727,9 @@ type shimPart struct {
 	nextDirections             *nextDirections
 	invalidDirections          bool
 	mutationVerificationResult *mutationVerificationResult
+	continuationHandoff        *continuationHandoff
 	invalidStructuredAnswer    bool
+	invalidStructuredKeys      []string
 }
 
 func (p *shimPart) AsText() (string, bool) {
@@ -4632,7 +4743,7 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 			return nil, false
 		}
 		return []gollm.FunctionCall{{
-			Name:      internalRequirementAnalysisCall,
+			Name:      protocol.RequirementAnalysisCall,
 			Arguments: args,
 		}}, true
 	}
@@ -4642,7 +4753,7 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 			return nil, false
 		}
 		return []gollm.FunctionCall{{
-			Name:      internalRequestContextCall,
+			Name:      protocol.RequestContextCall,
 			Arguments: args,
 		}}, true
 	}
@@ -4652,7 +4763,27 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 			return nil, false
 		}
 		return []gollm.FunctionCall{{
-			Name:      internalPhasePlanCall,
+			Name:      protocol.PhasePlanCall,
+			Arguments: args,
+		}}, true
+	}
+	if p.phasePlanRevision != nil {
+		args, err := toMap(p.phasePlanRevision)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      protocol.PhasePlanRevisionCall,
+			Arguments: args,
+		}}, true
+	}
+	if p.stepResult != nil {
+		args, err := toMap(p.stepResult)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      protocol.StepResultCall,
 			Arguments: args,
 		}}, true
 	}
@@ -4662,13 +4793,13 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 			return nil, false
 		}
 		return []gollm.FunctionCall{{
-			Name:      internalPhaseProgressCall,
+			Name:      protocol.PhaseProgressCall,
 			Arguments: args,
 		}}, true
 	}
 	if p.invalidPhaseProgress {
 		return []gollm.FunctionCall{{
-			Name:      internalPhaseProgressCall,
+			Name:      protocol.PhaseProgressCall,
 			Arguments: map[string]any{},
 		}}, true
 	}
@@ -4678,7 +4809,7 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 			return nil, false
 		}
 		return []gollm.FunctionCall{{
-			Name:      internalGuideProgressCall,
+			Name:      protocol.GuideProgressCall,
 			Arguments: args,
 		}}, true
 	}
@@ -4688,13 +4819,13 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 			return nil, false
 		}
 		return []gollm.FunctionCall{{
-			Name:      internalResourceGuideLookupCall,
+			Name:      protocol.ResourceGuideLookupCall,
 			Arguments: args,
 		}}, true
 	}
 	if p.invalidResourceGuideLookup {
 		return []gollm.FunctionCall{{
-			Name:      internalResourceGuideLookupCall,
+			Name:      protocol.ResourceGuideLookupCall,
 			Arguments: map[string]any{},
 		}}, true
 	}
@@ -4704,13 +4835,13 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 			return nil, false
 		}
 		return []gollm.FunctionCall{{
-			Name:      internalFinalReportCall,
+			Name:      protocol.FinalReportCall,
 			Arguments: args,
 		}}, true
 	}
 	if p.invalidFinalReport {
 		return []gollm.FunctionCall{{
-			Name:      internalFinalReportCall,
+			Name:      protocol.FinalReportCall,
 			Arguments: map[string]any{},
 		}}, true
 	}
@@ -4720,7 +4851,7 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 			return nil, false
 		}
 		return []gollm.FunctionCall{{
-			Name:      internalNextDirectionsCall,
+			Name:      protocol.NextDirectionsCall,
 			Arguments: args,
 		}}, true
 	}
@@ -4730,25 +4861,35 @@ func (p *shimPart) AsFunctionCalls() ([]gollm.FunctionCall, bool) {
 			return nil, false
 		}
 		return []gollm.FunctionCall{{
-			Name:      internalMutationVerificationResultCall,
+			Name:      protocol.MutationVerificationResultCall,
+			Arguments: args,
+		}}, true
+	}
+	if p.continuationHandoff != nil {
+		args, err := toMap(p.continuationHandoff)
+		if err != nil {
+			return nil, false
+		}
+		return []gollm.FunctionCall{{
+			Name:      protocol.ContinuationHandoffCall,
 			Arguments: args,
 		}}, true
 	}
 	if p.invalidDirections {
 		return []gollm.FunctionCall{{
-			Name:      internalNextDirectionsCall,
+			Name:      protocol.NextDirectionsCall,
 			Arguments: map[string]any{},
 		}}, true
 	}
-	if p.invalidStructuredAnswer {
+	if p.invalidStructuredAnswer || len(p.invalidStructuredKeys) > 0 {
 		return []gollm.FunctionCall{{
-			Name:      internalInvalidStructuredOutputCall,
-			Arguments: map[string]any{},
+			Name:      protocol.InvalidStructuredOutputCall,
+			Arguments: protocol.InvalidShimStructuredOutputArguments(p.invalidStructuredAnswer, p.invalidStructuredKeys),
 		}}, true
 	}
 	if p.invalidAction {
 		return []gollm.FunctionCall{{
-			Name:      internalInvalidActionCall,
+			Name:      protocol.InvalidActionCall,
 			Arguments: map[string]any{},
 		}}, true
 	}
@@ -4778,32 +4919,6 @@ func toMap(v any) (map[string]any, error) {
 	return result, nil
 }
 
-const (
-	internalResourceGuideLookupCall        = protocol.ResourceGuideLookupCall
-	internalRequestContextCall             = protocol.RequestContextCall
-	internalRequirementAnalysisCall        = protocol.RequirementAnalysisCall
-	internalPhasePlanCall                  = protocol.PhasePlanCall
-	internalPhaseProgressCall              = protocol.PhaseProgressCall
-	internalGuideProgressCall              = protocol.GuideProgressCall
-	internalFinalReportCall                = protocol.FinalReportCall
-	internalNextDirectionsCall             = protocol.NextDirectionsCall
-	internalMutationVerificationResultCall = protocol.MutationVerificationResultCall
-	internalInvalidActionCall              = protocol.InvalidActionCall
-	internalInvalidStructuredOutputCall    = protocol.InvalidStructuredOutputCall
-)
-
-func onlyFunctionCall(calls []gollm.FunctionCall, name string) bool {
-	return protocol.OnlyFunctionCall(calls, name)
-}
-
-func isRuntimeInternalCall(name string) bool {
-	return protocol.IsRuntimeInternalCall(name)
-}
-
-func normalizeAssistantStructuredFunctionCalls(calls []gollm.FunctionCall) []gollm.FunctionCall {
-	return protocol.NormalizeAssistantStructuredFunctionCalls(calls)
-}
-
 type toolFailureClass string
 
 const (
@@ -4819,6 +4934,28 @@ func (l *Loop) annotateToolFailureResult(call PendingCall, result map[string]any
 	if result == nil || toolResultSucceeded(result) {
 		return GateOutcome{}, false
 	}
+	if verificationflow.CanRequestResult(verificationEvidenceQualification(result)) {
+		if _, matches := l.mutationVerificationCallMatchID(call.FunctionCall); matches {
+			result["verification_observation"] = true
+			return GateOutcome{}, false
+		}
+	}
+	modifiesResource := strings.TrimSpace(call.ModifiesResource)
+	if modifiesResource != "" && !strings.EqualFold(modifiesResource, "no") && mutationExecutionUncertain(result) {
+		result["failure_class"] = string(toolFailureUnknown)
+		result["retryable"] = false
+		result["retry_scope"] = string(RetryScopeExternalState)
+		result["suggested_response"] = "Do not repeat the mutation. Use read-only observations to determine whether the uncertain mutation took effect."
+		return GateOutcome{
+			Kind:            GateOutcomeExternalStateWait,
+			Code:            "mutation_execution_uncertain",
+			Retryable:       false,
+			RetryScope:      RetryScopeExternalState,
+			ModelCorrection: "The mutating tool invocation ended with an uncertain outcome. Do not execute the mutation again. Satisfy the active mutation verification requirements with read-only observations, then return mutation_verification_result.",
+			CorrectionMode:  CorrectionModeAppendCompacted,
+			BranchPolicy:    BranchStayCurrent,
+		}, true
+	}
 	detail := toolFailureDetail(result)
 	class := classifyToolFailure(detail)
 	if isPartialToolResult(result) {
@@ -4833,7 +4970,7 @@ func (l *Loop) annotateToolFailureResult(call PendingCall, result map[string]any
 	result["retryable"] = retryable
 	result["retry_scope"] = string(scope)
 	result["suggested_response"] = toolFailureSuggestedResponse(class)
-	command, _ := commandString(call.FunctionCall.Arguments["command"])
+	command, _ := rawCommandString(call.FunctionCall.Arguments["command"])
 	correction := toolFailureCorrection(class, call.FunctionCall.Name, command, detail)
 	return GateOutcome{
 		Kind:            GateOutcomeToolExecutionFailure,
@@ -4914,7 +5051,7 @@ func classifyToolFailure(detail string) toolFailureClass {
 func toolFailureRetryPolicy(class toolFailureClass) (bool, RetryScope) {
 	switch class {
 	case toolFailureRBAC:
-		return false, RetryScopeUserRequest
+		return true, RetryScopeCurrentPhase
 	case toolFailureTimeout:
 		return true, RetryScopeExternalState
 	case toolFailureNotFound:
@@ -4933,7 +5070,7 @@ func toolFailureSuggestedResponse(class toolFailureClass) string {
 	case toolFailureCommandSyntax:
 		return "Retry with a corrected non-interactive command that observes the same evidence."
 	case toolFailureRBAC:
-		return "Do not repeat the same forbidden command. Use alternative permitted evidence if possible, or report the permission blocker when appropriate."
+		return "Do not repeat the same forbidden command. Use permitted evidence when possible. If the request actually requires an RBAC change, propose it as a separate risky mutating action with direct verification so the runtime can request exact user approval."
 	case toolFailureNotFound:
 		return "Recheck the target name, namespace, and resource kind before retrying or asking for clarification."
 	case toolFailureTimeout:

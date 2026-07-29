@@ -1,14 +1,18 @@
 # ReAct Runtime Renewal 계획 기준 문서
 
-> 상태: Gate/phase/step 구현 이력. 2026-07 state/package renewal로 control 전제 일부가 대체됨.
+> 상태: Gate/phase/step 구현 이력을 보존하는 superseded 설계 문서다. 현재 구현 계약으로
+> 사용하지 않는다.
 >
-> 현재 package 대응은 `contract`(enum/ref/outcome payload), `session`(mutable control/phase/
-> verification/context), `flow/gate`(outcome/correction rule), `coordinator`(gate 적용과 I/O)다.
-> 본문의 삭제된 `internal/react/*.go` 경로는 구현 당시 위치다. 특히 “ControlState는
-> 항상 flags에서 파생하며 직접 저장하지 않는다”는 결론은 현재 계약이 아니다. 현재 목표는
-> `session.State.Control`을 명시적 source of truth로 두고 snapshot을 그 상태에서 만드는
-> 것이다. 최신 구조는 [`../architecture_orchestrator_react.md`](../architecture_orchestrator_react.md),
-> 남은 이전 작업은 [`../TODO.md`](../TODO.md)를 기준으로 본다.
+> 현재 package 대응은 `contract`(enum/ref/outcome payload), `session`(revisioned aggregate와
+> execution ledger), `flow/gate`(outcome/correction rule), `coordinator`(package-private
+> `runtimeState`, gate 적용과 I/O)다. 본문의 `session.State`, coordinator compatibility field,
+> 삭제된 `internal/react/*.go` 경로는 구현 당시 전제다. 현재 source of truth는
+> `session.Aggregate[runtimeState]`가 소유하는 단일 root이며 snapshot은 그 root에서 투영한다.
+> 최신 구조는 [`../architecture_orchestrator_react.md`](../architecture_orchestrator_react.md)와
+> [`react_remediation_plans/08_turn_output_contract_and_goal_execution.md`](react_remediation_plans/08_turn_output_contract_and_goal_execution.md)를 기준으로 본다.
+> 본문 이력의 `BranchRecheckStep`은 현재 코드에 없다. Producer 없는 branch가 mutation
+> continuation budget을 공유하던 중복 경로였으므로 제거했고, temporal recheck는
+> mutation verification `await_state` control과 verification evidence budget이 전담한다.
 
 이 문서는 `internal/react`의 gate 처리 구조를 바로 바꾸기 전에, 현재 코드와 충돌하지 않는 공통화 방향과 실행 순서를 정리하기 위한 계획 기준 문서다. 목표는 read-only, structured output, mutation verification, guidance, approval gate가 서로 다른 의미의 차단을 같은 방식으로 오해하지 않게 만들고, 이후 4-6회에 나누어 코드 구조를 리뉴얼할 수 있는 작업 단위를 고정하는 것이다.
 
@@ -24,7 +28,7 @@
 
 ## 첫 계획 대비 변경된 내용
 
-처음 계획은 `GateOutcome`을 중심으로 read-only/self-talk/read-only unknown 같은 gate 결과를 구분하는 데 초점이 있었다. 이후 검토를 거치며 목표가 더 넓어졌다.
+처음 계획은 `GateOutcome`을 중심으로 read-only known/unknown 같은 gate 결과를 구분하는 데 초점이 있었다. 이후 검토를 거치며 목표가 더 넓어졌다.
 
 | 항목 | 첫 계획 | 현재 계획 |
 | --- | --- | --- |
@@ -67,8 +71,8 @@ Step    = execution/evidence step
 - 현재 runtime control role을 `ControlState`로 일관되게 파생한다.
 - 모든 주요 gate는 같은 결과 구조로 "허용/수정/재시도/차단/재분기"를 표현한다.
 - phase는 top-level 업무 단위로 표현하고, 기존 `phase_steps` 명칭 혼동을 코드 내부에서 줄인다.
-- step은 guide step, mutation evidence requirement, 일반 action을 모두 주소 지정할 수 있다.
-- read-only unknown, shell self-talk, target mismatch 같은 agent command 오류는 final report가 아니라 current phase/step retry로 돌아간다.
+- step은 guide step, active mutation verification check, 일반 action을 모두 주소 지정할 수 있다.
+- read-only unknown, target mismatch 같은 agent command 오류는 final report가 아니라 current phase/step retry로 돌아간다.
 - read-only mutation, approval denial 같은 사용자 요청 blocker는 agent retry와 분리된다.
 - mutation 이후에는 verification phase/step이 완료되기 전 final report로 빠지지 않는다.
 - guidance/runbook 검색 실패는 실패로 끝나며, 다른 RAG를 억지 fallback하지 않는다.
@@ -83,10 +87,10 @@ Step    = execution/evidence step
 | --- | --- | --- | --- |
 | 1차 | 주소 체계와 runtime projection 정리 | `PhaseRef`, `StepRef`, `StepKind`, `StepStatus`, `PhaseRuntime.Active`, `ActiveSteps` 추가 | 기존 동작 변화 없이 현재 phase/guide/mutation state를 주소로 표현 |
 | 2차 | GateOutcome 골격 도입 | `GateOutcome`, `GateOutcomeKind`, `RetryScope`, `BranchPolicy`, validation/apply skeleton 추가 | 기존 gate는 유지하되 outcome validation 테스트 가능 |
-| 3차 | Command policy gate 이전 | self-talk, read-only unknown/mutation, interactive, target/resource validation을 outcome으로 표현 | agent retry와 user blocker가 코드상 분리 |
+| 3차 | Command policy gate 이전 | read-only unknown/mutation, interactive, target/resource validation을 outcome으로 표현 | agent retry와 user blocker가 코드상 분리 |
 | 4차 | Structured output gate 이전 | requirement, phase_plan, phase_progress, final_report, next_directions, guide_progress validation을 outcome으로 표현 | 모델 출력 correction과 phase/step retry가 섞이지 않음 |
 | 5차 | StepRuntime adapter 적용 | guide/mutation/general action step projection, guide/mutation complete/retry/skip, phase-scoped cleanup primitive 초안 | gate가 guide/mutation step을 명시적으로 겨냥할 수 있음 |
-| 6차 | Phase rebranch hardening | `TargetPhase`, allowed_next/runtime override, cleanup policy, `BranchRecheckStep` 적용 | gate가 current/target phase로 안전하게 재분기 가능 |
+| 6차 | Phase rebranch hardening | `TargetPhase`, allowed_next/runtime override, cleanup policy, 당시 `BranchRecheckStep` 적용안 | gate가 current/target phase로 안전하게 재분기 가능 |
 
 명시적으로 제외하는 작업은 아래와 같다.
 
@@ -104,10 +108,10 @@ Step    = execution/evidence step
 | --- | --- | --- | --- |
 | 1차 주소 체계/projection | 완료 | `RuntimeSnapshot`이 `PhaseRuntime`과 `ActiveSteps`를 노출하고, `PhaseRef`/`StepRef`/`StepKind`/`StepStatus` 타입과 runtime anchor가 추가됨 | `RuntimeSnapshot` shallow pointer 필드는 후속 정리 |
 | 2차 GateOutcome skeleton | 완료 | `GateOutcome`/enum/validation/apply skeleton이 추가되고, 기존 `GateDecision` wrapper는 제거됨 | gate별 outcome kind 세분화는 후속 정리 |
-| 3차 Command policy gate | 완료 | self-talk shell action, read-only unknown/mutation block, interactive command block, target/resource validation이 `GateOutcome` apply path를 사용함 | approval UX는 기존 mutation approval flow 유지 |
+| 3차 Command policy gate | 완료 | read-only unknown/mutation block, interactive command block, target/resource validation이 `GateOutcome` apply path를 사용함 | approval UX는 `risk.risky=true` exact payload에 적용 |
 | 4차 Structured output gate | 완료 | requirement/request/phase/final/next/guide/resource-guide/mutation verification correction path가 `GateOutcome` helper를 사용하고, native raw-text fallback도 shim 변환기를 재사용함. final_report와 guided phase_progress 동시 요청은 fatal invariant가 아니라 control precedence로 처리함 | structured gate별 outcome kind 세분화는 후속 정리 |
 | 5차 StepRuntime adapter | 완료 | guide/mutation/general action step projection과 guide/mutation completion/retry/skip adapter가 추가됨. native raw-text `guide_progress` fallback parity, mutation continuation budget reset, phase-scoped cleanup primitive 초안이 추가됨 | general action retry/mark/skip adapter는 explicit step store 도입 전까지 의도적으로 제외 |
-| 6차 Phase rebranch hardening | 완료(primitive) | `BranchMovePhase`는 `allowed_next` 또는 제한된 runtime override를 검증하고, `BranchRewindPhase`는 source gate code와 rewind 방향을 검증하며, `BranchRecheckStep`은 mutation continuation budget을 소비함 | 개별 production gate가 어떤 target phase/step을 지정할지는 후속 gate별 이전에서 확대 |
+| 6차 Phase rebranch hardening | 완료(primitive) | `BranchMovePhase`는 `allowed_next` 또는 제한된 runtime override를 검증하고, `BranchRewindPhase`는 source gate code와 rewind 방향을 검증함. 당시 `BranchRecheckStep`은 이후 제거됨 | 개별 production gate가 어떤 target phase/step을 지정할지는 후속 gate별 이전에서 확대 |
 | 7차 Explicit phase steps | 완료(보존형) | `phase_steps[].steps[]`를 optional 선언형 step으로 parse/validate하고 `PhaseSpec.Steps` 및 runtime anchor에 투영함 | 모든 phase에 `steps[]`를 강제하지 않으며, explicit phase step은 아직 직접 mark/retry/skip 대상이 아님 |
 
 ## 실행 요청별 계약
@@ -118,7 +122,7 @@ Step    = execution/evidence step
 | --- | --- | --- | --- | --- |
 | 1차 | `internal/react/runtime_state.go`, phase/guide/mutation state helper | active control, active phase, active step을 읽는 projection API와 테스트 | gate 결과 처리, read-only 판정, prompt/schema 변경 | runtime state를 주소로 설명할 수 있음 |
 | 2차 | 새 gate outcome 타입 파일, 기존 correction wrapper 주변 | `GateOutcome` validation/apply skeleton, 기존 `GateDecision` 제거 | 실제 gate migration, control 직접 set API, phase 이동 적용 | gate 결과를 공통 타입으로 표현할 수 있음 |
-| 3차 | command policy gate 경로 | self-talk/read-only/interactive/target validation의 outcome화 | structured output gate 수정, guide/mutation 상태 변경 | command 실패가 retry/blocker/policy로 분리됨 |
+| 3차 | command policy gate 경로 | read-only/interactive/target validation의 outcome화 | structured output gate 수정, guide/mutation 상태 변경 | command 실패가 retry/blocker/policy로 분리됨 |
 | 4차 | structured output gate 경로 | requirement/phase/final/next/guide/mutation result validation의 outcome화 | command policy 재설계, phase graph 자동 재작성 | 모델 출력 correction과 runtime branch 의미가 분리됨 |
 | 5차 | step adapter와 제한적 branch apply 경로 | guide/mutation/general action step adapter, step target apply, phase-scoped cleanup primitive 초안 | cleanup primitive 없는 completed phase rewind, general action 직접 mark/retry/skip, `phase_steps` schema 제거 | gate가 guide/mutation step으로 재분기 가능 |
 
@@ -135,7 +139,7 @@ Step    = execution/evidence step
 | 실행 | 목표 | 분리 기준 |
 | --- | --- | --- |
 | 5차 | StepRuntime adapter 도입 | guide/mutation/general action을 공통 step ref로 관측하고, guide/mutation step에 한해 complete/retry/skip을 적용한다 |
-| 6차 | Phase 재분기 hardening | `TargetPhase`, `BranchPolicy`, allowed_next/runtime override, cleanup policy, `BranchRecheckStep`을 실제 runtime branch 정책으로 정리한다 |
+| 6차 | Phase 재분기 hardening | `TargetPhase`, `BranchPolicy`, allowed_next/runtime override, cleanup policy와 당시 recheck branch 적용안을 정리한다 |
 
 이 경우에도 `BranchRewindPhase`는 cleanup primitive가 없으면 활성화하지 않는다.
 
@@ -244,15 +248,15 @@ go test ./internal/react -run 'Test.*GateOutcome.*|Test.*PhasePlan.*' -count=1
 
 ### 3차 상세: Command policy gate 이전
 
-목표는 tool 실행 전후 command policy 실패를 같은 outcome 모델로 옮기는 것이다. 여기서 read-only/self-talk 버그가 구조적으로 정리되어야 한다.
+목표는 tool 실행 전후 command policy 실패를 같은 outcome 모델로 옮기는 것이다. 여기서 read-only command 분류 문제가 구조적으로 정리되어야 한다.
 
 수정 대상:
 
 | 파일 | 변경 내용 |
 | --- | --- |
-| `internal/react/loop.go` | `non-observation shell action`, `analyzeToolCalls`, interactive/read-only/approval 전 gate 호출 순서 정리 |
+| `internal/react/loop.go` | `analyzeToolCalls`, interactive/read-only/approval gate 호출 순서 정리 |
 | `internal/react/action_target_validation.go` | target/resource validation 결과를 `GateOutcome`으로 변환 |
-| `internal/react/readonly_test.go` | read-only known/unknown/self-talk/safe pipeline 회귀 케이스 보강 |
+| `internal/react/readonly_test.go` | read-only known/unknown/safe pipeline 회귀 케이스 보강 |
 | `internal/react/gate_outcome.go` | command gate apply 정책 추가 |
 | `prompts/default.tmpl` | 필요한 경우 read-only context를 더 명확히 하되, schema 변경은 하지 않음 |
 
@@ -260,7 +264,6 @@ go test ./internal/react -run 'Test.*GateOutcome.*|Test.*PhasePlan.*' -count=1
 
 | 케이스 | Outcome kind | RetryScope | UserVisible | 다음 흐름 |
 | --- | --- | --- | --- | --- |
-| `echo "..."` self-talk | `agent_command_retry` | `agent_correct_command` | 낮음 | current implicit action step 재시도 |
 | read-only safety unknown | `agent_command_retry` | `agent_correct_command` | 낮음/중간 | 더 구체적인 read-only kubectl command 요구 |
 | read-only known mutation | `user_request_blocked` | `user_request_blocked_by_read_only` | 높음 | 같은 mutation retry 금지 |
 | interactive command | `policy_block` | `agent_correct_command` | 중간 | non-interactive 대안 요구 |
@@ -270,16 +273,15 @@ go test ./internal/react -run 'Test.*GateOutcome.*|Test.*PhasePlan.*' -count=1
 구현 순서:
 
 1. command gate 평가 함수를 만든다. 실행 전 gate와 `PendingCall` 분석 후 gate를 분리한다.
-2. self-talk shell command는 read-only gate보다 먼저 잡는다.
+2. dispatch 후보로 남은 external action을 `analyzeToolCalls`에서 parse하고 effect를 분류한다.
 3. read-only unknown은 final report로 가지 않고 retry directive를 만든다.
 4. read-only known mutation은 blocker로 만들고 같은 mutation command 재시도를 막는다.
 5. interactive/process substitution/heredoc 같은 실행 정책 위반은 `policy_block`으로 분리한다.
 6. target/resource validation 결과를 outcome으로 반환하게 바꾸되 메시지 내용은 기존 의미를 유지한다.
-7. approval gate는 mutation 가능성이 남은 경우에만 기존 UX로 진행한다.
+7. approval gate는 command가 `risk.risky=true`를 선언한 경우 exact payload 승인 UX로 진행한다.
 
 실패하면 안 되는 케이스:
 
-- self-talk가 read-only blocker로 기록됨.
 - `kubectl api-resources`, `kubectl get`, safe pipeline이 unknown으로 막힘.
 - read-only mutation을 agent retry로 처리해서 같은 mutation을 반복함.
 - target mismatch correction이 final report를 유도함.
@@ -360,7 +362,7 @@ go test ./internal/react -run 'Test.*Requirement.*|Test.*Phase.*|Test.*Final.*|T
 | --- | --- |
 | `internal/react/step_runtime.go` | 새 파일. guide/mutation/general action step adapter |
 | `internal/react/phase_plan.go` | phase projection과 phase move/rewind helper. cleanup primitive 준비 |
-| `internal/react/mutation_lifecycle.go` | verification requirement를 step adapter로 연결 |
+| `internal/react/mutation_lifecycle.go` | active verification check를 step adapter로 연결 |
 | `internal/react/resource_guidance.go` | guide diagnostic step을 step adapter로 연결 |
 | `internal/react/loop.go` | `ApplyGateOutcome`이 branch policy를 실행하는 진입점 연결 |
 | `internal/react/runtime_state_anchor.go` | compaction 후 active phase/step anchor 보존 |
@@ -370,7 +372,7 @@ Step adapter 계약:
 | Step kind | 저장 실체 | 식별자 | 완료 판정 | retry 의미 |
 | --- | --- | --- | --- | --- |
 | `guide_diagnostic` | `guideStepState` | 1-based `Index` | `Completed[Index]` 또는 runtime `Skipped[Index]` | 같은 guide step 또는 다음 guide step |
-| `mutation_evidence` | `pendingMutationVerification.Requirements` | stable `ID` | `Satisfied[ID]` 또는 runtime `Skipped[ID]` | 같은 evidence command 또는 next_action |
+| `mutation_evidence` | `pendingMutationVerification.Checks[ActiveIndex]` | stable `VerificationID` | check status가 satisfied/failed/skipped | 같은-ID await-state recheck 또는 다음 ordered check |
 | `general_action` | persistent store 없음 | ephemeral current action ref, completed action record | tool observation/action record | current phase에서 action 재작성. 직접 mark/retry는 하지 않음 |
 
 구현 순서:
@@ -381,7 +383,8 @@ Step adapter 계약:
 4. `resetPhaseScopedState(fromPhase, policy)` 초안을 만든다.
 5. `BranchSkipStep`은 guide/mutation처럼 persistent terminal state가 있는 step에만 적용한다.
 6. `BranchMovePhase`와 `BranchRewindPhase`는 최소 연결 후, Phase 6에서 allowed_next/runtime override/cleanup policy hardening을 적용한다.
-7. `BranchRecheckStep`은 Phase 6에서 mutation continuation recheck budget과 연결한다.
+7. 당시 `BranchRecheckStep` 연결안은 폐기했다. 현재 temporal recheck는 verification ID와
+   verification evidence budget 안에서만 진행한다.
 
 실패하면 안 되는 케이스:
 
@@ -417,10 +420,10 @@ go test ./internal/react -run 'Test.*StepRuntime.*|Test.*Branch.*|Test.*Mutation
 
 현재 ReAct loop에는 여러 종류의 gate가 있다. 일부는 모델 출력 형식을 고치기 위한 correction이고, 일부는 agent가 낸 잘못된 command를 재시도하게 하는 gate이며, 일부는 사용자의 요청 자체가 runtime policy에 의해 막힌 상태다.
 
-예를 들어 read-only 모드에서 `kubectl delete pod`가 막힌 것과, 모델이 `echo "다음 단계는..."` 같은 self-talk command를 낸 것은 같은 "blocked"가 아니다.
+예를 들어 read-only 모드에서 `kubectl delete pod`가 막힌 것과, 안전성을 판정할 수 없는 command가 거부된 것은 같은 "blocked"가 아니다.
 
 - `kubectl delete pod`: 사용자가 요구한 변경이 read-only policy와 충돌한다. agent가 같은 명령을 재시도하면 안 된다.
-- `echo "..."`: agent가 관찰이 아닌 설명을 tool call로 잘못 냈다. 사용자의 요청이 막힌 것이 아니라 agent output을 고쳐야 한다.
+- safety unknown command: runtime이 read-only임을 증명할 수 없다. agent가 구체적인 read-only Kubernetes action으로 고쳐야 한다.
 - 안전성을 판정하지 못한 command: runtime이 실행하지 않았지만, 이 경우도 곧바로 final report로 가면 안 된다. 더 구체적인 read-only 진단 command로 재시도해야 한다.
 
 이 구분이 흐려지면 "read-only가 진단을 막았다" 같은 잘못된 최종 보고서가 나온다.
@@ -440,8 +443,7 @@ flowchart TD
   G --> H["final_report / next_directions gate"]
   H --> I["target/resource/first diagnostic validation"]
   I --> J["assistant-managed tool filtering"]
-  J --> K["non-observation shell action gate"]
-  K --> L["analyzeToolCalls"]
+  J --> L["analyzeToolCalls and effect classification"]
   L --> M["interactive command gate"]
   M --> N["read-only gate"]
   N --> O["approval gate"]
@@ -452,9 +454,9 @@ flowchart TD
 
 - `requirement_analysis`, `phase_plan`, `phase_progress`는 모델의 structured output contract를 강제한다.
 - `target/resource validation`은 action이 사용자 요청의 scope를 벗어나지 않게 한다.
-- `non-observation shell action`은 tool 실행 전, 관찰이 아닌 shell self-talk를 막는다.
+- dispatch 후보로 남은 external action은 `analyzeToolCalls`에서 parse되고 effect classification을 거친다.
 - `read-only gate`는 `analyzeToolCalls` 이후 `PendingCall.ModifiesResource` 판정을 바탕으로 동작한다.
-- `approval gate`는 mutation 가능성이 확인된 뒤 사용자 승인을 요구한다.
+- `approval gate`는 command가 `risk.risky=true`일 때 exact payload 사용자 승인을 요구한다.
 
 따라서 공통 타입을 도입하더라도 모든 gate를 한 번에 합치면 안 된다. 특히 tool observation은 `PendingCall`이 만들어진 뒤에만 안정적으로 기록할 수 있다.
 
@@ -534,9 +536,9 @@ Step:
 | Control | `RuntimeSnapshot.Control`이 현재 상태를 파생한다 | 유지하되 runtime control state로 정의한다 |
 | Gate | `runIteration` 곳곳에 correction/validation/read-only/approval이 흩어져 있다 | `GateOutcomeKind`로 타입화한다 |
 | Phase | `phaseStepState.PhaseSteps`가 사실상 phase graph인데 이름이 step이다 | 개념상 top-level phase로 고정하고, 향후 이름을 `PhaseState` 쪽으로 정리한다 |
-| Step | guide step, mutation evidence requirement만 명확한 nested step이다 | 모든 phase가 N개 step을 갖도록 일반화한다 |
+| Step | guide step, active mutation verification check만 명확한 nested step이다 | 모든 phase가 N개 step을 갖도록 일반화한다 |
 
-특히 `phaseStepState.PhaseSteps`는 이름 때문에 혼동이 크다. 목표 설계에서는 이것을 "phase step"이 아니라 **top-level phase**로 본다. 반대로 `guideStepState.StepDetails`와 mutation evidence requirement는 **phase 내부 step**이다.
+특히 `phaseStepState.PhaseSteps`는 이름 때문에 혼동이 크다. 목표 설계에서는 이것을 "phase step"이 아니라 **top-level phase**로 본다. 반대로 `guideStepState.StepDetails`와 active mutation verification check는 **phase 내부 step**이다.
 
 ### Control은 runtime control state다
 
@@ -570,7 +572,7 @@ Gate는 단순 차단기가 아니라 phase/step/control 흐름을 결정하는 
 | --- | --- | --- |
 | requirement gate | phase plan으로 진행 | requirement correction |
 | read-only gate | command 실행 가능 | mutation blocker 또는 command retry |
-| approval gate | mutation 실행 | 사용자 거절/중단/대안 |
+| approval gate | `risk.risky=true` command 실행 | 사용자 거절/중단/대안 |
 | resource guide gate | guide lookup 또는 guided diagnosis 진입 | ordinary diagnostic 유지 |
 | mutation verification gate | report/next phase 허용 | evidence step 계속 수행 |
 | user input gate | choice/text/approval을 해당 handler로 전달 | meta command 처리, invalid input 재요청, 취소 |
@@ -693,8 +695,8 @@ Steps:
 | `ControlAwaitingGuidedPhaseProgress` | phase completion | nested guide step 완료 후 phase 완료를 결정해야 함 | `guided_phase_progress_required` gate |
 | `ControlAwaitingFinalReport` | report synthesis | 최종 보고서를 작성해야 함 | `final_report_required` gate |
 | `ControlAwaitingNextDirections` | continuation planning | inconclusive report 뒤 다음 흐름을 제안해야 함 | `next_directions_required` gate |
-| `ControlAwaitingApproval` | approval wait | mutation 실행 전 사용자 승인이 필요함 | approval handler |
-| `ControlExecutingTool` | tool execution | tool dispatch 중이라 다른 control input을 받지 않음 | input 차단/표시용 |
+| `ControlAwaitingApproval` | approval wait | `risk.risky=true` command 실행 전 사용자 승인이 필요함 | approval handler |
+| `ControlAwaitingToolResult` | committed tool dispatch result | pre-dispatch intent가 commit된 뒤 reconciliation 전까지 다른 control input을 받지 않음 | input 차단/복구용 |
 | `ControlAwaitingMutationVerificationEvidence` | verification evidence collection | mutation 후 어떤 evidence step을 수행할지 결정해야 함 | mutation verification evidence gate |
 | `ControlAwaitingMutationVerificationResult` | verification result classification | evidence 수집 후 해결/진행/미해결을 판정해야 함 | `mutation_verification_result_required` gate |
 | `ControlAwaitingMutationContinuation` | mutation continuation planning | progressing/unresolved 뒤 다음 action 방향을 결정해야 함 | mutation continuation gate |
@@ -727,7 +729,7 @@ Control은 구현상 `phase`, `step`, `gate`를 모두 반영해 파생되지만
 | Step category | 코드 | 목적 | 상위 phase/control | completion |
 | --- | --- | --- | --- | --- |
 | resource guide diagnostic step | `guideStepState` | RAG guide의 diagnostic steps를 순차적으로 추적 | `guided_diagnosis` phase, `ControlAwaitingGuidedDiagnosisStep` | `guide_progress` 또는 action의 `guide_progress` |
-| mutation evidence requirement | `pendingMutationVerification.Requirements` | mutation 후 direct-effect/outcome evidence 수집 | `ControlAwaitingMutationVerificationEvidence` | read-only observation이 requirement를 만족 |
+| mutation verification check | `pendingMutationVerification.Checks[ActiveIndex]` | mutation 후 single/ordered direct verification | `ControlAwaitingMutationVerificationEvidence` | read-only observation이 active check를 만족 |
 | implicit phase step | 일반 action/tool observation | 현재 phase 내부에서 모델이 암묵적으로 고르는 최소 작업 | `ControlAwaitingModelStep` | 다음 action, observation, 또는 `phase_progress` |
 | mislabeled phase step | `phaseStepState.PhaseSteps` | 실제로는 top-level phase graph | 전체 ReAct request | `phase_progress` |
 
@@ -747,7 +749,7 @@ Control은 구현상 `phase`, `step`, `gate`를 모두 반영해 파생되지만
 | `guide_progress` | Gate/Step completion signal | nested step 완료 신호이며, phase 완료 신호가 아님 |
 | `phase_progress` | Phase completion signal | top-level phase 완료 신호 |
 | `mutation_verification_required` | Gate | mutation 후 evidence 수집을 강제하는 규칙 |
-| mutation evidence requirement | Step | verification obligation 내부의 세부 증거 수집 단위 |
+| mutation verification check | Step | verification obligation 내부의 현재 single/ordered check |
 | read-only block | Gate | command policy를 적용하는 규칙 |
 | approval | Human input handler + Gate boundary | 모델 correction이 아니라 사용자 승인을 요구하는 boundary |
 | next directions choice/text | Human input state | gate failure가 아니라 사용자 입력 대기 |
@@ -815,12 +817,12 @@ Gate를 공통화할 때 핵심은 "어느 함수에서 막혔는가"보다 "무
 | 타입 | 현재 커버 대상 | 사용자 메시지 | tool observation | correction | retry | next state |
 | --- | --- | --- | --- | --- | --- | --- |
 | `model_output_correction` | `requirement_analysis`, `request_context`, `phase_plan`, `phase_progress`, `guide_progress`, `resource_guide_lookup`, `next_directions`, `final_report` payload 오류 | 기본 숨김, 반복 실패 시 표시 | 없음 | `appendCorrectionWithCompaction` 우선 | `model_correct_output` | `StateRunning` |
-| `agent_command_retry` | non-observation shell action, read-only safety unknown command, 잘못 구성된 diagnostic command | 짧게 표시 가능 | post-analysis면 `retryable=true` observation | command를 고쳐 다시 내도록 지시 | `agent_correct_command` | `StateRunning` |
+| `agent_command_retry` | read-only safety unknown command, 잘못 구성된 diagnostic command | 짧게 표시 가능 | post-analysis면 `retryable=true` observation | command를 고쳐 다시 내도록 지시 | `agent_correct_command` | `StateRunning` |
 | `user_request_blocked` | read-only에서 명확한 mutation, 사용자가 요구한 변경이 policy와 충돌 | 표시 | `retryable=false` observation | 같은 mutation 반복 금지, final은 phase/final gate에 위임 | `user_request_blocked_by_read_only` | `StateRunning` |
 | `policy_block` | interactive command, shell evaluation syntax, heredoc/process substitution, 허용되지 않은 pipeline | 표시 가능 | post-analysis면 observation | 안전한 대체 command 요구 | 보통 `agent_correct_command` | `StateRunning` |
 | `tool_execution_failure` | kubectl/API/tool timeout, RBAC forbidden, kube context 없음, command runtime failure | 표시 가능 | 실행 결과 observation | 원인에 따라 대체 observation 또는 사용자 blocker | `tool_retry_or_alternative` | `StateRunning` |
 | `retrieval_result_gate` | resource guide/runbook no result, relevance mismatch, duplicate retrieval | 짧게 표시 가능 | 없음 또는 retrieval observation | fallback 금지, ordinary diagnosis 복귀 또는 query 수정 | `retrieval_retry_or_stop` | `StateRunning` |
-| `approval_required` | mutation 가능 command가 approval 필요 | choice request 표시 | 없음 | correction 아님 | 사용자 입력 대기 | `StateWaitingApproval` |
+| `approval_required` | `risk.risky=true` command가 exact approval 필요 | choice request 표시 | 없음 | correction 아님 | 사용자 입력 대기 | `StateWaitingApproval` |
 | `human_input_required` | `next_directions` choice/text, 사용자 질의 재입력 | input/choice request 표시 | 없음 | correction 아님 | 사용자 입력 대기 | waiting state |
 | `external_state_wait` | rollout 진행 중, verification evidence가 아직 progressing | 기본 숨김 또는 짧은 상태 표시 | observation 가능 | wait/recheck 지시 | `wait_for_external_state` | `StateRunning` |
 | `hard_invariant` | runtime 상태 불변식 위반, 반복 correction 한계 초과 | 표시 | 없음 | 없음 또는 진단용 message | 없음 | `StateDone` |
@@ -834,11 +836,10 @@ Gate를 공통화할 때 핵심은 "어느 함수에서 막혔는가"보다 "무
 | `resource_guidance.go` | wrong phase, CRD 미확인, duplicate lookup | `model_output_correction` | guide lookup contract 위반으로 처리 |
 | `loop.go` requested directive | final/phase/next directions required | `model_output_correction` | 요청된 structured directive를 다시 강제 |
 | `action_target_validation.go` | target/resource mismatch, unrelated first diagnostic | `model_output_correction` 또는 `agent_command_retry` | action이 아직 실행 전이면 command correction 성격이 강함 |
-| `loop.go` non-observation shell | `echo`, `printf`, `sleep`, `read` 등 | `agent_command_retry` | 사용자의 요청이 막힌 것이 아니라 agent command 선택 오류 |
 | `loop.go` read-only unknown | 안전한 diagnostic인지 판정 불가 | `agent_command_retry` | 더 구체적인 read-only kubectl command로 재시도 |
 | `loop.go` read-only mutation | 명확한 resource mutation | `user_request_blocked` | read-only policy blocker, 같은 mutation 반복 금지 |
 | `loop.go` interactive command | interactive 실행 위험 | `policy_block` | non-interactive diagnostic으로 재작성 요구 |
-| `loop.go` approval | mutation approval 필요 | `approval_required` | correction이 아니라 사용자 choice request |
+| `loop.go` approval | risky command exact approval 필요 | `approval_required` | correction이 아니라 사용자 choice request |
 | `mutation_lifecycle.go` | verification evidence 요구/결과 invalid | `model_output_correction` 또는 `external_state_wait` | 결과 payload invalid는 correction, progressing은 recheck |
 | `runtime_state.go` audit | impossible state | `hard_invariant` | 단, precedence로 해소 가능한 조합은 hard invariant가 아님 |
 
@@ -881,11 +882,10 @@ Gate를 공통화할 때 핵심은 "어느 함수에서 막혔는가"보다 "무
 | `inconsistent_action_target` | `action_target_validation.go` | action target이 request target과 불일치 | `agent_command_retry` | active phase 내부 command gate | scope 보존한 command 요구 |
 | `invalid_kubectl_resource` | `action_target_validation.go` | kubectl resource가 discovery/request와 불일치 | `agent_command_retry` | active phase 내부 command gate | 올바른 resource command 요구 |
 | `unrelated_first_diagnostic` | `action_target_validation.go` | 첫 진단이 요청과 무관 | `agent_command_retry` | active phase 내부 command gate | request target과 직접 관련된 첫 진단 요구 |
-| `non_observation_shell_action` | `rejectNonObservationShellToolCalls` | `echo`, `printf`, `sleep`, `read` 등 | `agent_command_retry` | phase 내부 command gate | 실제 관찰 command 또는 phase progress 요구 |
 | `readonly_unknown_command_blocked` | `rejectReadOnlyModifyingCalls` | read-only에서 safety unknown | `agent_command_retry` | command policy gate | 구체적인 read-only kubectl command 요구 |
 | `readonly_mutation_blocked` | `rejectReadOnlyModifyingCalls` | read-only에서 명확한 mutation | `user_request_blocked` | command policy gate | 같은 mutation 반복 금지, blocker로 기록 |
 | interactive command block | `hasInteractiveCommand` / `requestApproval` 전 | interactive command 감지 | `policy_block` | command policy gate | non-interactive command 요구 |
-| approval request | `requestApproval` | mutation 가능 command이며 approval 필요 | `approval_required` | command execution boundary | user choice 대기 |
+| approval request | `requestApproval` | command가 `risk.risky=true`이며 exact approval 필요 | `approval_required` | command execution boundary | user choice 대기 |
 | approval denial | `handleApproval` | 사용자가 실행 거절 | `user_request_blocked` 또는 `human_input_required` | command execution boundary | 거절 observation/next direction 정책 필요 |
 | `mutation_verification_required_plain_answer` | `rejectPlainAnswerDuringMutationVerification` | mutation evidence 필요 상태에서 plain answer | `model_output_correction` | mutation verification step | evidence action 요구 |
 | `mutation_verification_required` | `enforcePendingMutationVerification` | evidence 필요 상태에서 잘못된 출력 | `model_output_correction` | mutation evidence step | remaining evidence action 요구 |
@@ -1004,7 +1004,8 @@ tool/function call은 runtime gate를 통과했지만 실행 결과가 실패한
 - 실패 결과를 observation으로 남긴다.
 - RBAC forbidden, kube context 없음, API timeout, command syntax error, resource not found를 구분한다.
 - command syntax error처럼 agent가 고칠 수 있는 실패는 `agent_correct_command`로 재시도한다.
-- RBAC forbidden처럼 사용자가 권한을 바꿔야 하는 실패는 `user_request_blocked` 또는 `human_input_required`로 분기한다.
+- RBAC forbidden은 current-phase alternative evidence로 분기한다. 권한 변경이 실제로 필요하면 별도의
+  risky mutation과 direct verification을 제안하고 exact user approval을 받는다.
 - timeout 또는 rollout progressing처럼 외부 상태 문제면 `external_state_wait` 또는 alternative observation step으로 분기한다.
 
 #### `retrieval_result_gate`
@@ -1020,7 +1021,8 @@ RAG/guidance 검색 결과의 존재성과 관련성을 판정하는 gate다. �
 
 #### `approval_required`
 
-runtime이 command를 실행할 수는 있지만 사용자 승인이 필요한 경우다. correction이 아니다.
+runtime이 command를 실행할 수 있고 model이 `risk.risky=true`를 선언해 exact payload 사용자 승인이
+필요한 경우다. Correction이 아니며 영구 승인 생략 선택은 두지 않는다.
 
 처리 방식:
 
@@ -1045,7 +1047,7 @@ runtime이 command를 실행할 수는 있지만 사용자 승인이 필요한 �
 
 처리 방식:
 
-- `mutation_verification_result.status=progressing` 같은 결과를 받으면 next action을 runtime directive에 반영한다.
+- `mutation_verification_result.status=waiting`을 받으면 같은 verification ID를 유지하고 runtime wait/recheck budget을 적용한다.
 - 무한 대기를 피하기 위해 recheck 횟수 또는 iteration 한계를 둔다.
 - final report는 resolved/unresolved 판정 후에만 허용한다.
 
@@ -1115,7 +1117,6 @@ observation 전달은 현재 `appendToolObservation`의 명시적 tool-call resu
 
 예시:
 
-- `echo "..."` self-talk command
 - safety unknown command
 
 모델 correction은 "사용자 요청이 막힌 것이 아니라 agent command를 고쳐야 한다"를 명시해야 한다.
@@ -1151,7 +1152,6 @@ runtime state가 깨진 경우에만 사용한다. 단, precedence로 해소 가
 
 - `invalid_phase_plan`
 - `invalid_request_context`
-- `non_observation_shell_action`
 
 주의:
 
@@ -1168,7 +1168,6 @@ runtime state가 깨진 경우에만 사용한다. 단, precedence로 해소 가
 gate가 한 iteration을 소비했는지 명시해야 한다.
 
 - 모델이 잘못된 structured output을 낸 경우: 증가하는 것이 자연스럽다.
-- pre-analysis self-talk gate: 모델 응답 하나를 소비했으므로 증가한다.
 - audit hard failure: 증가보다 종료가 우선이다.
 
 ### User Message
@@ -1188,7 +1187,7 @@ gate가 한 iteration을 소비했는지 명시해야 한다.
 
 - `phaseStepState.PhaseSteps`는 실제로 phase graph지만 이름과 모델이 step처럼 보인다.
 - 일반 phase에는 명시적 `steps[]`가 없다.
-- step 상태는 `guideStepState`, `pendingMutationVerification.Requirements`, 암묵적 action 흐름으로 흩어져 있다.
+- step 상태는 `guideStepState`, active mutation verification check, 암묵적 action 흐름으로 흩어져 있다.
 - gate 결과가 `StateRunning`, `StateDone`, `StateWaitingApproval` 정도만 직접 제어한다.
 - phase 이동은 대부분 모델이 낸 `phase_progress.next_phase`에 의존한다.
 - step 재분기는 guide/mutation verification의 특수 로직에만 있다.
@@ -1305,16 +1304,17 @@ const (
 기존 구조 매핑:
 
 - `guideStepState.StepDetails[]` -> `StepKind=resource_guide_diagnostic`
-- `pendingMutationVerification.Requirements[]` -> `StepKind=mutation_evidence_requirement`
+- `pendingMutationVerification.Checks[]` -> `StepKind=mutation_evidence_requirement`; control-selected `ActiveIndex` 하나만 active
 - 일반 action -> `StepKind=general_action`, 처음에는 저장하지 않는 ephemeral step으로 표현
 
 `StepRef` 사용 규칙:
 
 - guide step은 주로 1-based `Index`로 식별한다.
-- mutation evidence requirement는 안정적인 requirement `ID`로 식별한다.
+- mutation verification은 안정적인 verification `ID`로 식별하며 await-state 재확인에서도 ID를 바꾸지 않는다.
 - general action은 현재 phase와 현재 function call에서 파생되는 ephemeral step이다.
 - adapter는 `Index`와 `ID`가 둘 다 항상 존재한다고 가정하면 안 된다.
-- general action은 별도 step store를 만들지 않고 `completedActions` history를 completed step projection으로 사용한다. retry 대상은 아직 current iteration의 implicit step으로만 계산한다.
+- 당시 general action은 별도 step store 없이 `completedActions` history를 completed step projection으로
+  사용했다. 현재는 이 mirror를 제거하고 stable step의 indexed attempt/observation ledger만 사용한다.
 
 #### GateOutcome
 
@@ -1360,7 +1360,6 @@ type BranchPolicy string
 const (
     BranchStayCurrent       BranchPolicy = "stay_current"
     BranchRetryStep         BranchPolicy = "retry_step"
-    BranchRecheckStep       BranchPolicy = "recheck_step"
     BranchSkipStep          BranchPolicy = "skip_step"
     BranchMovePhase         BranchPolicy = "move_phase"
     BranchRewindPhase       BranchPolicy = "rewind_phase"
@@ -1372,12 +1371,11 @@ const (
 
 | 상황 | GateOutcome | BranchPolicy |
 | --- | --- | --- |
-| `echo` self-talk | current phase 유지, current implicit step 재시도 | `BranchRetryStep` |
 | read-only unknown | current phase 유지, command step 재작성 | `BranchRetryStep` |
 | read-only mutation | current phase 유지 또는 report phase로 이동 가능 | `BranchBlockUserRequest` |
 | resource guide 필요 | `guidance_lookup` phase 유지, lookup step으로 이동 | `BranchMovePhase` 또는 `BranchStayCurrent` |
 | mutation 실행 완료 | `mutation_verification` phase, first evidence step | `BranchMovePhase` |
-| verification progressing | verification phase 유지, recheck step | `BranchRecheckStep` |
+| verification waiting | verification phase와 같은 ID 유지 | verification `await_state` control |
 | verification unresolved | diagnosis/remediation planning phase로 분기 | `BranchMovePhase` |
 
 ## 세부 적용 단계와 범위
@@ -1465,7 +1463,6 @@ Phase 7은 optional explicit phase steps를 보존형으로 도입하는 단계�
 
 범위:
 
-- `non_observation_shell_action`
 - read-only unknown
 - read-only known mutation
 - interactive command
@@ -1476,11 +1473,10 @@ Phase 7은 optional explicit phase steps를 보존형으로 도입하는 단계�
 
 - phase lifecycle과 덜 결합되어 있다.
 - `agent_command_retry`, `user_request_blocked`, `policy_block` 차이가 명확하다.
-- 현재 발생한 read-only/self-talk bug와 직접 연결된다.
+- 현재 발생한 read-only command classification 문제와 직접 연결된다.
 
 재분기 정책:
 
-- self-talk: current phase/current implicit step retry
 - read-only unknown: current phase/current command step retry
 - read-only mutation: user request blocker, same mutation retry 금지
 - target mismatch: current phase에서 target-corrected step retry
@@ -1495,7 +1491,6 @@ Phase 7은 optional explicit phase steps를 보존형으로 도입하는 단계�
 
 검증:
 
-- `echo`/`printf` self-talk는 read-only blocker가 아니라 command retry가 된다.
 - read-only unknown은 retryable observation을 남기고 final report를 강제하지 않는다.
 - read-only mutation은 retryable이 아니며 사용자 요청 blocker로 남는다.
 - read-only kubectl diagnostic과 safe pipeline은 기존대로 통과한다.
@@ -1537,11 +1532,11 @@ Phase 7은 optional explicit phase steps를 보존형으로 도입하는 단계�
 범위:
 
 - guide step adapter
-- mutation evidence requirement projection
+- active mutation verification projection
 - implicit action step projection
 - persistent guide/mutation evidence step에 대한 `SkipStep` branch helper
 - `resetPhaseScopedState(fromPhase, policy)` 또는 동등한 phase-scoped cleanup primitive 초안
-- mutation continuation recheck attempt budget
+- mutation continuation strategy-attempt budget
 
 목표:
 
@@ -1585,7 +1580,9 @@ Phase 7은 optional explicit phase steps를 보존형으로 도입하는 단계�
 - runtime override는 phase 이름 필터가 아니라 source gate kind, retry scope, source gate code로 판단한다.
 - `BranchRewindPhase`는 `Completed` mark만 지우면 안 된다. guide state, mutation verification state, injected guide state, resource guide query dedup state, completed action history 중 어느 범위를 reset할지 policy로 결정해야 한다.
 - cleanup primitive가 처리하지 못하는 state가 있으면 rewind를 거부하고 model correction 또는 ordinary phase move로 대체한다.
-- `BranchRecheckStep`은 external state recheck budget을 소비해야 하며, budget 초과 시 unresolved 또는 human input 방향으로 분기한다.
+- External-state temporal recheck는 별도 branch가 아니라 active verification check의
+  `RechecksUsed`와 verification evidence budget을 소비하며, budget 초과 시 unknown/inconclusive
+  obligation 또는 다른 안전 전략으로 분기한다.
 
 비범위:
 
@@ -1631,26 +1628,29 @@ Phase 7은 optional explicit phase steps를 보존형으로 도입하는 단계�
 
 | 주제 | 현재 반영 수준 | 완성 TODO |
 | --- | --- | --- |
-| Control 소유 원칙 | `session.State.Control`을 명시적 mutable source로 두고 `RuntimeSnapshot`은 이를 투영한다. `GateOutcome`은 임의 상태 대입 대신 검증된 transition을 요청해야 한다. | coordinator compatibility flags/control을 제거하고 모든 transition을 `session` API와 invariant로 제한한다. |
-| Phase rewind | `resetPhaseScopedState(fromPhase, policy)` 기반으로 처리 가능한 범위의 rewind를 연다. | `Completed`, `guideStepState`, `pendingMutationVerification`, `resourceGuideInjected`, guide query dedup, `completedActions` reset 범위를 policy로 제어한다. 처리 불가 state가 있으면 rewind를 거부한다. |
-| General action step | pending call은 active ephemeral step, `completedActions`는 completed general action projection으로 사용한다. 직접 mark/retry/skip은 지원하지 않는다. | explicit `steps[]` 도입 이후에도 일반 action 완료 근거는 tool observation으로 유지하고, 재시도는 phase/step correction을 통한 action 재작성으로 표현한다. |
-| Explicit phase step | `phase_steps[].steps[]`는 optional 선언형 step으로 parse/validate하고 `PhaseSpec.Steps` 및 runtime anchor에 노출한다. 없으면 기존 implicit phase mode로 동작한다. | strict mode를 도입할 때만 모든 phase에 steps를 요구한다. explicit step별 완료 추적은 별도 step store가 생기기 전까지 도입하지 않는다. |
-| Guide/mutation step adapter | guide는 `Index`, mutation evidence는 `ID`, general action은 ephemeral ref라는 식별 방식 차이를 adapter 계약에 명시한다. guide/mutation은 completed와 skipped를 분리해 terminal state로 보존한다. | 직접 mark/retry helper는 두지 않는다. guide progress와 mutation verification evidence 수집 경로가 각자의 완료 상태를 갱신하고, 공통 branch helper는 persistent guide/mutation step skip만 지원한다. 일반 action은 adapter read projection까지만 공유한다. |
+| Control 소유 원칙 | `coordinator.runtimeState`가 package-private root이고 `session.Aggregate`가 revision/audit/atomic replacement를 소유한다. `RuntimeSnapshot`은 detached projection이다. | 새 transition도 committed root 직접 변경 없이 candidate/audit/commit 경로를 사용한다. |
+| Phase rewind | `flow/phase.ValidateMovement`가 stable target과 mandatory verification owner를 검사하고 scoped cleanup만 허용한다. | 새 production rewind producer를 연결할 때 owner/cleanup regression matrix를 확장한다. |
+| General action step | accepted phase plan의 stable step에 action을 bind하고 indexed attempt/observation ledger에 기록한다. | semantic completion은 typed `step_result`와 evidence reference 계약을 유지한다. |
+| Explicit phase step | accepted plan은 stable goal/phase/step/criterion ID와 lineage를 가진 execution contract로 변환된다. | Budget 기본값은 request-fixed runtime policy와 hard bound를 따른다. |
+| Guide/mutation step adapter | guide nested step과 active mutation verification check는 control-aware runtime projection을 사용하며 verification은 한 owner/check만 executable하다. | 새 adapter를 추가할 때 active-step 단일 소유와 mandatory obligation audit을 유지한다. |
 | Native/shim parity | 정상 native function calling과 shim mode의 structured gate semantics를 맞추고, native raw text fallback도 shim 변환기를 재사용한다. | raw text fallback 복구 범위 변경 시 runtime-internal call parity 테스트를 함께 갱신한다. |
 | GateDecision 제거 | 기존 `GateDecision` wrapper를 제거하고 phase-plan validation도 직접 `GateOutcome`을 반환한다. | 새 gate를 추가할 때 별도 correction wrapper를 다시 만들지 않는다. |
-| External state wait | mutation continuation과 `BranchRecheckStep`이 recheck attempt budget을 소비하고, 초과 시 inconclusive final_report를 요구한다. | mutation/result gate별로 `BranchRecheckStep` target step을 더 정교하게 지정한다. |
+| External state wait | active `await_state` verification이 같은 ID로 recheck budget을 소비하고, 초과 시 mutation을 반복하지 않는다. | verification result/evidence control이 target과 latest evidence를 계속 검증한다. |
 | Tool failure | tool result failure, `InvokeTool` error, result conversion error, partial success를 `GateOutcomeToolExecutionFailure`로 분류하고, command syntax/RBAC/resource not found/timeout/partial success를 다른 retry scope와 branch policy로 annotation한다. | tool별 partial success schema가 추가될 때 classifier coverage를 확장한다. |
-| Cancellation cleanup | 사용자 취소/EOF/decline/finalize는 Step이 아니라 control boundary로 처리하고, pending calls/direction prompt/response directive/continuation flag를 policy helper로 정리한다. 임시 workdir 삭제는 `Close` 경계에 둔다. | ESC UI 입력, execution 중 cancel, verification pending cancel의 사용자 확인 정책을 더 세분화한다. |
+| Cancellation cleanup | 사용자 취소/EOF/decline/finalize는 control boundary로 처리하고 mutation verification은 단일 terminal finalizer가 owning attempt와 wait effect를 정리한다. Pre-dispatch intent가 있는 execution uncertainty는 자동 재실행하지 않는다. | ESC UI 입력과 executor별 cancellation 의미를 더 세분화한다. |
+| Action history ownership | 구형 `completedActions` mirror와 rewind trim 경로를 제거하고 stable attempt/observation ledger만 실행 이력을 소유한다. | Durable serialization은 Plan 09 DTO에서 ledger order/index를 복구한다. |
 
 완성형 구조의 최소 조건은 아래와 같다.
 
-- `RuntimeControlState`는 `session.State`에 명시적으로 저장되고 snapshot은 이를 읽기 전용으로 투영한다.
+- `RuntimeControlState`는 revisioned `coordinator.runtimeState` root에 저장되고 snapshot은 이를 detached
+  read-only view로 투영한다.
 - 모든 gate outcome은 retry/blocker/correction/wait/rebranch 의미가 명시된다.
 - phase/step target은 주소 검증을 통과해야 한다.
 - completed phase rewind는 cleanup primitive가 처리 가능한 범위에서만 가능하다.
-- general action은 pending 상태에서는 ephemeral step, 완료 후에는 `completedActions` 기반 completed step projection으로 다룬다.
+- general action은 runtime-selected stable step에 bind하고 accepted dispatch/observation을 indexed ledger에
+  연결한다.
 - guide/mutation/general action step adapter는 ID/Index 차이를 숨기되, 없는 식별자를 있다고 가정하지 않는다.
-- mutation continuation에는 별도 recheck budget이 있고, 초과 시 inconclusive final_report로 수렴한다.
+- mutation continuation에는 별도 strategy-attempt budget이 있고, 초과 시 inconclusive final_report로 수렴한다.
 - native/shim 정상 structured path와 raw text fallback 복구 경로는 같은 shim conversion semantics를 공유한다.
 
 ## 적용 시 고려사항
@@ -1709,10 +1709,9 @@ read-only gate는 최소 보안 필터가 아니라 command policy gate다.
 
 - 명확한 mutation: user request blocker
 - safety unknown: agent command retry
-- self-talk command: agent command retry
 - read-only kubectl diagnostic: 통과
 
-이 네 가지를 같은 blocked path로 합치면 안 된다.
+이 세 가지를 같은 blocked path로 합치면 안 된다.
 
 현재 lightweight mutation detector는 실제 실행 command 위치의 `kubectl`만 positive로 잡는다. `sudo kubectl ...`, `xargs kubectl ...` 같은 wrapper command는 후속 케이스로 두고, 향후 `Evaneos/kubectl-readonly` 기반 classifier로 대체/보강한다.
 
@@ -1772,7 +1771,7 @@ resource guide/runbook 검색은 gate를 통과해야 하는 분기다.
 tool 실행 실패는 모델 출력 오류와 구분한다.
 
 - command syntax error: agent command retry
-- RBAC forbidden: 권한 부족 observation, 대체 진단 또는 사용자 blocker
+- RBAC forbidden: 권한 부족 observation, current-phase 대체 진단, 필요 시 별도 risky RBAC mutation과 사용자 승인
 - resource not found: target/scope 재검증 또는 사용자 입력 필요
 - timeout/API unavailable: external state 또는 infrastructure failure로 분기
 - partial success: 남은 target/evidence step 유지
@@ -1785,7 +1784,7 @@ context compaction은 phase/step을 바꾸는 작업이 아니다. compaction �
 - active phase
 - active step 또는 remaining steps
 - requested structured directive
-- pending mutation verification requirements
+- pending mutation verification checks
 - request target/scope/namespace
 
 ### 12. Cancellation과 temporary state cleanup
@@ -1794,7 +1793,7 @@ context compaction은 phase/step을 바꾸는 작업이 아니다. compaction �
 
 - user input waiting: prompt만 유지하거나 취소
 - tool execution: 가능한 경우 context cancel
-- mutation approval waiting: pending calls clear
+- risky command approval waiting: pending calls clear
 - temporary file 기반 step: 임시 파일 clear
 - verification pending: 취소가 verification obligation을 없애는지, 사용자에게 명시적으로 물어야 하는지 정책 필요
 
@@ -1818,17 +1817,17 @@ context compaction은 phase/step을 바꾸는 작업이 아니다. compaction �
 - prompt/schema 대규모 변경
 - 기존 `phase_steps` JSON 필드 제거
 
-## 현재 read-only/self-talk 수정과의 관계
+## 현재 read-only command 분류와의 관계
 
 현재 command policy gate는 `GateOutcome` 기반으로 다음 정책을 유지한다.
 
-- `echo`, `printf`, `sleep`, `read` 같은 non-observation shell action은 tool/read-only gate 전에 agent command retry로 처리한다.
+- dispatch 후보로 남은 external action은 `analyzeToolCalls`에서 parse되고 effect classification을 거친다.
 - read-only에서 safety unknown command는 final report를 강제하지 않고 더 구체적인 read-only kubectl command로 재시도시킨다.
 - read-only에서 명확한 mutation은 user/request blocker로 처리하고 같은 mutation 반복을 금지한다.
 
 이 동작은 리뉴얼 3차 실행에서 `GateOutcome` 기반 command policy gate로 이전된 상태다. 아래 불변식은 계속 깨면 안 된다.
 
-- self-talk shell command는 read-only blocker로 기록하지 않는다.
+- action은 별도 선행 shell 명령 이름 검사로 공통 parse/effect classification 경로를 우회하지 않는다.
 - safety unknown은 agent command retry이며 사용자 요청 blocker가 아니다.
 - 명확한 mutation은 agent가 command를 고쳐서 해결할 수 있는 문제가 아니다.
 - read-only에서 허용된 `kubectl get`, `describe`, `logs`, `top`, `api-resources`, `api-versions`, `version`, `config`, `auth can-i`, `auth whoami`는 기존대로 통과해야 한다.
@@ -1865,7 +1864,7 @@ context compaction은 phase/step을 바꾸는 작업이 아니다. compaction �
 범위:
 - docs/drafts/react_gate_outcome_design.md의 N차 실행 범위만 적용
 - 범위 밖 gate 동작 변경 금지
-- 기존 read-only/self-talk 임시 수정의 정책 불변식 유지
+- 기존 read-only command classification의 정책 불변식 유지
 
 검증:
 - Go test/build는 실행하지 말고 필요한 명령만 출력

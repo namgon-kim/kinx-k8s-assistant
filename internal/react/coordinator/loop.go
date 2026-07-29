@@ -23,16 +23,21 @@ import (
 	reactcontract "github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
 	guidanceflow "github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/guidance"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/request"
-	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/kube"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/language"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/prompt"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/protocol"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/session"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/toolconnector"
 	"k8s.io/klog/v2"
 )
 
 type Loop struct {
+	runtimeState      *runtimeState
+	stateStore        *session.Aggregate[runtimeState]
+	activeTransaction *runtimeTransaction
+
 	cfg      *config.Config
+	deps     loopDependencies
 	llm      gollm.Client
 	chat     gollm.Chat
 	lang     *language.Translator
@@ -43,51 +48,6 @@ type Loop struct {
 	input  chan any
 	output chan *api.Message
 
-	session *session.State
-	// control is retained temporarily for package-local test fixtures. Runtime
-	// transitions use session, the canonical mutable state owner.
-	control            RuntimeControlState
-	currIteration      int
-	currChatContent    []any
-	contextBlockHashes map[string]struct{}
-	pendingCalls       []PendingCall
-	skipPermissions    bool
-
-	systemPrompt            string
-	promptOptions           promptOptions
-	toolProfile             ToolProfile
-	requestIntent           request.Intent
-	originalQuery           string
-	requirementAnalysis     *requirementAnalysis
-	requestContext          *requestContext
-	phaseStepState          *phaseStepState
-	resourceClassification  *resourceClassification
-	lastOriginalQuery       string
-	lastRequirementAnalysis *requirementAnalysis
-	lastRequestContext      *requestContext
-	lastDiagnosisSummary    string
-	resourceDiscoveryCache  map[string]resourceClassification
-	lastContextError        *contextError
-	injectedGuides          map[string]guideRef
-	completedActions        []actionRecord
-	actionSeq               int
-	lastCompactedActionSeq  int
-	contextApproxTokens     int
-	lastAssistantText       string
-	lastProgressText        string
-	resourceGuideInjected   bool
-	resourceGuideEvidence   []string
-	resourceGuideQueries    map[string]struct{}
-
-	guideStepState                *guideStepState
-	pendingResponseDirective      string
-	pendingFinalReport            *finalReport
-	pendingNextDirections         *nextDirections
-	pendingDirectionPrompt        *directionPromptState
-	pendingMutationVerification   *pendingMutationVerification
-	mutationContinuationAttempts  int
-	finalReportMustBeInconclusive bool
-
 	cancel context.CancelFunc
 	once   sync.Once
 
@@ -96,20 +56,28 @@ type Loop struct {
 }
 
 func New(cfg *config.Config) (*Loop, error) {
+	return newLoopWithDependencies(cfg, defaultLoopDependencies())
+}
+
+func newLoopWithDependencies(cfg *config.Config, dependencies loopDependencies) (*Loop, error) {
+	dependencies = dependencies.withDefaults()
 	klog.V(0).InfoS("react loop creating", "provider", cfg.LLMProvider, "model", cfg.Model, "shim", cfg.EnableToolUseShim, "read_only", cfg.ReadOnly, "mcp", cfg.MCPClient)
-	llmClient, err := newModelClient(cfg)
+	llmClient, err := dependencies.modelClient(cfg)
 	if err != nil {
 		klog.ErrorS(err, "LLM client creation failed", "provider", cfg.LLMProvider)
 		return nil, err
 	}
 	klog.V(0).InfoS("react loop created", "provider", cfg.LLMProvider)
+	initial := newRuntimeState()
+	stateStore := session.NewAggregate(initial)
 	return &Loop{
-		cfg:     cfg,
-		llm:     llmClient,
-		input:   make(chan any, 1),
-		output:  make(chan *api.Message, 32),
-		session: session.New(),
-		control: session.InitialControl(),
+		runtimeState: stateStore.Root(),
+		stateStore:   stateStore,
+		cfg:          cfg,
+		deps:         dependencies,
+		llm:          llmClient,
+		input:        make(chan any, 1),
+		output:       make(chan *api.Message, 32),
 	}, nil
 }
 
@@ -175,10 +143,11 @@ func (l *Loop) init(ctx context.Context) error {
 		return fmt.Errorf("작업 디렉터리 생성 실패: %w", err)
 	}
 	l.workDir = workDir
-	l.executor = newExecutor()
+	l.deps = l.deps.withDefaults()
+	l.executor = l.deps.executor()
 	klog.V(1).InfoS("react work directory created", "path", workDir)
 
-	registry, err := newToolRegistry(ctx, l.executor, l.cfg)
+	registry, err := l.deps.toolRegistry(ctx, l.executor, l.cfg)
 	if err != nil {
 		return fmt.Errorf("tool registry 초기화 실패: %w", err)
 	}
@@ -188,24 +157,35 @@ func (l *Loop) init(ctx context.Context) error {
 	l.lang = language.New(l.cfg)
 	klog.V(0).InfoS("language translator configured", "language", l.cfg.Lang.Language, "enabled", l.lang != nil && l.lang.Enabled())
 
-	l.requestIntent = request.General
-	l.toolProfile = selectToolProfile(registry.Tools, l.requestIntent, "")
-	l.promptOptions = l.newPromptOptions(l.requestIntent, false, false)
+	l.mutableRuntime().requestIntent = request.General
+	l.mutableRuntime().toolProfile = selectToolProfile(registry.Tools, l.mutableRuntime().requestIntent, "")
+	l.mutableRuntime().promptOptions = l.newPromptOptions(l.mutableRuntime().requestIntent, false, false)
 
 	return l.resetChatSession()
 }
 
 func (l *Loop) resetChatSession() error {
-	systemPrompt, err := buildSystemPromptWithOptions(l.cfg.PromptTemplateFile, l.registry.Tools, l.promptOptions)
+	systemPrompt, toolProfile, chat, err := l.newChatSession()
 	if err != nil {
-		klog.ErrorS(err, "system prompt build failed", "template", l.cfg.PromptTemplateFile)
 		return err
 	}
-	l.systemPrompt = systemPrompt
-	l.toolProfile = l.promptOptions.ToolProfile
-	l.contextApproxTokens = estimateContextTokens(systemPrompt)
-	l.chat = gollm.NewRetryChat(
-		l.llm.StartChat(l.systemPrompt, l.cfg.Model),
+	l.mutableRuntime().systemPrompt = systemPrompt
+	l.mutableRuntime().toolProfile = toolProfile
+	l.mutableRuntime().contextApproxTokens = estimateContextTokens(systemPrompt)
+	l.chat = chat
+	klog.V(1).InfoS("chat session reset", "prompt_tokens_estimate", l.mutableRuntime().contextApproxTokens, "tool_profile", l.mutableRuntime().toolProfile.Name, "tools", len(l.mutableRuntime().toolProfile.ToolNames), "shim", l.cfg.EnableToolUseShim)
+	klog.V(2).InfoS("chat session tool profile", "tool_profile", l.mutableRuntime().toolProfile.Name, "tools", l.mutableRuntime().toolProfile.ToolNames)
+	return nil
+}
+
+func (l *Loop) newChatSession() (string, ToolProfile, gollm.Chat, error) {
+	systemPrompt, err := buildSystemPromptWithOptions(l.cfg.PromptTemplateFile, l.registry.Tools, l.mutableRuntime().promptOptions)
+	if err != nil {
+		klog.ErrorS(err, "system prompt build failed", "template", l.cfg.PromptTemplateFile)
+		return "", ToolProfile{}, nil, err
+	}
+	chat := gollm.NewRetryChat(
+		l.llm.StartChat(systemPrompt, l.cfg.Model),
 		gollm.RetryConfig{
 			MaxAttempts:    3,
 			InitialBackoff: 10 * time.Second,
@@ -215,16 +195,14 @@ func (l *Loop) resetChatSession() error {
 		},
 	)
 	if !l.cfg.EnableToolUseShim {
-		defs := collectFunctionDefinitionsForProfile(l.registry.Tools, l.toolProfile, true)
-		klog.V(1).InfoS("setting function definitions", "count", len(defs), "tool_profile", l.toolProfile.Name)
-		if err := l.chat.SetFunctionDefinitions(defs); err != nil {
+		defs := collectFunctionDefinitionsForProfile(l.registry.Tools, l.mutableRuntime().toolProfile, true)
+		klog.V(1).InfoS("setting function definitions", "count", len(defs), "tool_profile", l.mutableRuntime().toolProfile.Name)
+		if err := chat.SetFunctionDefinitions(defs); err != nil {
 			klog.ErrorS(err, "function definition injection failed")
-			return fmt.Errorf("tool function definition 주입 실패: %w", err)
+			return "", ToolProfile{}, nil, fmt.Errorf("tool function definition 주입 실패: %w", err)
 		}
 	}
-	klog.V(1).InfoS("chat session reset", "prompt_tokens_estimate", l.contextApproxTokens, "tool_profile", l.toolProfile.Name, "tools", len(l.toolProfile.ToolNames), "shim", l.cfg.EnableToolUseShim)
-	klog.V(2).InfoS("chat session tool profile", "tool_profile", l.toolProfile.Name, "tools", l.toolProfile.ToolNames)
-	return nil
+	return systemPrompt, l.mutableRuntime().promptOptions.ToolProfile, chat, nil
 }
 
 func (l *Loop) run(ctx context.Context, initialQuery string) {
@@ -241,15 +219,28 @@ func (l *Loop) run(ctx context.Context, initialQuery string) {
 	}
 
 	for {
-		select {
-		case <-ctx.Done():
-			l.transitionControl(RuntimeControlExited)
+		handled, auditErr := l.auditRuntimeState()
+		if auditErr != nil {
+			klog.ErrorS(auditErr, "runtime audit recovery failed; stopping with committed state intact")
+			l.emitMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime 상태 복구에 실패해 미해결 작업을 보존한 채 실행을 중단합니다.\n"+auditErr.Error())
 			return
-		default:
+		}
+		if handled {
+			continue
 		}
 
-		if handled := l.auditRuntimeState(); handled {
-			continue
+		select {
+		case <-ctx.Done():
+			if err := l.mutateRuntimeAtomically(func() error {
+				l.finalizePendingMutationVerification("runtime context was cancelled", reactcontract.AttemptUnknown)
+				l.applyRuntimeCleanup(cleanupExitPolicy())
+				l.transitionControl(RuntimeControlExited)
+				return nil
+			}); err != nil {
+				klog.ErrorS(err, "failed to commit context cancellation cleanup")
+			}
+			return
+		default:
 		}
 
 		switch l.loopLifecycle() {
@@ -277,11 +268,25 @@ func (l *Loop) run(ctx context.Context, initialQuery string) {
 		case LoopLifecycleModelTurn:
 			l.refreshInputOwner()
 			if err := l.runIteration(ctx); err != nil {
-				l.pendingCalls = nil
-				l.currChatContent = nil
-				l.currIteration = 0
-				l.transitionControl(RuntimeControlAwaitingUserQuery)
-				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+				if recoveryErr := l.mutateRuntimeAtomically(func() error {
+					if warning := l.recoverUnreconciledDispatches(err.Error()); warning != "" {
+						l.addMessage(api.MessageSourceAgent, api.MessageTypeError, warning)
+						if l.mutableRuntime().pendingMutationVerification != nil {
+							return nil
+						}
+					}
+					if warning := l.finalizePendingMutationVerification("model turn failed: "+err.Error(), reactcontract.AttemptUnknown); warning != "" {
+						l.addMessage(api.MessageSourceAgent, api.MessageTypeError, warning)
+					}
+					l.mutableRuntime().pendingCalls = nil
+					l.mutableRuntime().currChatContent = nil
+					l.mutableRuntime().currIteration = 0
+					l.transitionControl(RuntimeControlAwaitingUserQuery)
+					l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+					return nil
+				}); recoveryErr != nil {
+					klog.ErrorS(recoveryErr, "failed to commit model-turn error recovery")
+				}
 			}
 		case LoopLifecycleExited:
 			return
@@ -290,55 +295,62 @@ func (l *Loop) run(ctx context.Context, initialQuery string) {
 }
 
 func (l *Loop) startQuery(query string) error {
+	return l.mutateRuntimeAtomically(func() error {
+		return l.initializeQuery(query)
+	})
+}
+
+func (l *Loop) initializeQuery(query string) error {
 	intent := request.Classify(query)
 	klog.V(0).InfoS("query starting", "query_len", len(query), "intent", intent)
-	l.requestIntent = intent
+	l.mutableRuntime().requestIntent = intent
 	l.captureConversationMemory()
 	priorState := l.priorConversationStateMessage()
-	l.toolProfile = selectToolProfile(l.registry.Tools, intent, query)
-	l.promptOptions = l.newPromptOptions(intent, false, false)
-	klog.V(1).InfoS("query prompt options selected", "intent", intent, "tool_profile", l.toolProfile.Name, "tools", len(l.toolProfile.ToolNames), "read_only", l.cfg.ReadOnly, "translate_output", l.promptOptions.TranslateOutput)
+	l.mutableRuntime().toolProfile = selectToolProfile(l.registry.Tools, intent, query)
+	l.mutableRuntime().promptOptions = l.newPromptOptions(intent, false, false)
+	klog.V(1).InfoS("query prompt options selected", "intent", intent, "tool_profile", l.mutableRuntime().toolProfile.Name, "tools", len(l.mutableRuntime().toolProfile.ToolNames), "read_only", l.cfg.ReadOnly, "translate_output", l.mutableRuntime().promptOptions.TranslateOutput)
 	if err := l.resetChatSession(); err != nil {
 		return err
 	}
 	l.addMessage(api.MessageSourceUser, api.MessageTypeText, query)
-	l.currIteration = 0
-	l.currChatContent = nil
+	l.mutableRuntime().currIteration = 0
+	l.mutableRuntime().currChatContent = nil
 	if priorState != "" {
-		l.currChatContent = append(l.currChatContent, priorState)
+		l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, priorState)
 	}
-	l.currChatContent = append(l.currChatContent, prompt.RequirementAnalysis())
-	l.currChatContent = append(l.currChatContent, prompt.RequirementAnalysisDefinitions())
-	l.currChatContent = append(l.currChatContent, query)
-	l.contextBlockHashes = nil
-	l.pendingCalls = nil
-	l.originalQuery = query
-	l.requirementAnalysis = nil
-	l.requestContext = nil
-	l.phaseStepState = nil
-	l.mutableSession().Context.ResetRequest()
-	l.session.Context.OriginalQuery = query
-	l.session.Phase.Reset()
-	l.session.Verification.Reset()
-	l.resourceClassification = nil
-	l.lastContextError = nil
-	l.injectedGuides = nil
-	l.completedActions = nil
-	l.actionSeq = 0
-	l.lastCompactedActionSeq = 0
-	l.lastAssistantText = ""
-	l.lastProgressText = ""
-	l.resourceGuideInjected = false
-	l.resourceGuideEvidence = nil
-	l.resourceGuideQueries = nil
-	l.guideStepState = nil
-	l.pendingResponseDirective = ""
-	l.pendingFinalReport = nil
-	l.pendingNextDirections = nil
-	l.pendingDirectionPrompt = nil
-	l.pendingMutationVerification = nil
-	l.mutationContinuationAttempts = 0
-	l.finalReportMustBeInconclusive = false
+	l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, prompt.RequirementAnalysis())
+	l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, prompt.RequirementAnalysisDefinitions())
+	l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, query)
+	l.mutableRuntime().contextBlockHashes = nil
+	l.mutableRuntime().pendingCalls = nil
+	l.mutableRuntime().dispatchIntents = nil
+	l.mutableRuntime().dispatchOrder = nil
+	l.mutableRuntime().originalQuery = query
+	l.mutableRuntime().requirementAnalysis = nil
+	l.mutableRuntime().requestContext = nil
+	l.mutableRuntime().phaseStepState = nil
+	l.mutableRuntime().resourceClassification = nil
+	l.mutableRuntime().lastContextError = nil
+	l.mutableRuntime().injectedGuides = nil
+	l.mutableRuntime().actionSeq = 0
+	l.mutableRuntime().lastCompactedActionSeq = 0
+	l.mutableRuntime().lastAssistantText = ""
+	l.mutableRuntime().lastProgressText = ""
+	l.mutableRuntime().resourceGuideInjected = false
+	l.mutableRuntime().resourceGuideEvidence = nil
+	l.mutableRuntime().resourceGuideQueries = nil
+	l.mutableRuntime().guideStepState = nil
+	l.mutableRuntime().pendingResponseDirective = ""
+	l.mutableRuntime().pendingFinalReport = nil
+	l.mutableRuntime().pendingNextDirections = nil
+	l.mutableRuntime().pendingDirectionPrompt = nil
+	l.mutableRuntime().pendingMutationVerification = nil
+	l.mutableRuntime().mutationContinuationAttempts = 0
+	l.mutableRuntime().finalReportMustBeInconclusive = false
+	l.mutableRuntime().continuation = nil
+	l.mutableRuntime().continuationResumePending = false
+	l.beginGoalExecution()
+	l.recordInternalObservation("user_input", query)
 	l.transitionControl(RuntimeControlAwaitingRequirementAnalysis)
 	klog.V(0).InfoS("query lifecycle initialized", "intent", intent, "lifecycle", logStateName(l.loopLifecycle()))
 	return nil
@@ -348,16 +360,16 @@ func (l *Loop) captureConversationMemory() {
 	if !l.hasConversationState() {
 		return
 	}
-	l.lastOriginalQuery = l.originalQuery
-	l.lastRequirementAnalysis = cloneRequirementAnalysis(l.requirementAnalysis)
-	l.lastRequestContext = cloneRequestContext(l.requestContext)
-	l.lastDiagnosisSummary = l.compactDiagnosisSummary()
+	l.mutableRuntime().lastOriginalQuery = l.mutableRuntime().originalQuery
+	l.mutableRuntime().lastRequirementAnalysis = cloneRequirementAnalysis(l.mutableRuntime().requirementAnalysis)
+	l.mutableRuntime().lastRequestContext = clonePointer(l.mutableRuntime().requestContext)
+	l.mutableRuntime().lastDiagnosisSummary = l.compactDiagnosisSummary()
 }
 
 func (l *Loop) newPromptOptions(intent request.Intent, includeGuidance bool, includeClusterAPI bool) promptOptions {
-	toolProfile := l.toolProfile
+	toolProfile := l.mutableRuntime().toolProfile
 	if len(toolProfile.ToolNames) == 0 && l.registry != nil {
-		toolProfile = selectToolProfile(l.registry.Tools, intent, l.originalQuery)
+		toolProfile = selectToolProfile(l.registry.Tools, intent, l.mutableRuntime().originalQuery)
 	}
 	return promptOptions{
 		EnableToolUseShim:          l.cfg.EnableToolUseShim,
@@ -375,23 +387,35 @@ func (l *Loop) handleMetaQuery(ctx context.Context, query string) bool {
 	switch query {
 	case "clear", "reset":
 		klog.V(0).InfoS("react meta query handled", "query", query)
-		l.requestIntent = request.General
-		l.toolProfile = selectToolProfile(l.registry.Tools, l.requestIntent, "")
-		l.promptOptions = l.newPromptOptions(l.requestIntent, false, false)
-		if err := l.resetChatSession(); err != nil {
+		if err := l.mutateRuntimeAtomically(func() error {
+			l.finalizePendingMutationVerification("user reset the active request", reactcontract.AttemptUnknown)
+			l.mutableRuntime().requestIntent = request.General
+			l.mutableRuntime().toolProfile = selectToolProfile(l.registry.Tools, l.mutableRuntime().requestIntent, "")
+			l.mutableRuntime().promptOptions = l.newPromptOptions(l.mutableRuntime().requestIntent, false, false)
+			if err := l.resetChatSession(); err != nil {
+				return err
+			}
+			l.clearConversationState()
 			l.transitionControl(RuntimeControlAwaitingUserQuery)
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "대화 컨텍스트를 초기화했습니다.")
+			return nil
+		}); err != nil {
 			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
-			return true
 		}
-		l.clearConversationState()
-		l.transitionControl(RuntimeControlAwaitingUserQuery)
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "대화 컨텍스트를 초기화했습니다.")
 		return true
 	case "exit", "quit":
 		klog.V(0).InfoS("react meta query handled", "query", query)
-		l.applyRuntimeCleanup(cleanupExitPolicy())
-		l.transitionControl(RuntimeControlExited)
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "종료합니다.")
+		if err := l.mutateRuntimeAtomically(func() error {
+			if warning := l.finalizePendingMutationVerification("user exited the session", reactcontract.AttemptUnknown); warning != "" {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, warning)
+			}
+			l.applyRuntimeCleanup(cleanupExitPolicy())
+			l.transitionControl(RuntimeControlExited)
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "종료합니다.")
+			return nil
+		}); err != nil {
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "Error: "+err.Error())
+		}
 		return true
 	case "model":
 		klog.V(1).InfoS("react meta query handled", "query", query, "model", l.cfg.Model)
@@ -419,66 +443,112 @@ func (l *Loop) handleMetaQuery(ctx context.Context, query string) bool {
 }
 
 func (l *Loop) clearConversationState() {
-	l.currIteration = 0
-	l.currChatContent = nil
-	l.contextBlockHashes = nil
-	l.pendingCalls = nil
-	l.originalQuery = ""
-	l.requirementAnalysis = nil
-	l.requestContext = nil
-	l.phaseStepState = nil
-	l.mutableSession().Context.ResetRequest()
-	l.session.Phase.Reset()
-	l.session.Verification.Reset()
-	l.resourceClassification = nil
-	l.lastOriginalQuery = ""
-	l.lastRequirementAnalysis = nil
-	l.lastRequestContext = nil
-	l.lastDiagnosisSummary = ""
-	l.lastContextError = nil
-	l.injectedGuides = nil
-	l.completedActions = nil
-	l.actionSeq = 0
-	l.lastCompactedActionSeq = 0
-	l.contextApproxTokens = estimateContextTokens(l.systemPrompt)
-	l.lastAssistantText = ""
-	l.lastProgressText = ""
-	l.resourceGuideInjected = false
-	l.resourceGuideEvidence = nil
-	l.resourceGuideQueries = nil
-	l.guideStepState = nil
-	l.pendingResponseDirective = ""
-	l.pendingFinalReport = nil
-	l.pendingNextDirections = nil
-	l.pendingDirectionPrompt = nil
-	l.pendingMutationVerification = nil
-	l.mutationContinuationAttempts = 0
-	l.finalReportMustBeInconclusive = false
+	l.mutableRuntime().currIteration = 0
+	l.mutableRuntime().currChatContent = nil
+	l.mutableRuntime().contextBlockHashes = nil
+	l.mutableRuntime().pendingCalls = nil
+	l.mutableRuntime().dispatchIntents = nil
+	l.mutableRuntime().dispatchOrder = nil
+	l.mutableRuntime().execution = nil
+	l.mutableRuntime().originalQuery = ""
+	l.mutableRuntime().requirementAnalysis = nil
+	l.mutableRuntime().requestContext = nil
+	l.mutableRuntime().phaseStepState = nil
+	l.mutableRuntime().resourceClassification = nil
+	l.mutableRuntime().lastOriginalQuery = ""
+	l.mutableRuntime().lastRequirementAnalysis = nil
+	l.mutableRuntime().lastRequestContext = nil
+	l.mutableRuntime().lastDiagnosisSummary = ""
+	l.mutableRuntime().lastContextError = nil
+	l.mutableRuntime().injectedGuides = nil
+	l.mutableRuntime().actionSeq = 0
+	l.mutableRuntime().lastCompactedActionSeq = 0
+	l.mutableRuntime().contextApproxTokens = estimateContextTokens(l.mutableRuntime().systemPrompt)
+	l.mutableRuntime().lastAssistantText = ""
+	l.mutableRuntime().lastProgressText = ""
+	l.mutableRuntime().resourceGuideInjected = false
+	l.mutableRuntime().resourceGuideEvidence = nil
+	l.mutableRuntime().resourceGuideQueries = nil
+	l.mutableRuntime().guideStepState = nil
+	l.mutableRuntime().pendingResponseDirective = ""
+	l.mutableRuntime().pendingFinalReport = nil
+	l.mutableRuntime().pendingNextDirections = nil
+	l.mutableRuntime().pendingDirectionPrompt = nil
+	l.mutableRuntime().pendingMutationVerification = nil
+	l.mutableRuntime().mutationContinuationAttempts = 0
+	l.mutableRuntime().finalReportMustBeInconclusive = false
+	l.mutableRuntime().continuation = nil
+	l.mutableRuntime().continuationResumePending = false
 }
 
-func (l *Loop) executeIteration(ctx context.Context) error {
+func (l *Loop) executeIteration(ctx context.Context) (returnErr error) {
+	var tx *runtimeTransaction
+	defer func() {
+		if tx == nil {
+			return
+		}
+		if returnErr != nil {
+			l.rollbackRuntimeTransaction(tx)
+			return
+		}
+		effects := append([]reactcontract.Effect(nil), tx.effects...)
+		returnErr = l.commitRuntimeTransaction(tx)
+		if returnErr == nil && len(effects) > 0 {
+			returnErr = l.executeTurnEffects(ctx, effects)
+		}
+	}()
+
 	snapshot := l.RuntimeSnapshot()
+	if !reactcontract.IsModelTurnControl(snapshot.Control) {
+		return fmt.Errorf("model turn is not allowed from runtime control state %q", snapshot.Control)
+	}
 	klog.V(1).InfoS("react iteration starting",
-		"iteration", l.currIteration+1,
-		"max_iterations", l.cfg.MaxIterations,
+		"iteration", l.mutableRuntime().currIteration+1,
+		"max_iterations", l.maxIterationLimit(),
 		"lifecycle", logStateName(l.loopLifecycle()),
 		"control", snapshot.Control,
-		"context_tokens_estimate", l.contextApproxTokens,
-		"chat_content_items", len(l.currChatContent),
+		"context_tokens_estimate", l.mutableRuntime().contextApproxTokens,
+		"chat_content_items", len(l.mutableRuntime().currChatContent),
 	)
-	if l.currIteration >= l.cfg.MaxIterations {
-		klog.V(0).InfoS("react max iterations reached", "max_iterations", l.cfg.MaxIterations)
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "Maximum number of iterations reached.")
-		l.currIteration = 0
-		l.currChatContent = nil
-		l.pendingCalls = nil
-		l.transitionControl(RuntimeControlAwaitingUserQuery)
+	if l.mutableRuntime().currIteration >= l.maxIterationLimit() {
+		klog.V(0).InfoS("react max iterations reached", "max_iterations", l.maxIterationLimit())
+		return l.mutateRuntimeAtomically(func() error {
+			if warning := l.finalizePendingMutationVerification("model iteration limit was reached", reactcontract.AttemptUnknown); warning != "" {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, warning)
+			}
+			l.mutableRuntime().pendingCalls = nil
+			execution := l.mutableRuntime().execution
+			if execution == nil || strings.TrimSpace(execution.RequestID) == "" || strings.TrimSpace(execution.Goal.ID) == "" {
+				l.transitionControl(RuntimeControlAwaitingUserQuery)
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "실행 계획이 확정되기 전에 model iteration 한도에 도달했습니다. 요청을 더 구체화해 다시 입력해 주세요.")
+				return nil
+			}
+			l.acceptContinuationHandoff(ctx, l.deterministicContinuationHandoff("The execution segment reached its model iteration limit before the request was conclusive."))
+			return nil
+		})
+	}
+
+	if l.closureThresholdReached() && l.closureCanInterruptCurrentControl() {
+		tx, returnErr = l.beginRuntimeTransaction(snapshot.Revision)
+		if returnErr != nil {
+			return returnErr
+		}
+		l.requestContinuationHandoff()
 		return nil
 	}
 
 	if l.shouldCompactBeforeNextSend() {
-		klog.V(1).InfoS("context compaction triggered before send", "context_tokens_estimate", l.contextApproxTokens, "limit", l.contextLimitTokens())
-		l.compactBeforeNextIteration("Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it.")
+		klog.V(1).InfoS("context compaction triggered before send", "context_tokens_estimate", l.mutableRuntime().contextApproxTokens, "limit", l.contextLimitTokens())
+		tx, returnErr = l.beginRuntimeTransaction(snapshot.Revision)
+		if returnErr != nil {
+			return returnErr
+		}
+		returnErr = l.prepareContextCompaction(
+			"pre_send",
+			"token_threshold",
+			"Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it.",
+		)
+		return returnErr
 	}
 
 	sentContent := l.buildIterationSendContent()
@@ -491,23 +561,31 @@ func (l *Loop) executeIteration(ctx context.Context) error {
 			return err
 		}
 		klog.V(0).InfoS("model streaming hit context length", "error", err.Error(), "duration", time.Since(sendStart))
-		if ok := l.compactAfterContextLengthError(err); !ok {
+		if l.mutableRuntime().contextLengthRetryUsed {
 			return err
 		}
-		sentContent = l.buildIterationSendContent()
-		klog.V(1).InfoS("retrying model request after context compaction", "content_items", len(sentContent), "content_tokens_estimate", estimateContextTokens(sentContent...))
-		sendStart = time.Now()
-		streamedText, functionCalls, err = l.sendAndCollectStreaming(ctx, sentContent)
-		if err != nil {
-			klog.ErrorS(err, "model streaming retry failed", "duration", time.Since(sendStart))
-			return err
+		tx, returnErr = l.beginRuntimeTransaction(snapshot.Revision)
+		if returnErr != nil {
+			return returnErr
 		}
+		l.mutableRuntime().contextLengthRetryUsed = true
+		returnErr = l.prepareContextCompaction(
+			"context_length",
+			"context_length_exceeded",
+			"The previous LLM request exceeded the provider context limit. Continue from this compacted state and follow the pending runtime directive. Do not repeat completed commands unless new evidence requires it.",
+		)
+		return returnErr
 	}
 	klog.V(1).InfoS("model response received", "duration", time.Since(sendStart), "text_len", len(streamedText), "function_calls", len(functionCalls), "call_names", logFunctionCallNames(functionCalls))
 	klog.V(2).InfoS("model response call summaries", "calls", logFunctionCallSummaries(functionCalls))
+	tx, returnErr = l.beginRuntimeTransaction(snapshot.Revision)
+	if returnErr != nil {
+		return returnErr
+	}
 	l.noteContextContent(sentContent...)
-	l.currChatContent = nil
-	l.pendingResponseDirective = ""
+	l.mutableRuntime().currChatContent = nil
+	l.mutableRuntime().contextLengthRetryUsed = false
+	l.mutableRuntime().pendingResponseDirective = ""
 
 	if len(functionCalls) == 0 {
 		if strings.TrimSpace(streamedText) != "" {
@@ -515,66 +593,34 @@ func (l *Loop) executeIteration(ctx context.Context) error {
 				functionCalls = functionCallsFromParsedReActResponse(parsed)
 			}
 		}
-		if len(functionCalls) == 0 && l.requirementAnalysis == nil {
-			if handled := l.requireRequirementAnalysisBeforeAction(nil); handled {
-				return nil
-			}
-		}
-		if len(functionCalls) == 0 && l.requirementAnalysis != nil && l.phaseStepState == nil {
-			if handled := l.requirePhasePlanBeforeAction(nil); handled {
-				return nil
-			}
-		}
+	}
+	functionCalls = protocol.NormalizeAssistantStructuredFunctionCalls(functionCalls)
+	klog.V(1).InfoS("normalized model function calls", "function_calls", len(functionCalls), "call_names", logFunctionCallNames(functionCalls))
+	envelope := normalizeModelOutputEnvelope(streamedText, functionCalls)
+	if handled := l.validateModelOutputEnvelope(&envelope, functionCalls); handled {
+		return nil
 	}
 
 	if len(functionCalls) == 0 {
 		klog.V(1).InfoS("model response had no function calls", "text_len", len(streamedText))
-		if handled := l.rejectMissingMutationVerificationOnNoCalls(); handled {
-			return nil
-		}
-		if handled := l.rejectMutationContinuationOnNoCalls(); handled {
-			return nil
-		}
-		if handled := l.rejectPlainAnswerDuringNextDirections(streamedText); handled {
-			return nil
-		}
-		if l.phaseStepState != nil && strings.TrimSpace(streamedText) != "" && !l.phaseAllowsPlainAnswer() {
-			if handled := l.rejectPlainAnswerOutsideResponsePhase(); handled {
-				return nil
-			}
-		}
 		if strings.TrimSpace(streamedText) != "" {
 			rawModelText := streamedText
-			l.contextApproxTokens += estimateContextTokens(rawModelText)
-			displayText := l.translateModelText(ctx, rawModelText)
-			l.addMessage(api.MessageSourceModel, api.MessageTypeText, displayText)
-			l.lastAssistantText = rawModelText
-			klog.V(0).InfoS("plain model answer emitted", "raw_len", len(rawModelText), "display_len", len(displayText))
+			l.mutableRuntime().contextApproxTokens += estimateContextTokens(rawModelText)
+			l.addTranslatedModelMessage(ctx, rawModelText)
+			l.mutableRuntime().lastAssistantText = rawModelText
+			l.recordPlainAnswerExecution(rawModelText)
+			klog.V(0).InfoS("plain model answer accepted", "raw_len", len(rawModelText))
 		}
-		l.currIteration = 0
-		l.pendingCalls = nil
+		l.mutableRuntime().currIteration = 0
+		l.mutableRuntime().pendingCalls = nil
 		l.transitionControl(RuntimeControlAwaitingUserQuery)
 		return nil
 	}
 	deferredProgressText := strings.TrimSpace(streamedText)
-	functionCalls = normalizeAssistantStructuredFunctionCalls(functionCalls)
-	klog.V(1).InfoS("normalized model function calls", "function_calls", len(functionCalls), "call_names", logFunctionCallNames(functionCalls))
-
-	if handled := l.rejectInvalidShimStructuredCalls(functionCalls); handled {
-		return nil
-	}
-
-	if handled := l.requireRequirementAnalysisBeforeAction(functionCalls); handled {
-		return nil
-	}
 
 	var requestContextHandled bool
 	functionCalls, requestContextHandled = l.consumeRequestContext(ctx, functionCalls)
 	if requestContextHandled {
-		return nil
-	}
-
-	if handled := l.requirePhasePlanBeforeAction(functionCalls); handled {
 		return nil
 	}
 
@@ -588,13 +634,9 @@ func (l *Loop) executeIteration(ctx context.Context) error {
 		return nil
 	}
 
-	if handled := l.enforceMutationContinuation(functionCalls); handled {
-		return nil
-	}
-
-	// Locks for runtime-requested structured output must run before any
-	// consumer can advance phase or clear the active control obligation.
-	if handled := l.enforceRequestedStructuredDirective(functionCalls); handled {
+	var continuationHandoffHandled bool
+	functionCalls, continuationHandoffHandled = l.consumeContinuationHandoff(ctx, functionCalls)
+	if continuationHandoffHandled {
 		return nil
 	}
 
@@ -604,16 +646,21 @@ func (l *Loop) executeIteration(ctx context.Context) error {
 		return nil
 	}
 
-	var guideProgressHandled bool
-	functionCalls, guideProgressHandled = l.consumeGuideProgress(functionCalls)
-	if guideProgressHandled {
+	var stepResultHandled bool
+	functionCalls, stepResultHandled = l.consumeStepResult(functionCalls)
+	if stepResultHandled {
 		return nil
 	}
 
-	// Guide completion can create a new phase-progress obligation while
-	// consuming this response. Re-apply the lock before any trailing call can
-	// reach the action dispatcher.
-	if handled := l.enforceRequestedStructuredDirective(functionCalls); handled {
+	var phasePlanRevisionHandled bool
+	functionCalls, phasePlanRevisionHandled = l.consumePhasePlanRevision(functionCalls)
+	if phasePlanRevisionHandled {
+		return nil
+	}
+
+	var guideProgressHandled bool
+	functionCalls, guideProgressHandled = l.consumeGuideProgress(functionCalls)
+	if guideProgressHandled {
 		return nil
 	}
 
@@ -623,11 +670,7 @@ func (l *Loop) executeIteration(ctx context.Context) error {
 		return nil
 	}
 
-	if handled := l.handleRequestedResourceGuideLookup(ctx, functionCalls); handled {
-		return nil
-	}
-
-	if handled := l.rejectActionDuringGuidanceLookupWithoutGuide(functionCalls); handled {
+	if handled := l.handleRequestedResourceGuideLookup(functionCalls); handled {
 		return nil
 	}
 
@@ -662,66 +705,137 @@ func (l *Loop) executeIteration(ctx context.Context) error {
 	functionCalls = l.rejectAssistantManagedToolCalls(functionCalls)
 	if len(functionCalls) == 0 {
 		klog.V(1).InfoS("all function calls were handled internally or rejected")
-		l.currIteration++
+		l.mutableRuntime().currIteration++
 		return nil
 	}
 
-	if handled := l.rejectNonObservationShellToolCalls(functionCalls); handled {
+	if err := l.validateCommandRiskMetadata(functionCalls); err != nil {
+		l.applyModelOutputCorrectionGate(
+			"command_risk_metadata_required",
+			"command risk 계약 오류가 반복되어 요청을 중단했습니다.",
+			"The proposed command action has invalid risk metadata: "+err.Error()+". Return one corrected action with an explicit risk.risky boolean and risk.reason when risky=true.",
+		)
 		return nil
 	}
-
 	pending, err := l.analyzeToolCalls(ctx, functionCalls)
 	if err != nil {
 		klog.ErrorS(err, "tool call analysis failed", "call_names", logFunctionCallNames(functionCalls))
-		return err
+		l.applyModelOutputCorrectionGate(
+			"tool_call_parse_error",
+			"tool call 형식 오류가 반복되어 요청을 중단했습니다.",
+			"The proposed action could not be parsed by the registered tool: "+err.Error()+" Return one corrected action using the registered tool schema; keep the accepted plan and active step unchanged.",
+		)
+		return nil
 	}
-	l.pendingCalls = pending
+	l.mutableRuntime().pendingCalls = pending
 	klog.V(1).InfoS("tool calls analyzed", "pending", len(pending), "summaries", logPendingCallSummaries(pending))
+	if l.cfg.ReadOnly && l.hasModifyingCalls() {
+		clearPendingVerificationInput(pending)
+		klog.V(0).InfoS("read-only mode blocking modifying tool calls", "pending", len(l.mutableRuntime().pendingCalls))
+		klog.V(1).InfoS("read-only blocked call summaries", "pending", logPendingCallSummaries(l.mutableRuntime().pendingCalls))
+		l.rejectReadOnlyModifyingCalls()
+		return nil
+	}
+	if err := normalizePendingVerification(pending); err != nil {
+		l.mutableRuntime().pendingCalls = nil
+		l.applyModelOutputCorrectionGate(
+			"mutation_verification_spec_required",
+			"mutation verification 계약 형식이 반복적으로 잘못되어 요청을 중단했습니다.",
+			"The proposed verification metadata was invalid: "+err.Error()+". Return one corrected mutating action with a single or ordered-chain verification contract.",
+		)
+		return nil
+	}
+	modifyingCalls := 0
+	for _, call := range pending {
+		if strings.EqualFold(strings.TrimSpace(call.ModifiesResource), "yes") ||
+			strings.EqualFold(strings.TrimSpace(call.ModifiesResource), "unknown") {
+			modifyingCalls++
+			if err := validateMutationVerificationSpec(call); err != nil {
+				l.mutableRuntime().pendingCalls = nil
+				l.applyModelOutputCorrectionGate(
+					"mutation_verification_spec_required",
+					"mutation verification 계약이 누락되어 요청을 중단했습니다.",
+					"The mutating action was rejected before execution: "+err.Error()+". Return one corrected mutating action with a single or ordered-chain verification contract.",
+				)
+				return nil
+			}
+		}
+		if l.verificationEvidenceBudgetExhausted(call) {
+			l.blockMutationEvidenceBudget(call)
+			return nil
+		}
+	}
+	if modifyingCalls > 1 {
+		l.mutableRuntime().pendingCalls = nil
+		l.applyModelOutputCorrectionGate(
+			"multiple_mutations_per_attempt",
+			"한 attempt에 여러 mutation을 제안하여 요청을 중단했습니다.",
+			"Return exactly one mutating primary action for the active step. Its direct verification belongs to the same attempt; do not batch independent mutations.",
+		)
+		return nil
+	}
+	if allowed, reason := l.pendingAttemptBatchAllowed(pending); !allowed {
+		l.mutableRuntime().pendingCalls = nil
+		l.applyModelOutputCorrectionGate(
+			"action_attempt_contract",
+			"action이 active step의 attempt contract와 반복적으로 충돌하여 요청을 중단했습니다.",
+			"The proposed action was rejected before execution: "+reason+". Choose a materially different strategy within the active step budget, or close the step with step_result.",
+		)
+		return nil
+	}
 
 	if handled := l.rejectInteractiveToolCalls(); handled {
 		klog.V(0).InfoS("interactive tool calls rejected")
 		return nil
 	}
 
-	if l.cfg.ReadOnly && l.hasModifyingCalls() {
-		klog.V(0).InfoS("read-only mode blocking modifying tool calls", "pending", len(l.pendingCalls))
-		klog.V(1).InfoS("read-only blocked call summaries", "pending", logPendingCallSummaries(l.pendingCalls))
-		l.rejectReadOnlyModifyingCalls()
-		return nil
-	}
-	if !l.skipPermissions && l.hasModifyingCalls() {
-		klog.V(0).InfoS("approval required for modifying tool calls", "pending", len(l.pendingCalls))
-		klog.V(1).InfoS("approval required call summaries", "pending", logPendingCallSummaries(l.pendingCalls))
+	if l.pendingCallsRequireApproval() {
+		klog.V(0).InfoS("approval required for tool calls", "pending", len(l.mutableRuntime().pendingCalls))
+		klog.V(1).InfoS("approval required call summaries", "pending", logPendingCallSummaries(l.mutableRuntime().pendingCalls))
 		l.emitAcceptedProgressText(ctx, deferredProgressText)
 		l.requestApproval()
 		return nil
 	}
 
 	l.emitAcceptedProgressText(ctx, deferredProgressText)
-	klog.V(1).InfoS("dispatching tool calls without approval", "pending", len(l.pendingCalls))
-	return l.dispatchToolCalls(ctx)
-}
-
-func (l *Loop) rejectPlainAnswerDuringNextDirections(text string) bool {
-	if l.RuntimeSnapshot().Control != RuntimeControlAwaitingNextDirections || strings.TrimSpace(text) == "" {
-		return false
+	klog.V(1).InfoS("dispatching tool calls without approval", "pending", len(l.mutableRuntime().pendingCalls))
+	if err := l.preparePendingToolDispatch(false); err != nil {
+		return err
 	}
-	message := "The previous final_report was inconclusive and the runtime requested `next_directions`. Return only a next_directions object with concrete continuation options; do not emit a plain answer yet."
-	l.queueResponseDirective(message)
-	return l.applyModelOutputCorrectionGate("next_directions_required_plain_answer", "next_directions 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
+	return nil
 }
 
-func (l *Loop) auditRuntimeState() bool {
+func (l *Loop) auditRuntimeState() (bool, error) {
 	snapshot := l.RuntimeSnapshot()
-	if message := snapshot.AuditError(); message != "" {
-		l.pendingCalls = nil
-		l.currIteration = 0
-		l.transitionControl(RuntimeControlAwaitingUserQuery)
-		l.refreshInputOwner()
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime lifecycle invariant violation: "+message)
-		return true
+	if len(snapshot.PendingDispatches) > 0 {
+		if err := l.mutateRuntimeAtomically(func() error {
+			if warning := l.recoverUnreconciledDispatches("runtime resumed with an unreconciled committed dispatch"); warning != "" {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, warning)
+			}
+			return nil
+		}); err != nil {
+			return false, fmt.Errorf("recover committed tool dispatch: %w", err)
+		}
+		return true, nil
 	}
-	return false
+	if message := snapshot.AuditError(); message != "" {
+		err := l.mutateRuntimeAtomically(func() error {
+			if warning := l.finalizePendingMutationVerification("runtime audit failed: "+message, reactcontract.AttemptUnknown); warning != "" {
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeError, warning)
+			}
+			l.mutableRuntime().pendingCalls = nil
+			l.mutableRuntime().currIteration = 0
+			l.transitionControl(RuntimeControlAwaitingUserQuery)
+			l.refreshInputOwner()
+			l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "runtime lifecycle invariant violation: "+message)
+			return nil
+		})
+		if err != nil {
+			return false, fmt.Errorf("commit runtime audit recovery for %q: %w", message, err)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // buildIterationSendContent assembles the message list that will be sent to
@@ -729,7 +843,7 @@ func (l *Loop) auditRuntimeState() bool {
 // keeps the active request, phase, nested guide/mutation state, and required
 // next output in active attention across many iterations of tool observations.
 func (l *Loop) buildIterationSendContent() []any {
-	sentContent := append([]any(nil), l.currChatContent...)
+	sentContent := append([]any(nil), l.mutableRuntime().currChatContent...)
 	if anchor := l.mutationVerificationAnchor(); anchor != "" {
 		sentContent = append([]any{anchor}, sentContent...)
 	}
@@ -737,6 +851,9 @@ func (l *Loop) buildIterationSendContent() []any {
 		sentContent = append([]any{anchor}, sentContent...)
 	}
 	if anchor := l.phaseStepAnchor(); anchor != "" {
+		sentContent = append([]any{anchor}, sentContent...)
+	}
+	if anchor := l.executionAnchor(); anchor != "" {
 		sentContent = append([]any{anchor}, sentContent...)
 	}
 	if anchor := l.requirementAnalysisAnchor(); anchor != "" {
@@ -764,6 +881,9 @@ func (l *Loop) sendAndCollectStreaming(ctx context.Context, contents []any) (str
 	var functionCalls []gollm.FunctionCall
 	for response, err := range stream {
 		if err != nil {
+			if shimErr, ok := err.(*shimOutputError); ok {
+				return shimErr.Raw, []gollm.FunctionCall{{Name: protocol.InvalidStructuredOutputCall}}, nil
+			}
 			return "", nil, err
 		}
 		if response == nil {
@@ -789,12 +909,11 @@ func (l *Loop) emitProgressText(ctx context.Context, rawText string) {
 	if rawText == "" {
 		return
 	}
-	if rawText == strings.TrimSpace(l.lastProgressText) {
+	if rawText == strings.TrimSpace(l.mutableRuntime().lastProgressText) {
 		return
 	}
-	displayText := l.translateModelText(ctx, rawText)
-	l.addMessage(api.MessageSourceModel, api.MessageTypeText, displayText)
-	l.lastProgressText = rawText
+	l.addTranslatedModelMessage(ctx, rawText)
+	l.mutableRuntime().lastProgressText = rawText
 }
 
 func (l *Loop) emitAcceptedProgressText(ctx context.Context, progressText string) {
@@ -802,63 +921,20 @@ func (l *Loop) emitAcceptedProgressText(ctx context.Context, progressText string
 	if progressText == "" {
 		return
 	}
-	l.contextApproxTokens += estimateContextTokens(progressText)
-	l.lastAssistantText = progressText
+	l.mutableRuntime().contextApproxTokens += estimateContextTokens(progressText)
+	l.mutableRuntime().lastAssistantText = progressText
 	l.emitProgressText(ctx, progressText)
 }
 
-func (l *Loop) enforceRequestedStructuredDirective(calls []gollm.FunctionCall) bool {
-	if len(calls) == 0 {
-		return false
-	}
-	snapshot := l.RuntimeSnapshot()
-	switch {
-	case (snapshot.Control == RuntimeControlAwaitingResourceGuideLookup || snapshot.RequiresResourceGuideLookupNow) && !onlyFunctionCall(calls, internalResourceGuideLookupCall):
-		message := "The active guidance_lookup phase requires exactly one resource_guide_lookup object. Do not emit an action, phase_progress, guide_progress, final_report, next_directions, or any other structured output until the lookup result is observed."
-		l.queueResponseDirective(message)
-		return l.applyModelOutputCorrectionGate("resource_guide_lookup_required", "resource_guide_lookup 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
-	case (snapshot.Control == RuntimeControlAwaitingGuidedDiagnosisStep ||
-		(snapshot.requiresGuidedDiagnosisStepNow() && !snapshot.FinalReportMustBeInconclusive)) &&
-		hasAnyFunctionCall(calls, internalFinalReportCall, internalNextDirectionsCall):
-		message := "The active guided_diagnosis phase still has incomplete resource-guide steps. Continue with one action for the next guide step, or return guide_progress after useful evidence completes that step. Do not emit final_report or next_directions yet."
-		l.queueResponseDirective(message)
-		return l.applyModelOutputCorrectionGate("guided_diagnosis_step_required", "남은 guide step이 있는데 final_report 또는 next_directions가 반복되어 진단을 중단합니다.", message)
-	case snapshot.Control == RuntimeControlAwaitingNextDirections && !onlyFunctionCall(calls, internalNextDirectionsCall):
-		message := "The previous final_report was inconclusive and the runtime requested `next_directions`. Return only a next_directions object with concrete continuation options; do not emit action, final_report, phase_progress, or a plain answer yet."
-		l.queueResponseDirective(message)
-		return l.applyModelOutputCorrectionGate("next_directions_required", "next_directions 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
-	case snapshot.Control == RuntimeControlAwaitingGuidedPhaseProgress && !onlyFunctionCall(calls, internalPhaseProgressCall):
-		message := "The runtime already requested `phase_progress` for the completed guided_diagnosis phase. Do not emit another action. Return only a phase_progress object completing guided_diagnosis."
-		l.queueResponseDirective(message)
-		return l.applyModelOutputCorrectionGate("guided_phase_progress_required", "guided_diagnosis phase_progress 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
-	case snapshot.Control == RuntimeControlAwaitingFinalReport && !onlyFunctionCall(calls, internalFinalReportCall):
-		message := "The runtime already requested `final_report` after completing the resource-guide diagnostic steps. Do not emit another action. Return only a final_report object."
-		l.queueResponseDirective(message)
-		return l.applyModelOutputCorrectionGate("final_report_required", "final_report 요청이 반복적으로 무시되어 진단을 중단합니다.", message)
-	}
-	return false
-}
-
-func hasAnyFunctionCall(calls []gollm.FunctionCall, names ...string) bool {
-	for _, call := range calls {
-		for _, name := range names {
-			if call.Name == name {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func (l *Loop) rejectConversationalToolCalls(calls []gollm.FunctionCall) bool {
-	if len(calls) == 0 || l.requirementAnalysis == nil {
+	if len(calls) == 0 || l.mutableRuntime().requirementAnalysis == nil {
 		return false
 	}
 	if !l.requirementAnalysisNeedsDirectConversation() {
 		return false
 	}
 	for _, call := range calls {
-		if isRuntimeInternalCall(call.Name) {
+		if protocol.IsRuntimeInternalCall(call.Name) {
 			continue
 		}
 		message := "The accepted requirement_analysis is a conversation/clarification request. Do not call shell, bash, kubectl, echo, or any other tool to ask the user a question. Return a plain assistant answer/question directly, or complete the clarification phase with phase_progress when the user's intent is already clear."
@@ -867,31 +943,9 @@ func (l *Loop) rejectConversationalToolCalls(calls []gollm.FunctionCall) bool {
 	return false
 }
 
-func (l *Loop) rejectNonObservationShellToolCalls(calls []gollm.FunctionCall) bool {
-	for _, call := range calls {
-		command, ok := selfTalkShellCommand(call)
-		if !ok {
-			continue
-		}
-		message := fmt.Sprintf("The previous action was rejected before execution because it does not observe cluster state. Command %q only prints or waits locally, so it is assistant self-talk, not a diagnostic command. Retry with one of these valid next outputs: emit phase_progress if the current planning phase is complete, or emit one real read-only kubectl action if more evidence is needed. Do not return final_report yet unless the active phase allows it and enough evidence is already available.", command)
-		return l.applyGateOutcome(GateOutcome{
-			Kind:            GateOutcomeAgentCommandRetry,
-			Code:            "non_observation_shell_action",
-			Retryable:       true,
-			RetryScope:      RetryScopeAgentCommand,
-			UserVisible:     true,
-			UserMessage:     "관찰이 없는 shell action을 실행하지 않고 다음 응답을 재요청합니다:\n* " + command,
-			ModelCorrection: message,
-			CorrectionMode:  CorrectionModeAppendCompacted,
-			BranchPolicy:    BranchRetryStep,
-		})
-	}
-	return false
-}
-
 func (l *Loop) rejectInteractiveToolCalls() bool {
 	var descriptions []string
-	for _, call := range l.pendingCalls {
+	for _, call := range l.mutableRuntime().pendingCalls {
 		if !call.IsInteractive {
 			continue
 		}
@@ -926,42 +980,8 @@ func (l *Loop) rejectInteractiveToolCalls() bool {
 	})
 }
 
-func selfTalkShellCommand(call gollm.FunctionCall) (string, bool) {
-	command, ok := commandString(call.Arguments["command"])
-	if !ok {
-		return "", false
-	}
-	script := strings.TrimSpace(command)
-	if extracted, ok := kube.ExtractShellScript(script); ok {
-		script = extracted
-	}
-	commands := kube.SplitShellCommandList(script)
-	if len(commands) == 0 {
-		commands = []string{script}
-	}
-	for _, candidate := range commands {
-		fields := kube.ShellWords(candidate)
-		if len(fields) == 0 {
-			continue
-		}
-		if !isSelfTalkShellProgram(fields[0]) {
-			return "", false
-		}
-	}
-	return command, true
-}
-
-func isSelfTalkShellProgram(program string) bool {
-	switch strings.Trim(strings.ToLower(program), "'\"") {
-	case "echo", "printf", "true", "false", "sleep", "read":
-		return true
-	default:
-		return false
-	}
-}
-
 func (l *Loop) requirementAnalysisNeedsDirectConversation() bool {
-	analysis := l.requirementAnalysis
+	analysis := l.mutableRuntime().requirementAnalysis
 	if analysis == nil {
 		return false
 	}
@@ -980,15 +1000,7 @@ func (l *Loop) rejectAssistantManagedToolCalls(calls []gollm.FunctionCall) []gol
 			result := map[string]any{
 				"error": "guidance is handled by k8s-assistant outside the model tool loop. Continue with kubectl only.",
 			}
-			if l.cfg.EnableToolUseShim {
-				l.currChatContent = append(l.currChatContent, fmt.Sprintf("Result of running %q:\n%v", call.Name, result))
-			} else {
-				l.currChatContent = append(l.currChatContent, gollm.FunctionCallResult{
-					ID:     call.ID,
-					Name:   call.Name,
-					Result: result,
-				})
-			}
+			l.appendFunctionCallResult(call, result)
 			continue
 		}
 		allowed = append(allowed, call)
@@ -1019,39 +1031,44 @@ const (
 type RuntimeControlState = reactcontract.RuntimeControlState
 
 const (
-	RuntimeControlUnset                                = reactcontract.RuntimeControlUnset
-	RuntimeControlAwaitingUserQuery                    = reactcontract.RuntimeControlAwaitingUserQuery
-	RuntimeControlAwaitingRequirementAnalysis          = reactcontract.RuntimeControlAwaitingRequirementAnalysis
-	RuntimeControlAwaitingPhasePlan                    = reactcontract.RuntimeControlAwaitingPhasePlan
-	RuntimeControlAwaitingModelStep                    = reactcontract.RuntimeControlAwaitingModelStep
-	RuntimeControlAwaitingResourceGuideLookup          = reactcontract.RuntimeControlAwaitingResourceGuideLookup
-	RuntimeControlAwaitingGuidedDiagnosisStep          = reactcontract.RuntimeControlAwaitingGuidedDiagnosisStep
-	RuntimeControlAwaitingGuidedPhaseProgress          = reactcontract.RuntimeControlAwaitingGuidedPhaseProgress
-	RuntimeControlAwaitingFinalReport                  = reactcontract.RuntimeControlAwaitingFinalReport
-	RuntimeControlAwaitingNextDirections               = reactcontract.RuntimeControlAwaitingNextDirections
-	RuntimeControlAwaitingApproval                     = reactcontract.RuntimeControlAwaitingApproval
-	RuntimeControlExecutingTool                        = reactcontract.RuntimeControlExecutingTool
-	RuntimeControlAwaitingMutationVerificationEvidence = reactcontract.RuntimeControlAwaitingMutationVerificationEvidence
-	RuntimeControlAwaitingMutationVerificationResult   = reactcontract.RuntimeControlAwaitingMutationVerificationResult
-	RuntimeControlAwaitingMutationContinuation         = reactcontract.RuntimeControlAwaitingMutationContinuation
-	RuntimeControlAwaitingContinuationChoice           = reactcontract.RuntimeControlAwaitingContinuationChoice
-	RuntimeControlAwaitingContinuationText             = reactcontract.RuntimeControlAwaitingContinuationText
-	RuntimeControlExited                               = reactcontract.RuntimeControlExited
+	RuntimeControlUnset                                     = reactcontract.RuntimeControlUnset
+	RuntimeControlAwaitingUserQuery                         = reactcontract.RuntimeControlAwaitingUserQuery
+	RuntimeControlAwaitingRequirementAnalysis               = reactcontract.RuntimeControlAwaitingRequirementAnalysis
+	RuntimeControlAwaitingPhasePlan                         = reactcontract.RuntimeControlAwaitingPhasePlan
+	RuntimeControlAwaitingModelStep                         = reactcontract.RuntimeControlAwaitingModelStep
+	RuntimeControlAwaitingResourceGuideLookup               = reactcontract.RuntimeControlAwaitingResourceGuideLookup
+	RuntimeControlAwaitingGuidedDiagnosisStep               = reactcontract.RuntimeControlAwaitingGuidedDiagnosisStep
+	RuntimeControlAwaitingGuidedPhaseProgress               = reactcontract.RuntimeControlAwaitingGuidedPhaseProgress
+	RuntimeControlAwaitingFinalReport                       = reactcontract.RuntimeControlAwaitingFinalReport
+	RuntimeControlAwaitingNextDirections                    = reactcontract.RuntimeControlAwaitingNextDirections
+	RuntimeControlAwaitingApproval                          = reactcontract.RuntimeControlAwaitingApproval
+	RuntimeControlAwaitingToolResult                        = reactcontract.RuntimeControlAwaitingToolResult
+	RuntimeControlAwaitingMutationVerificationEvidence      = reactcontract.RuntimeControlAwaitingMutationVerificationEvidence
+	RuntimeControlAwaitingMutationVerificationResult        = reactcontract.RuntimeControlAwaitingMutationVerificationResult
+	RuntimeControlAwaitingMutationVerificationChainEvidence = reactcontract.RuntimeControlAwaitingMutationVerificationChainEvidence
+	RuntimeControlAwaitingMutationVerificationChainResult   = reactcontract.RuntimeControlAwaitingMutationVerificationChainResult
+	RuntimeControlAwaitingMutationContinuation              = reactcontract.RuntimeControlAwaitingMutationContinuation
+	RuntimeControlAwaitingContinuationHandoff               = reactcontract.RuntimeControlAwaitingContinuationHandoff
+	RuntimeControlAwaitingContinuationChoice                = reactcontract.RuntimeControlAwaitingContinuationChoice
+	RuntimeControlAwaitingContinuationText                  = reactcontract.RuntimeControlAwaitingContinuationText
+	RuntimeControlExited                                    = reactcontract.RuntimeControlExited
 )
 
 type PhaseStatus = reactcontract.PhaseStatus
 
 const (
-	PhasePending   = reactcontract.PhasePending
-	PhaseActive    = reactcontract.PhaseActive
-	PhaseCompleted = reactcontract.PhaseCompleted
-	PhaseSkipped   = reactcontract.PhaseSkipped
+	PhasePending    = reactcontract.PhasePending
+	PhaseActive     = reactcontract.PhaseActive
+	PhaseCompleted  = reactcontract.PhaseCompleted
+	PhaseSkipped    = reactcontract.PhaseSkipped
+	PhaseSuperseded = reactcontract.PhaseSuperseded
 )
 
 type StepKind = reactcontract.StepKind
 
 const (
 	StepGeneralAction               = reactcontract.StepGeneralAction
+	StepLightweightLookup           = reactcontract.StepLightweightLookup
 	StepExplicitPhase               = reactcontract.StepExplicitPhase
 	StepResourceGuideDiagnostic     = reactcontract.StepResourceGuideDiagnostic
 	StepMutationEvidenceRequirement = reactcontract.StepMutationEvidenceRequirement
@@ -1060,11 +1077,14 @@ const (
 type StepStatus = reactcontract.StepStatus
 
 const (
-	StepPending   = reactcontract.StepPending
-	StepActive    = reactcontract.StepActive
-	StepCompleted = reactcontract.StepCompleted
-	StepSkipped   = reactcontract.StepSkipped
-	StepRetrying  = reactcontract.StepRetrying
+	StepPending    = reactcontract.StepPending
+	StepActive     = reactcontract.StepActive
+	StepCompleted  = reactcontract.StepCompleted
+	StepAchieved   = reactcontract.StepAchieved
+	StepBlocked    = reactcontract.StepBlocked
+	StepSkipped    = reactcontract.StepSkipped
+	StepRetrying   = reactcontract.StepRetrying
+	StepSuperseded = reactcontract.StepSuperseded
 )
 
 type UserInputKind = reactcontract.UserInputKind
@@ -1111,6 +1131,10 @@ func (l *Loop) refreshInputOwner() {
 	if l == nil {
 		return
 	}
+	if l.activeTransaction != nil {
+		l.activeTransaction.refreshInputOwner = true
+		return
+	}
 	snapshot := l.publishRuntimeSnapshot()
 	owner := snapshot.InputOwner
 	var value int32
@@ -1134,32 +1158,30 @@ func (l *Loop) transitionControl(next RuntimeControlState) {
 	if l == nil {
 		return
 	}
-	if next != RuntimeControlAwaitingFinalReport {
-		l.finalReportMustBeInconclusive = false
-	}
-	l.mutableSession().Transition(next)
-	l.control = next
-}
-
-func (l *Loop) mutableSession() *session.State {
-	if l.session == nil {
-		l.session = session.New()
-		// Package-local tests may construct Loop with the compatibility field.
-		if l.control != RuntimeControlUnset {
-			l.session.Control = l.control
+	if l.activeTransaction == nil {
+		l.mutableRuntime()
+		expected, candidate := l.stateStore.Candidate(cloneRuntimeState)
+		if candidate == nil {
+			klog.ErrorS(fmt.Errorf("runtime control transition candidate is nil"), "runtime control transition rejected", "next", next)
+			return
 		}
+		candidate.control = next
+		if _, err := l.stateStore.Commit(expected, candidate, l.auditRuntimeCandidate); err != nil {
+			klog.ErrorS(err, "runtime control transition rejected", "next", next)
+			l.runtimeState = l.stateStore.Root()
+			return
+		}
+		l.runtimeState = l.stateStore.Root()
+		return
 	}
-	return l.session
+	l.mutableRuntime().control = next
 }
 
 func (l *Loop) controlState() RuntimeControlState {
 	if l == nil {
 		return RuntimeControlUnset
 	}
-	if l.session != nil {
-		return l.session.Control
-	}
-	return l.control
+	return l.mutableRuntime().control
 }
 
 func (l *Loop) loopLifecycle() LoopLifecycleState {
@@ -1167,16 +1189,6 @@ func (l *Loop) loopLifecycle() LoopLifecycleState {
 		return LoopLifecycleAwaitingUserInput
 	}
 	return session.LifecycleFor(l.controlState())
-}
-
-func (l *Loop) transitionAfterToolFailure() {
-	if l != nil && l.controlState() == RuntimeControlExecutingTool {
-		l.transitionControl(RuntimeControlAwaitingModelStep)
-	}
-}
-
-func reactPhaseRef(ref PhaseRef) reactcontract.PhaseRef {
-	return ref
 }
 
 type PhaseRef = reactcontract.PhaseRef
@@ -1272,10 +1284,10 @@ func isApprovalToken(input string) bool {
 	}
 }
 
-// RuntimeSnapshot is a shallow, same-goroutine projection of Loop control
-// lifecycle. It centralizes lifecycle interpretation for prompts and diagnostics; it
-// is not an immutable deep copy for cross-goroutine use.
+// RuntimeSnapshot is a detached projection of the revisioned session root.
+// Maps, slices, and workflow pointers are copied before publication.
 type RuntimeSnapshot struct {
+	Revision   uint64
 	Lifecycle  LoopLifecycleState
 	Control    RuntimeControlState
 	InputOwner InputOwner
@@ -1292,6 +1304,7 @@ type RuntimeSnapshot struct {
 	ActiveSteps  []StepRuntimeState
 
 	PendingCalls                   []PendingCall
+	PendingDispatches              []reactcontract.ToolDispatchIntent
 	PendingMutationVerification    *pendingMutationVerification
 	MutationContinuationAttempts   int
 	FinalReportMustBeInconclusive  bool
@@ -1299,62 +1312,127 @@ type RuntimeSnapshot struct {
 	PendingNextDirections          *nextDirections
 	PendingDirectionPrompt         *directionPromptState
 	PendingDirective               string
+	Continuation                   *reactcontract.ContinuationState
+	ContinuationResumePending      bool
 	ResourceGuideInjected          bool
 	RequiresResourceGuideLookupNow bool
+	Execution                      *session.GoalExecutionState
 }
 
 func (l *Loop) RuntimeSnapshot() RuntimeSnapshot {
 	if l == nil {
 		return RuntimeSnapshot{Control: RuntimeControlUnset}
 	}
-	snapshot := RuntimeSnapshot{
-		Lifecycle:                      l.loopLifecycle(),
-		Control:                        l.controlState(),
-		OriginalQuery:                  strings.TrimSpace(l.originalQuery),
-		Requirement:                    l.requirementAnalysis,
-		Request:                        l.requestContext,
-		ResourceClassification:         l.resourceClassification,
-		Phase:                          l.phaseStepState,
-		Guide:                          l.guideStepState,
-		PhaseRuntime:                   l.phaseStepState.runtimeState(),
-		PendingCalls:                   append([]PendingCall(nil), l.pendingCalls...),
-		PendingMutationVerification:    l.pendingMutationVerification,
-		MutationContinuationAttempts:   l.mutationContinuationAttempts,
-		FinalReportMustBeInconclusive:  l.finalReportMustBeInconclusive,
-		PendingFinalReport:             l.pendingFinalReport,
-		PendingNextDirections:          l.pendingNextDirections,
-		PendingDirectionPrompt:         l.pendingDirectionPrompt,
-		PendingDirective:               strings.TrimSpace(l.pendingResponseDirective),
-		ResourceGuideInjected:          l.resourceGuideInjected,
-		RequiresResourceGuideLookupNow: l.phaseStepRequiresResourceGuideLookup(),
+	revision := uint64(0)
+	if l.stateStore != nil {
+		revision = l.stateStore.Revision()
 	}
-	snapshot.ActiveSteps = l.activeStepRuntimeStates(snapshot.PhaseRuntime)
+	return projectRuntimeSnapshot(l.mutableRuntime(), revision)
+}
+
+func projectRuntimeSnapshot(source *runtimeState, revision uint64) RuntimeSnapshot {
+	if source == nil {
+		return RuntimeSnapshot{Control: RuntimeControlUnset}
+	}
+	state := cloneRuntimeState(*source)
+	phaseRuntime := state.phaseStepState.runtimeState()
+	enrichPhaseRuntimeContracts(phaseRuntime, state.execution)
+	snapshot := RuntimeSnapshot{
+		Revision:                     revision,
+		Lifecycle:                    session.LifecycleFor(state.control),
+		Control:                      state.control,
+		OriginalQuery:                strings.TrimSpace(state.originalQuery),
+		Requirement:                  state.requirementAnalysis,
+		Request:                      state.requestContext,
+		ResourceClassification:       state.resourceClassification,
+		Phase:                        state.phaseStepState,
+		Guide:                        state.guideStepState,
+		PhaseRuntime:                 phaseRuntime,
+		PendingCalls:                 clonePendingCalls(state.pendingCalls),
+		PendingDispatches:            pendingDispatchIntents(&state),
+		PendingMutationVerification:  state.pendingMutationVerification,
+		MutationContinuationAttempts: state.mutationContinuationAttempts,
+		FinalReportMustBeInconclusive: state.finalReportMustBeInconclusive ||
+			(state.execution != nil && len(state.execution.BlockedObligations) > 0),
+		PendingFinalReport:             state.pendingFinalReport,
+		PendingNextDirections:          state.pendingNextDirections,
+		PendingDirectionPrompt:         state.pendingDirectionPrompt,
+		PendingDirective:               strings.TrimSpace(state.pendingResponseDirective),
+		Continuation:                   cloneContinuationState(state.continuation),
+		ContinuationResumePending:      state.continuationResumePending,
+		ResourceGuideInjected:          state.resourceGuideInjected,
+		RequiresResourceGuideLookupNow: projectRequiresResourceGuideLookup(&state),
+		Execution:                      session.CloneGoalExecutionState(state.execution),
+	}
+	snapshot.ActiveSteps = projectActiveStepRuntimeStates(&state, snapshot.PhaseRuntime)
 	snapshot.InputOwner = snapshot.DerivedInputOwner()
 	return snapshot
 }
 
-func (l *Loop) activeStepRuntimeStates(phase *PhaseRuntimeState) []StepRuntimeState {
-	if l == nil {
+func pendingDispatchIntents(state *runtimeState) []reactcontract.ToolDispatchIntent {
+	if state == nil {
+		return nil
+	}
+	var intents []reactcontract.ToolDispatchIntent
+	for _, id := range state.dispatchOrder {
+		intent, ok := state.dispatchIntents[id]
+		if !ok || intent.Status != reactcontract.ToolDispatchPending {
+			continue
+		}
+		intents = append(intents, cloneDispatchIntent(intent))
+	}
+	return intents
+}
+
+func projectActiveStepRuntimeStates(state *runtimeState, phase *PhaseRuntimeState) []StepRuntimeState {
+	if state == nil {
 		return nil
 	}
 	activePhase := PhaseRef{}
 	if phase != nil {
 		activePhase = phase.Active
 	}
+	if verification := state.pendingMutationVerification; verification != nil &&
+		state.control != RuntimeControlAwaitingMutationContinuation {
+		return verification.stepRuntimeStates(activePhase)
+	}
 	var steps []StepRuntimeState
-	for _, action := range l.completedActions {
-		if action.Phase == nil || (action.Phase.Index == 0 && strings.TrimSpace(action.Phase.Name) == "") {
-			continue
+	hasRuntimeProjection := false
+	if guide := state.guideStepState; guide != nil {
+		steps = append(steps, guide.stepRuntimeStates(activePhase)...)
+		hasRuntimeProjection = true
+	}
+	if hasRuntimeProjection {
+		return steps
+	}
+	if execution := state.execution; execution != nil && len(execution.Phases) > 0 {
+		for _, phaseContract := range execution.Phases {
+			for _, step := range phaseContract.Steps {
+				status := execution.StepStatus[step.ID]
+				if status == "" {
+					status = StepPending
+				}
+				steps = append(steps, StepRuntimeState{
+					Ref: StepRef{
+						Phase: PhaseRef{
+							ID:        phaseContract.ID,
+							LineageID: phaseContract.PhaseLineageID,
+							Index:     phaseContract.Index,
+							Name:      phaseContract.Name,
+						},
+						Kind:          step.Kind,
+						ID:            step.ID,
+						GoalLineageID: step.GoalLineageID,
+						Index:         step.Index,
+					},
+					Status:      status,
+					Description: step.Goal,
+				})
+			}
 		}
-		steps = append(steps, action.stepRuntimeState())
+		return steps
 	}
-	if l.guideStepState != nil {
-		steps = append(steps, l.guideStepState.stepRuntimeStates(activePhase)...)
-	}
-	if l.pendingMutationVerification != nil {
-		steps = append(steps, l.pendingMutationVerification.stepRuntimeStates(activePhase)...)
-	}
-	for i, call := range l.pendingCalls {
+	for i, call := range state.pendingCalls {
 		if strings.HasPrefix(strings.TrimSpace(call.FunctionCall.Name), "__") {
 			continue
 		}
@@ -1364,36 +1442,20 @@ func (l *Loop) activeStepRuntimeStates(phase *PhaseRuntimeState) []StepRuntimeSt
 }
 
 func pendingCallStepRuntimeState(phase PhaseRef, index int, call PendingCall) StepRuntimeState {
-	command, _ := commandString(call.FunctionCall.Arguments["command"])
-	if command == "" {
-		command = strings.TrimSpace(stringFromAny(call.FunctionCall.Arguments["command"]))
+	command, _ := rawCommandString(call.FunctionCall.Arguments["command"])
+	ref := StepRef{
+		Phase: phase,
+		Kind:  StepGeneralAction,
+		Index: index,
+	}
+	if call.StepRef != nil {
+		ref = *call.StepRef
 	}
 	return StepRuntimeState{
-		Ref: StepRef{
-			Phase: phase,
-			Kind:  StepGeneralAction,
-			Index: index,
-		},
+		Ref:         ref,
 		Status:      StepActive,
 		Description: strings.TrimSpace(call.FunctionCall.Name),
 		Command:     command,
-	}
-}
-
-func (a actionRecord) stepRuntimeState() StepRuntimeState {
-	phase := PhaseRef{}
-	if a.Phase != nil {
-		phase = *a.Phase
-	}
-	return StepRuntimeState{
-		Ref: StepRef{
-			Phase: phase,
-			Kind:  StepGeneralAction,
-			Index: a.Step,
-		},
-		Status:      StepCompleted,
-		Description: strings.TrimSpace(a.Tool),
-		Command:     strings.TrimSpace(a.Command),
 	}
 }
 
@@ -1411,6 +1473,15 @@ func (l *Loop) PublishedRuntimeSnapshot() (RuntimeSnapshot, bool) {
 
 func (l *Loop) publishRuntimeSnapshot() RuntimeSnapshot {
 	snapshot := l.RuntimeSnapshot()
+	l.runtimeSnapshot.Store(snapshot)
+	return snapshot
+}
+
+func (l *Loop) publishCommittedRuntimeSnapshot() RuntimeSnapshot {
+	if l == nil || l.activeTransaction == nil || l.activeTransaction.previous == nil {
+		return l.publishRuntimeSnapshot()
+	}
+	snapshot := projectRuntimeSnapshot(l.activeTransaction.previous, l.activeTransaction.expected)
 	l.runtimeSnapshot.Store(snapshot)
 	return snapshot
 }
@@ -1441,12 +1512,16 @@ func (s RuntimeSnapshot) ShouldEmitAnchor() bool {
 
 func (s RuntimeSnapshot) ActiveGate() string {
 	switch s.Control {
-	case RuntimeControlAwaitingMutationVerificationResult:
+	case RuntimeControlAwaitingMutationVerificationResult,
+		RuntimeControlAwaitingMutationVerificationChainResult:
 		return "mutation_verification_result_required"
-	case RuntimeControlAwaitingMutationVerificationEvidence:
+	case RuntimeControlAwaitingMutationVerificationEvidence,
+		RuntimeControlAwaitingMutationVerificationChainEvidence:
 		return "mutation_verification_evidence_required"
 	case RuntimeControlAwaitingMutationContinuation:
 		return "mutation_continuation_required"
+	case RuntimeControlAwaitingContinuationHandoff:
+		return "continuation_handoff_required"
 	case RuntimeControlAwaitingGuidedPhaseProgress:
 		return "guided_diagnosis_phase_progress_required"
 	case RuntimeControlAwaitingFinalReport:
@@ -1472,12 +1547,16 @@ func (s RuntimeSnapshot) ActiveGate() string {
 
 func (s RuntimeSnapshot) RequiredNextOutput() string {
 	switch s.Control {
-	case RuntimeControlAwaitingMutationVerificationResult:
+	case RuntimeControlAwaitingMutationVerificationResult,
+		RuntimeControlAwaitingMutationVerificationChainResult:
 		return "mutation_verification_result"
-	case RuntimeControlAwaitingMutationVerificationEvidence:
+	case RuntimeControlAwaitingMutationVerificationEvidence,
+		RuntimeControlAwaitingMutationVerificationChainEvidence:
 		return "one read-only action satisfying a remaining mutation evidence requirement"
 	case RuntimeControlAwaitingMutationContinuation:
-		return "next best action based on verification evidence"
+		return "one materially different action or evidence-grounded phase_plan_revision"
+	case RuntimeControlAwaitingContinuationHandoff:
+		return "continuation_handoff"
 	case RuntimeControlAwaitingGuidedPhaseProgress:
 		return "phase_progress"
 	case RuntimeControlAwaitingFinalReport:
@@ -1511,12 +1590,16 @@ func (s RuntimeSnapshot) RequiredNextOutput() string {
 
 func (s RuntimeSnapshot) ForbiddenNextOutputs() []string {
 	switch s.Control {
-	case RuntimeControlAwaitingMutationVerificationResult:
+	case RuntimeControlAwaitingMutationVerificationResult,
+		RuntimeControlAwaitingMutationVerificationChainResult:
 		return []string{"action", "final_report", "phase_progress", "next_directions", "answer"}
-	case RuntimeControlAwaitingMutationVerificationEvidence:
+	case RuntimeControlAwaitingMutationVerificationEvidence,
+		RuntimeControlAwaitingMutationVerificationChainEvidence:
 		return []string{"mutating action", "final_report", "phase_progress", "next_directions", "answer", "mutation_verification_result"}
 	case RuntimeControlAwaitingMutationContinuation:
 		return []string{"final_report", "phase_progress", "next_directions", "answer"}
+	case RuntimeControlAwaitingContinuationHandoff:
+		return []string{"action", "phase_plan_revision", "phase_progress", "final_report", "next_directions", "answer"}
 	case RuntimeControlAwaitingGuidedPhaseProgress:
 		return []string{"action", "final_report", "next_directions", "answer"}
 	case RuntimeControlAwaitingFinalReport:
@@ -1550,7 +1633,13 @@ func (s RuntimeSnapshot) requiresGuidedDiagnosisStepNow() bool {
 func (s RuntimeSnapshot) NestedStateName() string {
 	if s.PendingMutationVerification != nil {
 		if s.PendingMutationVerification.AwaitingResult {
+			if s.PendingMutationVerification.isChain() {
+				return "mutation_verification_chain_result"
+			}
 			return "mutation_verification_result"
+		}
+		if s.PendingMutationVerification.isChain() {
+			return "mutation_verification_chain_evidence"
 		}
 		return "mutation_verification_evidence"
 	}
@@ -1564,9 +1653,38 @@ func (s RuntimeSnapshot) NestedStateName() string {
 }
 
 func (s RuntimeSnapshot) AuditError() string {
+	if message := auditGoalExecution(s.Execution); message != "" {
+		return message
+	}
+	class, knownControl := reactcontract.ClassifyRuntimeControlState(s.Control)
 	switch {
-	case s.Control == RuntimeControlUnset:
+	case !knownControl:
+		return fmt.Sprintf("runtime control state is unknown: %q", s.Control)
+	case class == reactcontract.ControlExecutionInvalid:
 		return "runtime control state is unset"
+	case len(s.PendingDispatches) > 0 && s.Control != RuntimeControlAwaitingToolResult:
+		return "committed pending dispatch exists outside tool-result control"
+	case s.Control == RuntimeControlAwaitingToolResult && len(s.PendingDispatches) == 0:
+		return "tool result control has no committed pending dispatch"
+	case (s.Control == RuntimeControlAwaitingUserQuery || s.Control == RuntimeControlExited) &&
+		s.PendingMutationVerification != nil:
+		return "terminal/user-query control cannot retain pending mutation verification"
+	case s.PendingMutationVerification != nil && s.Execution != nil &&
+		!snapshotHasAttempt(s.Execution, s.PendingMutationVerification.AttemptID):
+		return "pending mutation verification has no owning attempt"
+	case snapshotHasOrphanVerifyingAttempt(s.Execution, s.PendingMutationVerification):
+		return "verifying mutation attempt has no active verification owner"
+	case s.Control == RuntimeControlAwaitingContinuationHandoff &&
+		(s.Execution == nil || strings.TrimSpace(s.Execution.RequestID) == "" || strings.TrimSpace(s.Execution.Goal.ID) == ""):
+		return "continuation handoff control has no active request and goal"
+	case s.ContinuationResumePending &&
+		(s.Continuation == nil || s.Control != RuntimeControlAwaitingContinuationChoice):
+		return "continuation resume flag has no matching continuation choice"
+	case s.ContinuationResumePending &&
+		(s.Execution == nil ||
+			s.Continuation.Handoff.RequestID != s.Execution.RequestID ||
+			s.Continuation.Handoff.GoalID != s.Execution.Goal.ID):
+		return "continuation handoff identity does not match active execution"
 	case s.Control == RuntimeControlAwaitingContinuationText && s.PendingDirectionPrompt != nil:
 		return "direction free-text lifecycle still has a pending choice prompt"
 	case s.Control == RuntimeControlAwaitingContinuationChoice && s.PendingDirectionPrompt == nil:
@@ -1581,10 +1699,18 @@ func (s RuntimeSnapshot) AuditError() string {
 		return "resource guide lookup control has no eligible guidance lookup phase"
 	case s.Control == RuntimeControlAwaitingGuidedDiagnosisStep && (s.Guide == nil || len(s.Guide.remainingSteps()) == 0):
 		return "guided diagnosis control has no remaining guide step"
-	case s.Control == RuntimeControlAwaitingMutationVerificationEvidence && (s.PendingMutationVerification == nil || s.PendingMutationVerification.AwaitingResult):
+	case s.Control == RuntimeControlAwaitingMutationVerificationEvidence &&
+		(s.PendingMutationVerification == nil || !s.PendingMutationVerification.matchesEvidenceControl(s.Control)):
 		return "mutation evidence control does not match verification payload"
-	case s.Control == RuntimeControlAwaitingMutationVerificationResult && (s.PendingMutationVerification == nil || !s.PendingMutationVerification.AwaitingResult):
+	case s.Control == RuntimeControlAwaitingMutationVerificationResult &&
+		(s.PendingMutationVerification == nil || !s.PendingMutationVerification.matchesResultControl(s.Control)):
 		return "mutation verification result control does not match verification payload"
+	case s.Control == RuntimeControlAwaitingMutationVerificationChainEvidence &&
+		(s.PendingMutationVerification == nil || !s.PendingMutationVerification.matchesEvidenceControl(s.Control)):
+		return "mutation verification chain evidence control does not match verification payload"
+	case s.Control == RuntimeControlAwaitingMutationVerificationChainResult &&
+		(s.PendingMutationVerification == nil || !s.PendingMutationVerification.matchesResultControl(s.Control)):
+		return "mutation verification chain result control does not match verification payload"
 	case s.Control == RuntimeControlAwaitingGuidedPhaseProgress && (s.PendingMutationVerification != nil || s.Phase == nil || !strings.EqualFold(strings.TrimSpace(s.Phase.currentStep().Name), "guided_diagnosis") || s.Guide == nil || !s.Guide.allCompleted()):
 		return "guided phase progress control does not match a completed guided_diagnosis phase"
 	case s.Control == RuntimeControlAwaitingFinalReport && s.PendingMutationVerification != nil:
@@ -1596,6 +1722,30 @@ func (s RuntimeSnapshot) AuditError() string {
 	}
 }
 
+func snapshotHasAttempt(execution *session.GoalExecutionState, attemptID string) bool {
+	if execution == nil || strings.TrimSpace(attemptID) == "" {
+		return false
+	}
+	_, ok := execution.AttemptByID(attemptID)
+	return ok
+}
+
+func snapshotHasOrphanVerifyingAttempt(execution *session.GoalExecutionState, verification *pendingMutationVerification) bool {
+	if execution == nil {
+		return false
+	}
+	ownerID := ""
+	if verification != nil {
+		ownerID = verification.AttemptID
+	}
+	for _, attempt := range execution.OrderedAttempts() {
+		if attempt.Status == reactcontract.AttemptVerifying && attempt.ID != ownerID {
+			return true
+		}
+	}
+	return false
+}
+
 func (l *Loop) runtimeStateAnchor() string {
 	snapshot := l.RuntimeSnapshot()
 	if !snapshot.ShouldEmitAnchor() {
@@ -1604,6 +1754,7 @@ func (l *Loop) runtimeStateAnchor() string {
 
 	var b strings.Builder
 	b.WriteString("Runtime lifecycle summary. Treat this as the concise decision contract for the next response; detailed anchors below remain authoritative for their domain.\n")
+	fmt.Fprintf(&b, "state_revision: %d\n", snapshot.Revision)
 	fmt.Fprintf(&b, "loop_lifecycle: %s\n", reactStateName(snapshot.Lifecycle))
 	fmt.Fprintf(&b, "control_state: %s\n", snapshot.Control)
 	if snapshot.OriginalQuery != "" {
@@ -1705,12 +1856,12 @@ func (s RuntimeSnapshot) writeRuntimePhaseSummary(b *strings.Builder) {
 func (s RuntimeSnapshot) writeRuntimeNestedStateSummary(b *strings.Builder) {
 	fmt.Fprintf(b, "active_nested_state: %s\n", s.NestedStateName())
 	if s.PendingMutationVerification != nil && !s.PendingMutationVerification.AwaitingResult {
-		if remaining := s.PendingMutationVerification.remainingRequirements(); len(remaining) > 0 {
-			var ids []string
-			for _, req := range remaining {
-				ids = append(ids, req.ID)
+		if check := s.PendingMutationVerification.activeCheck(); check != nil {
+			fmt.Fprintf(b, "active_mutation_verification_id: %s\n", check.ID)
+			fmt.Fprintf(b, "active_mutation_verification_mode: %s\n", check.Mode)
+			if len(s.PendingMutationVerification.Checks) > 1 {
+				fmt.Fprintf(b, "mutation_verification_chain_position: %d/%d\n", s.PendingMutationVerification.ActiveIndex+1, len(s.PendingMutationVerification.Checks))
 			}
-			fmt.Fprintf(b, "remaining_mutation_evidence_ids: %s\n", strings.Join(ids, ","))
 		}
 		return
 	}
@@ -1726,13 +1877,20 @@ func (s RuntimeSnapshot) writeRuntimeNestedStateSummary(b *strings.Builder) {
 }
 
 func (l *Loop) phaseStepRequiresResourceGuideLookup() bool {
-	if l.phaseStepState == nil || l.resourceClassification == nil {
+	if l == nil {
 		return false
 	}
-	current := l.phaseStepState.currentStep()
+	return projectRequiresResourceGuideLookup(l.mutableRuntime())
+}
+
+func projectRequiresResourceGuideLookup(state *runtimeState) bool {
+	if state == nil || state.phaseStepState == nil || state.resourceClassification == nil {
+		return false
+	}
+	current := state.phaseStepState.currentStep()
 	return guidanceflow.LookupRequired(
-		string(l.resourceClassification.Kind),
-		l.resourceGuideInjected,
+		string(state.resourceClassification.Kind),
+		state.resourceGuideInjected,
 		current.Name,
 	)
 }
@@ -1778,7 +1936,6 @@ type runtimeCleanupPolicy struct {
 	ClearResponseDirectives   bool
 	ClearDirectionState       bool
 	ClearMutationContinuation bool
-	ClearMutationVerification bool
 }
 
 func (l *Loop) applyRuntimeCleanup(policy runtimeCleanupPolicy) {
@@ -1786,22 +1943,19 @@ func (l *Loop) applyRuntimeCleanup(policy runtimeCleanupPolicy) {
 		return
 	}
 	if policy.ClearPendingCalls {
-		l.pendingCalls = nil
+		l.mutableRuntime().pendingCalls = nil
 	}
 	if policy.ClearResponseDirectives {
-		l.pendingResponseDirective = ""
+		l.mutableRuntime().pendingResponseDirective = ""
 	}
 	if policy.ClearDirectionState {
-		l.pendingFinalReport = nil
-		l.pendingNextDirections = nil
-		l.pendingDirectionPrompt = nil
+		l.mutableRuntime().pendingFinalReport = nil
+		l.mutableRuntime().pendingNextDirections = nil
+		l.mutableRuntime().pendingDirectionPrompt = nil
 	}
 	if policy.ClearMutationContinuation {
-		l.mutationContinuationAttempts = 0
-		l.finalReportMustBeInconclusive = false
-	}
-	if policy.ClearMutationVerification {
-		l.pendingMutationVerification = nil
+		l.mutableRuntime().mutationContinuationAttempts = 0
+		l.mutableRuntime().finalReportMustBeInconclusive = false
 	}
 }
 
@@ -1830,38 +1984,28 @@ func cleanupExitPolicy() runtimeCleanupPolicy {
 type phaseScopedResetPolicy struct {
 	ResetGuide                 bool
 	ResetResourceGuideLookup   bool
-	ResetMutationVerification  bool
 	ClearResponseDirectives    bool
 	ClearPendingFinalDirection bool
-	TrimCompletedActions       bool
 }
 
-func (l *Loop) resetPhaseScopedState(from PhaseRef, policy phaseScopedResetPolicy) {
+func (l *Loop) resetPhaseScopedState(policy phaseScopedResetPolicy) {
 	if l == nil {
 		return
 	}
 	if policy.ResetGuide {
-		l.guideStepState = nil
+		l.mutableRuntime().guideStepState = nil
 	}
 	if policy.ResetResourceGuideLookup {
-		l.resourceGuideInjected = false
-		l.resourceGuideQueries = nil
-	}
-	if policy.ResetMutationVerification {
-		l.pendingMutationVerification = nil
-		l.mutationContinuationAttempts = 0
-		l.finalReportMustBeInconclusive = false
+		l.mutableRuntime().resourceGuideInjected = false
+		l.mutableRuntime().resourceGuideQueries = nil
 	}
 	if policy.ClearResponseDirectives {
-		l.pendingResponseDirective = ""
+		l.mutableRuntime().pendingResponseDirective = ""
 	}
 	if policy.ClearPendingFinalDirection {
-		l.pendingFinalReport = nil
-		l.pendingNextDirections = nil
-		l.pendingDirectionPrompt = nil
-	}
-	if policy.TrimCompletedActions {
-		l.trimCompletedActionsFromPhase(from)
+		l.mutableRuntime().pendingFinalReport = nil
+		l.mutableRuntime().pendingNextDirections = nil
+		l.mutableRuntime().pendingDirectionPrompt = nil
 	}
 }
 
@@ -1869,39 +2013,19 @@ func (l *Loop) defaultPhaseScopedResetPolicy(from PhaseRef) phaseScopedResetPoli
 	policy := phaseScopedResetPolicy{
 		ClearResponseDirectives:    true,
 		ClearPendingFinalDirection: true,
-		TrimCompletedActions:       true,
 	}
-	if l == nil || l.phaseStepState == nil {
+	if l == nil || l.mutableRuntime().phaseStepState == nil {
 		return policy
 	}
-	for _, ref := range l.phaseStepState.phasesAtOrAfter(from) {
+	for _, ref := range l.mutableRuntime().phaseStepState.phasesAtOrAfter(from) {
 		name := strings.ToLower(strings.TrimSpace(ref.Name))
 		switch {
 		case strings.Contains(name, "guidance"), strings.Contains(name, "guided"):
 			policy.ResetGuide = true
 			policy.ResetResourceGuideLookup = true
-		case strings.Contains(name, "mutation"), strings.Contains(name, "remediation"), strings.Contains(name, "verification"):
-			policy.ResetMutationVerification = true
 		}
 	}
 	return policy
-}
-
-func (l *Loop) trimCompletedActionsFromPhase(from PhaseRef) {
-	if l == nil || len(l.completedActions) == 0 || l.phaseStepState == nil {
-		return
-	}
-	var kept []actionRecord
-	for _, action := range l.completedActions {
-		if action.Phase == nil || action.Phase.Index == 0 {
-			kept = append(kept, action)
-			continue
-		}
-		if action.Phase.Index < from.Index {
-			kept = append(kept, action)
-		}
-	}
-	l.completedActions = kept
 }
 
 type contextError struct {
@@ -1916,17 +2040,6 @@ type guideRef struct {
 	Content string `json:"content,omitempty"`
 }
 
-type actionRecord struct {
-	Step       int            `json:"step"`
-	Tool       string         `json:"tool"`
-	Phase      *PhaseRef      `json:"phase,omitempty"`
-	Command    string         `json:"command,omitempty"`
-	Target     *actionTarget  `json:"target,omitempty"`
-	ResultHash string         `json:"result_hash"`
-	Result     map[string]any `json:"result,omitempty"`
-	Clues      []string       `json:"clues,omitempty"`
-}
-
 func contextHash(content string) string {
 	sum := sha256.Sum256([]byte(content))
 	return fmt.Sprintf("sha256:%x", sum[:8])
@@ -1934,26 +2047,23 @@ func contextHash(content string) string {
 
 func (l *Loop) appendContextBlock(kind, content string, preserve bool) bool {
 	if preserve {
-		l.currChatContent = append(l.currChatContent, content)
+		l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, content)
 		return true
 	}
-	if l.contextBlockHashes == nil {
-		l.contextBlockHashes = make(map[string]struct{})
+	if l.mutableRuntime().contextBlockHashes == nil {
+		l.mutableRuntime().contextBlockHashes = make(map[string]struct{})
 	}
 	key := kind + ":" + contextHash(content)
-	if _, ok := l.contextBlockHashes[key]; ok {
+	if _, ok := l.mutableRuntime().contextBlockHashes[key]; ok {
 		return false
 	}
-	l.contextBlockHashes[key] = struct{}{}
-	l.currChatContent = append(l.currChatContent, content)
+	l.mutableRuntime().contextBlockHashes[key] = struct{}{}
+	l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, content)
 	return true
 }
 
 func (l *Loop) appendCorrection(code, message string) bool {
-	if l.lastContextError != nil && l.lastContextError.Code == code {
-		return false
-	}
-	l.lastContextError = &contextError{
+	l.mutableRuntime().lastContextError = &contextError{
 		Code:      code,
 		Message:   message,
 		Retryable: true,
@@ -1962,10 +2072,7 @@ func (l *Loop) appendCorrection(code, message string) bool {
 }
 
 func (l *Loop) appendCorrectionWithCompaction(code, message string) bool {
-	if l.lastContextError != nil && l.lastContextError.Code == code {
-		return false
-	}
-	l.lastContextError = &contextError{
+	l.mutableRuntime().lastContextError = &contextError{
 		Code:      code,
 		Message:   message,
 		Retryable: true,
@@ -1973,19 +2080,17 @@ func (l *Loop) appendCorrectionWithCompaction(code, message string) bool {
 	if !l.shouldCompactForStateRewrite() {
 		return l.appendContextBlock("correction:"+code, message, false)
 	}
-	before := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
-	limit := l.contextLimitTokens()
-	l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("↻ context compacting: correction state %q triggered compaction; preserving question, procedure order, clues, and next action. estimated context %d/%d tokens.", code, before, limit))
-	if err := l.resetChatSession(); err != nil {
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "context compact failed: "+err.Error())
-		return l.appendContextBlock("correction:"+code, message, false)
+	if l.activeTransaction != nil {
+		if err := l.prepareContextCompaction(
+			"correction",
+			code,
+			"Return one corrected next response. Do not repeat the invalid response.",
+		); err != nil {
+			return l.appendContextBlock("correction:"+code, message, false)
+		}
+		return true
 	}
-	l.currChatContent = []any{l.compactedStateMessage("Return one corrected next response. Do not repeat the invalid response.")}
-	l.contextBlockHashes = nil
-	l.lastCompactedActionSeq = l.actionSeq
-	after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
-	l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("✓ context compacted: correction state %q preserved. estimated context %d/%d tokens.", code, after, limit))
-	return true
+	return l.appendContextBlock("correction:"+code, message, false)
 }
 
 func (l *Loop) compactedStateMessage(nextInstruction string) string {
@@ -2015,34 +2120,34 @@ func (l *Loop) priorConversationStateMessage() string {
 }
 
 func (l *Loop) hasPriorConversationMemory() bool {
-	return l.lastOriginalQuery != "" ||
-		l.lastRequirementAnalysis != nil ||
-		l.lastRequestContext != nil ||
-		strings.TrimSpace(l.lastDiagnosisSummary) != ""
+	return l.mutableRuntime().lastOriginalQuery != "" ||
+		l.mutableRuntime().lastRequirementAnalysis != nil ||
+		l.mutableRuntime().lastRequestContext != nil ||
+		strings.TrimSpace(l.mutableRuntime().lastDiagnosisSummary) != ""
 }
 
 func (l *Loop) writePriorConversationMemory(b *strings.Builder) {
-	if l.lastOriginalQuery != "" {
+	if l.mutableRuntime().lastOriginalQuery != "" {
 		b.WriteString("previous_original_query: ")
-		b.WriteString(compactPriorString(l.lastOriginalQuery, 1000))
+		b.WriteString(compactPriorString(l.mutableRuntime().lastOriginalQuery, 1000))
 		b.WriteString("\n")
 	}
-	if l.lastRequirementAnalysis != nil {
-		if raw, err := json.Marshal(compactPriorRequirementAnalysis(l.lastRequirementAnalysis)); err == nil {
+	if l.mutableRuntime().lastRequirementAnalysis != nil {
+		if raw, err := json.Marshal(compactPriorRequirementAnalysis(l.mutableRuntime().lastRequirementAnalysis)); err == nil {
 			b.WriteString("previous_requirement_analysis: ")
 			b.Write(raw)
 			b.WriteString("\n")
 		}
 	}
-	if l.lastRequestContext != nil {
-		if raw, err := json.Marshal(compactPriorRequestContext(l.lastRequestContext)); err == nil {
+	if l.mutableRuntime().lastRequestContext != nil {
+		if raw, err := json.Marshal(compactPriorRequestContext(l.mutableRuntime().lastRequestContext)); err == nil {
 			b.WriteString("previous_request_context: ")
 			b.Write(raw)
 			b.WriteString("\n")
 		}
 	}
-	if strings.TrimSpace(l.lastDiagnosisSummary) != "" {
-		if raw, err := json.Marshal(l.lastDiagnosisSummary); err == nil {
+	if strings.TrimSpace(l.mutableRuntime().lastDiagnosisSummary) != "" {
+		if raw, err := json.Marshal(l.mutableRuntime().lastDiagnosisSummary); err == nil {
 			b.WriteString("previous_diagnosis_summary: ")
 			b.Write(raw)
 			b.WriteString("\n")
@@ -2134,27 +2239,24 @@ func compactPriorString(value string, maxBytes int) string {
 }
 
 func (l *Loop) hasConversationState() bool {
-	return l.originalQuery != "" ||
-		l.requirementAnalysis != nil ||
-		l.requestContext != nil ||
-		l.resourceClassification != nil ||
-		l.lastContextError != nil ||
-		len(l.injectedGuides) > 0 ||
-		len(l.completedActions) > 0 ||
-		strings.TrimSpace(l.lastAssistantText) != ""
+	return l.mutableRuntime().originalQuery != "" ||
+		l.mutableRuntime().requirementAnalysis != nil ||
+		l.mutableRuntime().requestContext != nil ||
+		l.mutableRuntime().resourceClassification != nil ||
+		l.mutableRuntime().lastContextError != nil ||
+		len(l.mutableRuntime().injectedGuides) > 0 ||
+		strings.TrimSpace(l.mutableRuntime().lastAssistantText) != ""
 }
 
 func (l *Loop) compactDiagnosisSummary() string {
 	var b strings.Builder
-	if len(l.completedActions) > 0 {
-		if raw, err := json.Marshal(l.compactedActionSummaries()); err == nil {
-			b.WriteString("completed_procedure_and_clues: ")
-			b.Write(raw)
-			b.WriteString("\n")
-		}
+	if anchor := l.executionAnchor(); anchor != "" {
+		b.WriteString("goal_execution_projection: ")
+		b.WriteString(anchor)
+		b.WriteString("\n")
 	}
-	if strings.TrimSpace(l.lastAssistantText) != "" {
-		if raw, err := json.Marshal(compactStateText(l.lastAssistantText)); err == nil {
+	if strings.TrimSpace(l.mutableRuntime().lastAssistantText) != "" {
+		if raw, err := json.Marshal(compactStateText(l.mutableRuntime().lastAssistantText)); err == nil {
 			b.WriteString("last_assistant_text: ")
 			b.Write(raw)
 		}
@@ -2162,75 +2264,49 @@ func (l *Loop) compactDiagnosisSummary() string {
 	return strings.TrimSpace(b.String())
 }
 
-func cloneRequirementAnalysis(value *requirementAnalysis) *requirementAnalysis {
-	if value == nil {
-		return nil
-	}
-	cloned := *value
-	cloned.Resources = append([]requirementResource(nil), value.Resources...)
-	if value.OperationalFocus != nil {
-		focus := *value.OperationalFocus
-		focus.RelatedResourceHints = append([]requirementRelatedResource(nil), value.OperationalFocus.RelatedResourceHints...)
-		focus.EvidenceNeeds = append([]string(nil), value.OperationalFocus.EvidenceNeeds...)
-		cloned.OperationalFocus = &focus
-	}
-	cloned.Evidence = append([]string(nil), value.Evidence...)
-	cloned.Constraints = append([]string(nil), value.Constraints...)
-	cloned.Ambiguities = append([]string(nil), value.Ambiguities...)
-	return &cloned
-}
-
-func cloneRequestContext(value *requestContext) *requestContext {
-	if value == nil {
-		return nil
-	}
-	cloned := *value
-	return &cloned
-}
-
 func (l *Loop) writeConversationState(b *strings.Builder, includeGuideContent bool) {
-	if l.originalQuery != "" {
+	if l.mutableRuntime().originalQuery != "" {
 		b.WriteString("original_query: ")
-		b.WriteString(l.originalQuery)
+		b.WriteString(l.mutableRuntime().originalQuery)
 		b.WriteString("\n")
 	}
-	if l.requirementAnalysis != nil {
-		if raw, err := json.Marshal(l.requirementAnalysis); err == nil {
+	if l.mutableRuntime().requirementAnalysis != nil {
+		if raw, err := json.Marshal(l.mutableRuntime().requirementAnalysis); err == nil {
 			b.WriteString("requirement_analysis: ")
 			b.Write(raw)
 			b.WriteString("\n")
 		}
 	}
-	if l.requestContext != nil {
-		if raw, err := json.Marshal(l.requestContext); err == nil {
+	if l.mutableRuntime().requestContext != nil {
+		if raw, err := json.Marshal(l.mutableRuntime().requestContext); err == nil {
 			b.WriteString("request_context: ")
 			b.Write(raw)
 			b.WriteString("\n")
 		}
 	}
-	if l.resourceClassification != nil {
-		if raw, err := json.Marshal(l.resourceClassification); err == nil {
+	if l.mutableRuntime().resourceClassification != nil {
+		if raw, err := json.Marshal(l.mutableRuntime().resourceClassification); err == nil {
 			b.WriteString("resource_classification: ")
 			b.Write(raw)
 			b.WriteString("\n")
 		}
 	}
-	if l.lastContextError != nil {
-		if raw, err := json.Marshal(l.lastContextError); err == nil {
+	if l.mutableRuntime().lastContextError != nil {
+		if raw, err := json.Marshal(l.mutableRuntime().lastContextError); err == nil {
 			b.WriteString("last_error: ")
 			b.Write(raw)
 			b.WriteString("\n")
 		}
 	}
-	if len(l.injectedGuides) > 0 {
-		keys := make([]string, 0, len(l.injectedGuides))
-		for key := range l.injectedGuides {
+	if len(l.mutableRuntime().injectedGuides) > 0 {
+		keys := make([]string, 0, len(l.mutableRuntime().injectedGuides))
+		for key := range l.mutableRuntime().injectedGuides {
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
 		refs := make([]guideRef, 0, len(keys))
 		for _, key := range keys {
-			ref := l.injectedGuides[key]
+			ref := l.mutableRuntime().injectedGuides[key]
 			if !includeGuideContent {
 				ref.Content = ""
 			}
@@ -2242,15 +2318,13 @@ func (l *Loop) writeConversationState(b *strings.Builder, includeGuideContent bo
 			b.WriteString("\n")
 		}
 	}
-	if len(l.completedActions) > 0 {
-		if raw, err := json.Marshal(l.compactedActionSummaries()); err == nil {
-			b.WriteString("completed_procedure_and_clues: ")
-			b.Write(raw)
-			b.WriteString("\n")
-		}
+	if anchor := l.executionAnchor(); anchor != "" {
+		b.WriteString("goal_execution_projection: ")
+		b.WriteString(anchor)
+		b.WriteString("\n")
 	}
-	if strings.TrimSpace(l.lastAssistantText) != "" {
-		if raw, err := json.Marshal(compactStateText(l.lastAssistantText)); err == nil {
+	if strings.TrimSpace(l.mutableRuntime().lastAssistantText) != "" {
+		if raw, err := json.Marshal(compactStateText(l.mutableRuntime().lastAssistantText)); err == nil {
 			b.WriteString("last_assistant_answer: ")
 			b.Write(raw)
 			b.WriteString("\n")
@@ -2258,106 +2332,73 @@ func (l *Loop) writeConversationState(b *strings.Builder, includeGuideContent bo
 	}
 }
 
-func (l *Loop) compactedActionSummaries() []map[string]any {
-	out := make([]map[string]any, 0, len(l.completedActions))
-	for _, action := range l.completedActions {
-		item := map[string]any{
-			"step":        action.Step,
-			"tool":        action.Tool,
-			"result_hash": action.ResultHash,
-		}
-		if action.Command != "" {
-			item["command"] = action.Command
-		}
-		if action.Target != nil {
-			item["target"] = action.Target
-		}
-		if len(action.Clues) > 0 {
-			item["clues"] = action.Clues
-		}
-		out = append(out, item)
-	}
-	return out
-}
-
 func (l *Loop) shouldCompactBeforeNextSend() bool {
-	if l.actionSeq == l.lastCompactedActionSeq {
+	if l.mutableRuntime().actionSeq == l.mutableRuntime().lastCompactedActionSeq {
 		return false
 	}
-	estimated := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
+	estimated := l.mutableRuntime().contextApproxTokens + estimateContextTokens(l.mutableRuntime().currChatContent...)
 	return estimated >= l.contextCompactThresholdTokens()
 }
 
 func (l *Loop) shouldCompactForStateRewrite() bool {
-	return l.contextApproxTokens+estimateContextTokens(l.currChatContent...) >= l.contextCompactThresholdTokens()
+	return l.mutableRuntime().contextApproxTokens+estimateContextTokens(l.mutableRuntime().currChatContent...) >= l.contextCompactThresholdTokens()
 }
 
-func (l *Loop) compactBeforeNextIteration(nextInstruction string) {
-	before := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
-	limit := l.contextLimitTokens()
-	l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("↻ context compacting: estimated context %d/%d tokens (>=80%%). Preserving question, procedure order, clues, and next action.", before, limit))
-	if err := l.resetChatSession(); err != nil {
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "context compact failed: "+err.Error())
-		return
+func (l *Loop) prepareContextCompaction(reason, code, nextInstruction string) error {
+	if l == nil || l.activeTransaction == nil {
+		return fmt.Errorf("context compaction requires an active runtime transaction")
 	}
-	if l.pendingResponseDirective != "" {
+	if l.mutableRuntime().pendingCompaction != nil {
+		return fmt.Errorf("context compaction is already pending")
+	}
+	before := l.mutableRuntime().contextApproxTokens + estimateContextTokens(l.mutableRuntime().currChatContent...)
+	limit := l.contextLimitTokens()
+	if l.mutableRuntime().pendingResponseDirective != "" {
 		nextInstruction = "Continue from compacted state and follow the pending runtime directive below."
 	}
-	l.currChatContent = []any{l.compactedStateMessage(nextInstruction)}
+	l.mutableRuntime().pendingCompaction = &compactionState{
+		Reason:          reason,
+		Code:            code,
+		Limit:           limit,
+		OriginalContent: cloneChatContent(l.mutableRuntime().currChatContent),
+		OriginalHashes:  cloneStringSet(l.mutableRuntime().contextBlockHashes),
+	}
+	l.mutableRuntime().currChatContent = []any{l.compactedStateMessage(nextInstruction)}
 	l.appendPendingResponseDirectiveAfterCompaction()
-	l.contextBlockHashes = nil
-	l.lastCompactedActionSeq = l.actionSeq
-	after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
-	l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("✓ context compacted: estimated context %d/%d tokens; %d completed diagnostic steps preserved.", after, limit, len(l.completedActions)))
-}
-
-func (l *Loop) compactAfterContextLengthError(err error) bool {
-	before := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
-	limit := l.contextLimitTokens()
-	l.lastContextError = &contextError{
-		Code:      "context_length_exceeded",
-		Message:   err.Error(),
-		Retryable: true,
-	}
-	l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("↻ context compacting after provider context-length error: estimated context %d/%d tokens. Retrying once with compacted procedure/clues.", before, limit))
-	if resetErr := l.resetChatSession(); resetErr != nil {
-		l.addMessage(api.MessageSourceAgent, api.MessageTypeError, "context compact failed: "+resetErr.Error())
-		return false
-	}
-	nextInstruction := "The previous LLM request exceeded the provider context limit. Continue from this compacted state. Next action: choose exactly one remaining diagnostic step from the clues; do not repeat completed commands unless new evidence requires it."
-	if l.pendingResponseDirective != "" {
-		nextInstruction = "The previous LLM request exceeded the provider context limit. Continue from this compacted state and follow the pending runtime directive below."
-	}
-	l.currChatContent = []any{l.compactedStateMessage(nextInstruction)}
-	l.appendPendingResponseDirectiveAfterCompaction()
-	l.contextBlockHashes = nil
-	l.lastCompactedActionSeq = l.actionSeq
-	after := l.contextApproxTokens + estimateContextTokens(l.currChatContent...)
-	l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("✓ context compacted after context-length error: estimated context %d/%d tokens; retrying now.", after, limit))
-	return true
+	l.mutableRuntime().contextBlockHashes = nil
+	l.mutableRuntime().lastCompactedActionSeq = l.mutableRuntime().actionSeq
+	l.addMessage(api.MessageSourceAgent, api.MessageTypeText, fmt.Sprintf("↻ context compacting: estimated context %d/%d tokens. Preserving request, procedure order, evidence, and pending directive.", before, limit))
+	return l.queueTurnEffect(reactcontract.Effect{
+		Kind: reactcontract.EffectResetChat,
+		Payload: chatResetEffect{
+			Reason: reason,
+			Code:   code,
+			Limit:  limit,
+		},
+	})
 }
 
 func (l *Loop) appendPendingResponseDirectiveAfterCompaction() {
-	if strings.TrimSpace(l.pendingResponseDirective) == "" {
+	if strings.TrimSpace(l.mutableRuntime().pendingResponseDirective) == "" {
 		return
 	}
-	l.currChatContent = append(l.currChatContent, "Pending runtime directive for the next model response:\n"+l.pendingResponseDirective)
+	l.mutableRuntime().currChatContent = append(l.mutableRuntime().currChatContent, "Pending runtime directive for the next model response:\n"+l.mutableRuntime().pendingResponseDirective)
 }
 
 func (l *Loop) appendGuideObservation(ref guideRef, content string) {
-	if l.injectedGuides == nil {
-		l.injectedGuides = make(map[string]guideRef)
+	if l.mutableRuntime().injectedGuides == nil {
+		l.mutableRuntime().injectedGuides = make(map[string]guideRef)
 	}
 	key := ref.GuideID
 	if key == "" {
 		key = ref.Hash
 	}
-	if previous, ok := l.injectedGuides[key]; ok && previous.Hash == ref.Hash {
+	if previous, ok := l.mutableRuntime().injectedGuides[key]; ok && previous.Hash == ref.Hash {
 		l.appendContextBlock("guide-ref", fmt.Sprintf("Guide context already injected; use guide_ref %s (%s) without repeating the guide body.", key, ref.Hash), false)
 		return
 	}
 	ref.Content = content
-	l.injectedGuides[key] = ref
+	l.mutableRuntime().injectedGuides[key] = ref
 	l.appendContextBlock("guide", content, false)
 }
 
@@ -2530,7 +2571,7 @@ func isClueLine(line string) bool {
 }
 
 func (l *Loop) noteContextContent(contents ...any) {
-	l.contextApproxTokens += estimateContextTokens(contents...)
+	l.mutableRuntime().contextApproxTokens += estimateContextTokens(contents...)
 }
 
 func (l *Loop) contextCompactThresholdTokens() int {
@@ -2606,11 +2647,20 @@ func isContextLengthError(err error) bool {
 }
 
 type PendingCall struct {
-	FunctionCall     gollm.FunctionCall
-	ParsedToolCall   *tools.ToolCall
-	IsInteractive    bool
-	InteractiveError error
-	ModifiesResource string
+	FunctionCall      gollm.FunctionCall
+	StepRef           *StepRef
+	ParsedToolCall    *tools.ToolCall
+	IsInteractive     bool
+	InteractiveError  error
+	ModifiesResource  string
+	RetryOf           string
+	RetryReason       string
+	ChangedSince      []string
+	Verification      *reactcontract.VerificationSpec
+	verificationInput any
+	Risk              *reactcontract.CommandRisk
+	DispatchID        string
+	AttemptID         string
 }
 
 type guideStepState struct {
@@ -2687,11 +2737,7 @@ func (g *guideStepState) stepRuntimeStates(phase PhaseRef) []StepRuntimeState {
 			status = StepActive
 		}
 		steps = append(steps, StepRuntimeState{
-			Ref: StepRef{
-				Phase: phase,
-				Kind:  StepResourceGuideDiagnostic,
-				Index: detail.Index,
-			},
+			Ref:             guideRuntimeStepRef(phase, detail.Index),
 			Status:          status,
 			Description:     strings.TrimSpace(detail.Description),
 			Command:         strings.TrimSpace(detail.RenderedCommand),
@@ -2699,6 +2745,20 @@ func (g *guideStepState) stepRuntimeStates(phase PhaseRef) []StepRuntimeState {
 		})
 	}
 	return steps
+}
+
+func guideRuntimeStepRef(phase PhaseRef, stepIndex int) StepRef {
+	stepID := fmt.Sprintf("guide-step-%d", stepIndex)
+	if phase.ID != "" {
+		stepID = fmt.Sprintf("%s.guide-step-%d", phase.ID, stepIndex)
+	}
+	return StepRef{
+		Phase:         phase,
+		Kind:          StepResourceGuideDiagnostic,
+		ID:            stepID,
+		GoalLineageID: stepID + ".lineage",
+		Index:         stepIndex,
+	}
 }
 
 // directionPromptState maps rendered next-direction choices to their runtime
@@ -2724,44 +2784,38 @@ func (l *Loop) SkipStep(ref StepRef) bool {
 }
 
 func (l *Loop) skipGuideRuntimeStep(ref StepRef) bool {
-	if l == nil || l.guideStepState == nil || ref.Index <= 0 || ref.Index > l.guideStepState.TotalSteps {
+	if l == nil || l.mutableRuntime().guideStepState == nil || ref.Index <= 0 || ref.Index > l.mutableRuntime().guideStepState.TotalSteps {
 		return false
 	}
-	if l.guideStepState.Skipped == nil {
-		l.guideStepState.Skipped = map[int]bool{}
+	if l.mutableRuntime().guideStepState.Skipped == nil {
+		l.mutableRuntime().guideStepState.Skipped = map[int]bool{}
 	}
-	if l.guideStepState.Completed[ref.Index] || l.guideStepState.Skipped[ref.Index] {
+	if l.mutableRuntime().guideStepState.Completed[ref.Index] || l.mutableRuntime().guideStepState.Skipped[ref.Index] {
 		return false
 	}
-	l.guideStepState.Skipped[ref.Index] = true
+	l.mutableRuntime().guideStepState.Skipped[ref.Index] = true
 	return true
 }
 
 func (l *Loop) skipMutationEvidenceRuntimeStep(ref StepRef) bool {
-	if l == nil || l.pendingMutationVerification == nil || ref.ID == "" {
+	if l == nil || l.mutableRuntime().pendingMutationVerification == nil || ref.ID == "" {
 		return false
 	}
-	if !l.pendingMutationVerification.hasRequirement(ref.ID) {
+	verification := l.mutableRuntime().pendingMutationVerification
+	check := verification.activeCheck()
+	if check == nil || check.ID != ref.ID {
 		return false
 	}
-	if l.pendingMutationVerification.Skipped == nil {
-		l.pendingMutationVerification.Skipped = map[string]bool{}
-	}
-	if l.pendingMutationVerification.Satisfied[ref.ID] || l.pendingMutationVerification.Skipped[ref.ID] {
+	if len(check.EvidenceRefs) == 0 {
 		return false
 	}
-	l.pendingMutationVerification.Skipped[ref.ID] = true
-	if l.pendingMutationVerification.allSatisfied() {
-		l.pendingMutationVerification.AwaitingResult = true
+	if check.Status == reactcontract.VerificationCheckSatisfied ||
+		check.Status == reactcontract.VerificationCheckSkipped {
+		return false
+	}
+	check.Status = reactcontract.VerificationCheckSkipped
+	if !verification.advanceCheck() {
+		verification.AwaitingResult = true
 	}
 	return true
-}
-
-func (v pendingMutationVerification) hasRequirement(id string) bool {
-	for _, req := range v.Requirements {
-		if req.ID == id {
-			return true
-		}
-	}
-	return false
 }
