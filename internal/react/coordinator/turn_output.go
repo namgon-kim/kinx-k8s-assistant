@@ -64,8 +64,13 @@ func (l *Loop) rejectTurnOutputPolicy(code, correction string) bool {
 }
 
 func (l *Loop) lightweightBundleEligible(calls []gollm.FunctionCall) bool {
+	_, eligible := l.eligibleLightweightBundlePlan(calls)
+	return eligible
+}
+
+func (l *Loop) eligibleLightweightBundlePlan(calls []gollm.FunctionCall) (phasePlan, bool) {
 	if l.controlState() != RuntimeControlAwaitingPhasePlan || len(calls) != 2 {
-		return false
+		return phasePlan{}, false
 	}
 	var plan *phasePlan
 	var action *gollm.FunctionCall
@@ -74,33 +79,33 @@ func (l *Loop) lightweightBundleEligible(calls []gollm.FunctionCall) bool {
 		if call.Name == protocol.PhasePlanCall {
 			parsed, ok := phasePlanFromFunctionCall(call)
 			if !ok || !singleLightweightPhase(parsed) {
-				return false
+				return phasePlan{}, false
 			}
 			plan = &parsed
 			continue
 		}
 		if protocol.IsRuntimeInternalCall(call.Name) || action != nil {
-			return false
+			return phasePlan{}, false
 		}
 		action = &calls[i]
 	}
 	if plan == nil || action == nil || !isNonMutatingKubectlInvocation(*action) {
-		return false
+		return phasePlan{}, false
 	}
 	if result := l.validatePhasePlanForRequest(*plan); !result.Valid {
-		return false
+		return phasePlan{}, false
 	}
 	analysis := l.mutableRuntime().requirementAnalysis
 	if analysis == nil {
-		return false
+		return phasePlan{}, false
 	}
 	risk := strings.ToLower(strings.Join([]string{analysis.RequestType, analysis.Action}, " "))
 	for _, marker := range []string{"mutation", "mutate", "remediation", "repair", "apply", "delete", "patch"} {
 		if strings.Contains(risk, marker) {
-			return false
+			return phasePlan{}, false
 		}
 	}
-	return true
+	return *plan, true
 }
 
 func (l *Loop) bindActionProposals(envelope *contract.ModelOutputEnvelope, calls []gollm.FunctionCall) bool {
@@ -131,16 +136,17 @@ func (l *Loop) bindActionProposals(envelope *contract.ModelOutputEnvelope, calls
 }
 
 func (l *Loop) deriveActionStepRef(calls []gollm.FunctionCall) (StepRef, bool) {
-	if l.lightweightBundleEligible(calls) {
+	if plan, eligible := l.eligibleLightweightBundlePlan(calls); eligible {
 		execution := l.mutableRuntime().execution
 		requestID := "request-provisional"
 		if execution != nil && execution.RequestID != "" {
 			requestID = execution.RequestID
 		}
-		phaseID := requestID + ".phase-1"
+		phaseIndex := plan.PhaseSteps[0].Index
+		phaseID := fmt.Sprintf("%s.phase-%d", requestID, phaseIndex)
 		stepID := phaseID + ".step-1"
 		return StepRef{
-			Phase:         PhaseRef{ID: phaseID, LineageID: phaseID + ".lineage", Index: 1, Name: lightweightLookupPhase},
+			Phase:         PhaseRef{ID: phaseID, LineageID: phaseID + ".lineage", Index: phaseIndex, Name: lightweightLookupPhase},
 			Kind:          StepLightweightLookup,
 			ID:            stepID,
 			GoalLineageID: stepID + ".lineage",

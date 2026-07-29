@@ -22,9 +22,12 @@ func TestAggregateCommitIsAtomicAndRevisioned(t *testing.T) {
 	candidate.Control = "after"
 	candidate.Values[0] = "b"
 
-	revision, err := aggregate.Commit(expected, candidate, func(candidate aggregateFixture) error {
+	revision, err := aggregate.Commit(expected, candidate, func(candidate aggregateFixture, candidateRevision uint64) error {
 		if candidate.Control != "after" {
 			return errors.New("candidate was not provided to audit")
+		}
+		if candidateRevision != 1 {
+			t.Fatalf("candidate revision = %d, want 1", candidateRevision)
 		}
 		return nil
 	})
@@ -43,7 +46,7 @@ func TestAggregateRejectsAuditAndStaleRevisionWithoutChangingRoot(t *testing.T) 
 	aggregate := NewAggregate(aggregateFixture{Control: "before"})
 	expected, rejected := aggregate.Candidate(cloneAggregateFixture)
 	rejected.Control = "invalid"
-	if _, err := aggregate.Commit(expected, rejected, func(aggregateFixture) error { return errors.New("invalid") }); err == nil {
+	if _, err := aggregate.Commit(expected, rejected, func(aggregateFixture, uint64) error { return errors.New("invalid") }); err == nil {
 		t.Fatal("audit failure was accepted")
 	}
 	if aggregate.Revision() != 0 || aggregate.Root().Control != "before" {

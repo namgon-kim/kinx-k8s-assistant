@@ -182,11 +182,8 @@ func (l *Loop) commitRuntimeTransaction(tx *runtimeTransaction) error {
 	return nil
 }
 
-func (l *Loop) auditRuntimeCandidate(candidate runtimeState) error {
-	current := l.runtimeState
-	l.runtimeState = &candidate
-	message := l.RuntimeSnapshot().AuditError()
-	l.runtimeState = current
+func (l *Loop) auditRuntimeCandidate(candidate runtimeState, candidateRevision uint64) error {
+	message := projectRuntimeSnapshot(&candidate, candidateRevision).AuditError()
 	if message != "" {
 		return fmt.Errorf("runtime lifecycle invariant violation: %s", message)
 	}

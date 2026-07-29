@@ -7,6 +7,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/protocol"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/session"
 )
 
 func TestRuntimeTransactionRejectsInvalidCandidateWithoutPartialState(t *testing.T) {
@@ -277,6 +278,70 @@ func TestTurnOutputPolicyRejectsStateEventActionMixBeforePhaseMutation(t *testin
 	}
 	if loop.mutableRuntime().phaseStepState.Completed[1] {
 		t.Fatal("phase mutated before output policy rejection")
+	}
+}
+
+func TestLightweightBundleBindsToDeclaredPhaseIndex(t *testing.T) {
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingPhasePlan,
+			execution: &session.GoalExecutionState{
+				RequestID: "request-000001",
+			},
+			requirementAnalysis: &requirementAnalysis{
+				RequestType: "lookup",
+				Action:      "list",
+				Target: requirementAnalysisTarget{
+					Category:    "kubernetes_resource",
+					Description: "pods",
+				},
+				Resources: []requirementResource{{Kind: "pods"}},
+			},
+		},
+	}
+	phaseID := "request-000001.phase-2"
+	stepID := phaseID + ".step-1"
+	calls := []gollm.FunctionCall{
+		{
+			Name: protocol.PhasePlanCall,
+			Arguments: map[string]any{
+				"request_goal":        "list pods",
+				"current_phase_index": 2,
+				"phase_steps": []any{map[string]any{
+					"index":                2,
+					"name":                 lightweightLookupPhase,
+					"goal":                 "list pods",
+					"completion_condition": "successful observation received",
+				}},
+			},
+		},
+		{
+			Name: "kubectl",
+			Arguments: map[string]any{
+				"command":           "kubectl get pods -n default",
+				"modifies_resource": "no",
+				"step_ref": map[string]any{
+					"kind":            string(contract.StepLightweightLookup),
+					"id":              stepID,
+					"goal_lineage_id": stepID + ".lineage",
+					"index":           1,
+					"phase": map[string]any{
+						"id":         phaseID,
+						"lineage_id": phaseID + ".lineage",
+						"index":      2,
+						"name":       lightweightLookupPhase,
+					},
+				},
+			},
+		},
+	}
+	envelope := normalizeModelOutputEnvelope("", calls)
+	if handled := loop.validateModelOutputEnvelope(&envelope, calls); handled {
+		t.Fatal("valid lightweight bundle using phase index 2 was rejected")
+	}
+	ref := envelope.ExternalActions[0].BoundStepRef
+	if ref == nil || ref.Phase.Index != 2 || ref.Phase.ID != phaseID || ref.ID != stepID {
+		t.Fatalf("bound step = %#v, want phase-2 provisional contract", ref)
 	}
 }
 

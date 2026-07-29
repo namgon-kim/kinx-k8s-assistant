@@ -47,12 +47,13 @@ func (a *Aggregate[T]) Candidate(clone func(T) T) (uint64, *T) {
 	return a.revision, &candidate
 }
 
-func (a *Aggregate[T]) Commit(expected uint64, candidate *T, audit func(T) error) (uint64, error) {
+func (a *Aggregate[T]) Commit(expected uint64, candidate *T, audit func(T, uint64) error) (uint64, error) {
 	if a == nil || candidate == nil {
 		return 0, fmt.Errorf("session candidate is nil")
 	}
+	candidateRevision := expected + 1
 	if audit != nil {
-		if err := audit(*candidate); err != nil {
+		if err := audit(*candidate, candidateRevision); err != nil {
 			return a.Revision(), err
 		}
 	}
@@ -62,6 +63,6 @@ func (a *Aggregate[T]) Commit(expected uint64, candidate *T, audit func(T) error
 		return a.revision, fmt.Errorf("stale session revision: expected %d, current %d", expected, a.revision)
 	}
 	a.root = candidate
-	a.revision++
+	a.revision = candidateRevision
 	return a.revision, nil
 }

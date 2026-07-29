@@ -1091,7 +1091,9 @@ func singleLightweightPhase(plan phasePlan) bool {
 		return false
 	}
 	step := plan.PhaseSteps[0]
-	return strings.EqualFold(strings.TrimSpace(step.Name), lightweightLookupPhase)
+	return step.Index == plan.CurrentPhaseIndex &&
+		len(step.Steps) == 0 &&
+		strings.EqualFold(strings.TrimSpace(step.Name), lightweightLookupPhase)
 }
 
 func (l *Loop) phasePlanRequiresMutationVerification(plan phasePlan) bool {
@@ -3036,8 +3038,10 @@ func (l *Loop) consumeMutationVerificationResult(calls []gollm.FunctionCall) ([]
 				l.achieveActiveExecutionStep("mutation verification satisfied", l.activePhaseAttemptObservationRefs())
 				if l.mutableRuntime().guideStepState != nil && l.mutableRuntime().guideStepState.allCompleted() {
 					l.requestPostGuideCompletionDirective()
+				} else if l.activateNextExecutionStep() {
+					l.queueResponseDirective("The mutation's direct verification is satisfied. Continue with the newly active declared plan step. Verify the original user-visible outcome in its own step when it differs from the mutated target.")
 				} else {
-					l.queueResponseDirective("The mutation's direct verification is satisfied. Continue with the next declared plan step. Verify the original user-visible outcome in its own step when it differs from the mutated target.")
+					l.queueResponseDirective("The mutation's direct verification is satisfied and no execution step remains in the active phase. Return phase_progress before choosing another action.")
 				}
 			}
 		case contract.VerificationWaiting:

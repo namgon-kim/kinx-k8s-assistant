@@ -104,6 +104,9 @@ func (r PhaseRef) String() string {
 		return r.ID
 	}
 	if strings.TrimSpace(r.Name) == "" {
+		if r.LineageID != "" {
+			return "lineage=" + r.LineageID
+		}
 		return fmt.Sprintf("#%d", r.Index)
 	}
 	if r.Index == 0 {
@@ -123,7 +126,7 @@ func (r StepRef) String() string {
 	if r.Index != 0 {
 		parts = append(parts, fmt.Sprintf("index=%d", r.Index))
 	}
-	if r.Phase.Index != 0 || strings.TrimSpace(r.Phase.Name) != "" {
+	if r.Phase.ID != "" || r.Phase.LineageID != "" || r.Phase.Index != 0 || strings.TrimSpace(r.Phase.Name) != "" {
 		parts = append(parts, "phase="+r.Phase.String())
 	}
 	return strings.Join(parts, " ")

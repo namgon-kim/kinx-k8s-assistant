@@ -267,11 +267,13 @@ func (l *Loop) rewindExecutionToPhase(index int) {
 			if execution.StepStatus[step.ID] == contract.StepSuperseded {
 				continue
 			}
+			l.resetCorrectionScope(string(RetryScopeCurrentStep), "", step.ID)
 			execution.StepStatus[step.ID] = contract.StepPending
 			for _, criterion := range step.CompletionCriteria {
 				delete(execution.CriterionResults, criterion.ID)
 			}
 		}
+		l.resetCorrectionScope(string(RetryScopeCurrentPhase), phase.ID, "")
 	}
 	l.activateExecutionPhase(index)
 }
@@ -653,6 +655,7 @@ func (l *Loop) recordFinalReportExecution(report finalReport) {
 		} else {
 			execution.StepStatus[step.ID] = contract.StepBlocked
 			execution.ActiveStepID = ""
+			l.resetCorrectionScope(string(RetryScopeCurrentStep), "", step.ID)
 		}
 	}
 	if report.Conclusive && phase != nil {

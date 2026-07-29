@@ -107,6 +107,11 @@ func classifyStructuredName(name string, externalActionFallback bool) OutputClas
 	case "":
 		classification.Support = OutputUnknown
 	default:
+		if kind, declared := declaredStructuredOutputKind(bare); declared {
+			classification.Kind = kind
+			classification.Support = OutputUnsupported
+			break
+		}
 		if !externalActionFallback || strings.HasPrefix(normalized, "__") && strings.HasSuffix(normalized, "__") {
 			classification.Support = OutputUnknown
 			break
@@ -115,6 +120,19 @@ func classifyStructuredName(name string, externalActionFallback bool) OutputClas
 		classification.Support = OutputSupported
 	}
 	return classification
+}
+
+func declaredStructuredOutputKind(name string) (contract.ModelOutputKind, bool) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, kind := range contract.AllModelOutputKinds() {
+		if kind == contract.OutputAction || kind == contract.OutputPlainAnswer {
+			continue
+		}
+		if name == strings.ToLower(kind.String()) {
+			return kind, true
+		}
+	}
+	return "", false
 }
 
 func ClassifyPlainAnswer(text string) OutputClassification {

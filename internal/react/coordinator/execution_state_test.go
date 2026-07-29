@@ -8,6 +8,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/protocol"
 )
 
 func TestAcceptedPlanCreatesStableExecutionContracts(t *testing.T) {
@@ -447,6 +448,77 @@ func TestUncertainMutationCreatesVerificationObligation(t *testing.T) {
 	}
 }
 
+func TestSatisfiedMutationVerificationActivatesNextExecutionStep(t *testing.T) {
+	loop, _ := executionTestLoop(t, contract.StepGeneralAction)
+	execution := loop.mutableRuntime().execution
+	phase := &execution.Phases[0]
+	mutationStep := phase.Steps[0]
+	nextStep := contract.StepContract{
+		ID:            phase.ID + ".step-2",
+		GoalLineageID: phase.ID + ".step-2.lineage",
+		Kind:          contract.StepExplicitPhase,
+		Index:         2,
+		Goal:          "verify the original workload outcome",
+		MaxAttempts:   4,
+	}
+	phase.Steps = append(phase.Steps, nextStep)
+	execution.StepStatus[nextStep.ID] = contract.StepPending
+
+	const attemptID = "mutation-attempt"
+	const observationID = "mutation-observation"
+	if err := execution.AppendObservation(contract.ObservationRecord{
+		ID:            observationID,
+		AttemptID:     attemptID,
+		Kind:          contract.EvidenceObservation,
+		Qualification: contract.EvidenceStateBearing,
+	}); err != nil {
+		t.Fatalf("append verification observation: %v", err)
+	}
+	if err := execution.AppendAttempt(contract.AttemptRecord{
+		ID:              attemptID,
+		SessionID:       execution.SessionID,
+		RequestID:       execution.RequestID,
+		PhaseID:         phase.ID,
+		StepID:          mutationStep.ID,
+		GoalLineageID:   mutationStep.GoalLineageID,
+		ObservationRefs: []string{observationID},
+		Status:          contract.AttemptVerifying,
+	}); err != nil {
+		t.Fatalf("append mutation attempt: %v", err)
+	}
+	loop.mutableRuntime().pendingMutationVerification = &pendingMutationVerification{
+		AttemptID:      attemptID,
+		AwaitingResult: true,
+		Checks: []verificationRuntimeCheck{{
+			ID:           "direct",
+			Status:       contract.VerificationCheckActive,
+			EvidenceRefs: []string{observationID},
+		}},
+	}
+	loop.transitionMutationVerification()
+
+	_, handled := loop.consumeMutationVerificationResult([]gollm.FunctionCall{{
+		Name: protocol.MutationVerificationResultCall,
+		Arguments: map[string]any{
+			"verification_id":  "direct",
+			"status":           "satisfied",
+			"evidence_refs":    []any{observationID},
+			"evidence_summary": []any{"the mutation target reached its declared state"},
+			"reason":           "state-bearing evidence satisfies the direct verification",
+		},
+	}})
+	if !handled {
+		t.Fatal("expected mutation verification result to be consumed")
+	}
+	execution = loop.mutableRuntime().execution
+	if execution.StepStatus[mutationStep.ID] != contract.StepAchieved {
+		t.Fatalf("mutation step status = %q, want achieved", execution.StepStatus[mutationStep.ID])
+	}
+	if execution.ActiveStepID != nextStep.ID || execution.StepStatus[nextStep.ID] != contract.StepActive {
+		t.Fatalf("next step = %q/%q, want %q/%q", execution.ActiveStepID, execution.StepStatus[nextStep.ID], nextStep.ID, contract.StepActive)
+	}
+}
+
 func TestRewindPreservesSupersededExecutionHistory(t *testing.T) {
 	loop, _ := executionTestLoop(t, contract.StepGeneralAction)
 	execution := loop.mutableRuntime().execution
@@ -506,11 +578,41 @@ func TestExplicitRewindMayResetBlockedStep(t *testing.T) {
 	phase := execution.Phases[0]
 	blocked := phase.Steps[0]
 	execution.StepStatus[blocked.ID] = contract.StepBlocked
+	execution.Corrections[contract.CorrectionKey{
+		Code:       "invalid_step_result",
+		RetryScope: string(RetryScopeCurrentStep),
+		PhaseID:    phase.ID,
+		StepID:     blocked.ID,
+	}] = contract.CorrectionState{Count: 1}
 
 	loop.rewindExecutionToPhase(phase.Index)
 
 	if execution.ActiveStepID != blocked.ID || execution.StepStatus[blocked.ID] != contract.StepActive {
 		t.Fatalf("rewound blocked step = %q/%q, want %q/%q", execution.ActiveStepID, execution.StepStatus[blocked.ID], blocked.ID, contract.StepActive)
+	}
+	if len(execution.Corrections) != 0 {
+		t.Fatalf("rewound step retained corrections: %#v", execution.Corrections)
+	}
+}
+
+func TestInconclusiveFinalReportClearsBlockedStepCorrections(t *testing.T) {
+	loop, _ := executionTestLoop(t, contract.StepGeneralAction)
+	execution := loop.mutableRuntime().execution
+	step := loop.activeExecutionStep()
+	execution.Corrections[contract.CorrectionKey{
+		Code:       "invalid_final_report",
+		RetryScope: string(RetryScopeCurrentStep),
+		PhaseID:    execution.ActivePhaseID,
+		StepID:     step.ID,
+	}] = contract.CorrectionState{Count: 1}
+
+	loop.recordFinalReportExecution(finalReport{Conclusive: false})
+
+	if execution.StepStatus[step.ID] != contract.StepBlocked {
+		t.Fatalf("step status = %q, want blocked", execution.StepStatus[step.ID])
+	}
+	if len(execution.Corrections) != 0 {
+		t.Fatalf("blocked final-report step retained corrections: %#v", execution.Corrections)
 	}
 }
 

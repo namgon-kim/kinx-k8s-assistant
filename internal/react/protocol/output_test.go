@@ -91,3 +91,19 @@ func TestStructuredCallNamesMatchSupportedOutputKinds(t *testing.T) {
 		t.Errorf("structured call maps to unregistered supported kind %q", kind)
 	}
 }
+
+func TestDeclaredStructuredOutputKindsNeverFallBackToUnknown(t *testing.T) {
+	for _, kind := range contract.AllModelOutputKinds() {
+		if kind == contract.OutputAction || kind == contract.OutputPlainAnswer {
+			continue
+		}
+		native := ClassifyNativeCallName("__" + kind.String() + "__")
+		shim := ClassifyShimKey(kind.String())
+		if native.Kind != kind || native.Support == OutputUnknown {
+			t.Errorf("native declared kind %q classified as %#v", kind, native)
+		}
+		if shim.Kind != kind || shim.Support == OutputUnknown {
+			t.Errorf("shim declared kind %q classified as %#v", kind, shim)
+		}
+	}
+}
