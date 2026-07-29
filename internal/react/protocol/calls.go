@@ -11,18 +11,17 @@ const (
 	RequestContextCall             = "__request_context__"
 	RequirementAnalysisCall        = "__requirement_analysis__"
 	PhasePlanCall                  = "__phase_plan__"
+	PhasePlanRevisionCall          = "__phase_plan_revision__"
+	StepResultCall                 = "__step_result__"
 	PhaseProgressCall              = "__phase_progress__"
 	GuideProgressCall              = "__guide_progress__"
 	FinalReportCall                = "__final_report__"
 	NextDirectionsCall             = "__next_directions__"
 	MutationVerificationResultCall = "__mutation_verification_result__"
+	ContinuationHandoffCall        = "__continuation_handoff__"
 	InvalidActionCall              = "__invalid_action__"
 	InvalidStructuredOutputCall    = "__invalid_structured_output__"
 )
-
-func OnlyFunctionCall(calls []gollm.FunctionCall, name string) bool {
-	return len(calls) == 1 && calls[0].Name == name
-}
 
 func IsRuntimeInternalCall(name string) bool {
 	return InternalStructuredCallName(name) != ""
@@ -50,6 +49,10 @@ func InternalStructuredCallName(name string) string {
 		return RequestContextCall
 	case BareInternalCallName(PhasePlanCall), PhasePlanCall:
 		return PhasePlanCall
+	case BareInternalCallName(PhasePlanRevisionCall), PhasePlanRevisionCall:
+		return PhasePlanRevisionCall
+	case BareInternalCallName(StepResultCall), StepResultCall:
+		return StepResultCall
 	case BareInternalCallName(PhaseProgressCall), PhaseProgressCall:
 		return PhaseProgressCall
 	case BareInternalCallName(GuideProgressCall), GuideProgressCall:
@@ -62,6 +65,8 @@ func InternalStructuredCallName(name string) string {
 		return NextDirectionsCall
 	case BareInternalCallName(MutationVerificationResultCall), MutationVerificationResultCall:
 		return MutationVerificationResultCall
+	case BareInternalCallName(ContinuationHandoffCall), ContinuationHandoffCall:
+		return ContinuationHandoffCall
 	default:
 		return ""
 	}

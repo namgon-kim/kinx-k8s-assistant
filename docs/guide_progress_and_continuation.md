@@ -118,7 +118,7 @@ In native function-calling mode, guide progress is a separate runtime-internal f
 | `step_completed` | 1-based index of the guide step advanced by live evidence. Omit when no guide is active. |
 | `evidence_useful` | True when the previous observation moved diagnosis forward. Omit when no guide is active. |
 
-When this field is present and the referenced evidence is useful, `consumeGuideProgress` calls `markGuideStepCompleted(step)`. If the model omits explicit guide progress, `recordAction` may infer completion only for the current next guide step when the executed command exactly matches the rendered guide command after whitespace normalization. Observations with explicit errors or statuses such as `blocked`, `declined`, `failed`, or `error` do not complete guide steps.
+When this field is present and the referenced evidence is useful, `consumeGuideProgress` calls `markGuideStepCompleted(step)`. If the model omits explicit guide progress, `recordAction` may infer completion only for the current next guide step when the executed command, after extracting an allowed shell wrapper such as `bash -c`, exactly matches the rendered guide command after whitespace normalization. The raw wrapped command remains in action history; wrapper extraction is used only for command comparison and policy parsing. Observations with explicit errors or statuses such as `blocked`, `declined`, `failed`, or `error` do not complete guide steps.
 
 When `guideStepState.allCompleted()` becomes true, the model should emit `phase_progress` for the parent `guided_diagnosis` phase and then proceed to `final_report`. Runtime may request a final report as a safety fallback, but the conceptual transition is phase-level, not guide-step-level.
 
@@ -194,6 +194,20 @@ Emitted only after an inconclusive `final_report`. The model proposes 1–3 dist
 
 Invalid options (missing required fields, unknown `kind`) are filtered before the user is prompted. If no valid option remains, the runtime emits one correction and asks the model to re-emit. If the correction also fails, the runtime does not show an internal schema error to the user; it falls back to a user choice prompt containing "직접 다른 방향 입력" and "여기서 진단 종료", plus one generic `different_approach` option when `blockers` or `evidence_missing` from the inconclusive `final_report` can be turned into a safe continuation directive.
 
+### `continuation_handoff`
+
+This is distinct from `next_directions`. It closes one bounded model-execution segment when the
+request is still active near `MaxIterations`; it does not declare the diagnosis complete or create
+a new request. Runtime requires this object exclusively, validates its request/goal/step/evidence
+and mandatory-obligation IDs, requires every nonterminal runtime step in `unresolved_steps`, and
+requires `conclusive=false`.
+After acceptance, runtime shows the evidence-based current judgement and recommended next step through
+the normal translation boundary before presenting continue/finalize choices.
+
+If the user continues, runtime increments the continuation segment and resets only the segment
+iteration counter. Request and goal IDs, phase/step lineage, attempts, observations, plan revision,
+correction, verification, and mutation-continuation counters remain authoritative.
+
 ## Control flow
 
 The model-declared `phase_step` workflow and runtime control are separate axes. A phase says
@@ -208,11 +222,14 @@ RuntimeControlAwaitingUserQuery
        -> RuntimeControlAwaitingResourceGuideLookup
        -> RuntimeControlAwaitingGuidedDiagnosisStep
        -> RuntimeControlAwaitingGuidedPhaseProgress
-       -> RuntimeControlAwaitingApproval -> RuntimeControlExecutingTool
+       -> RuntimeControlAwaitingApproval -> RuntimeControlAwaitingToolResult
        -> RuntimeControlAwaitingMutationVerificationEvidence
        -> RuntimeControlAwaitingMutationVerificationResult
+       -> RuntimeControlAwaitingMutationVerificationChainEvidence
+       -> RuntimeControlAwaitingMutationVerificationChainResult
        -> RuntimeControlAwaitingFinalReport
        -> RuntimeControlAwaitingNextDirections
+       -> RuntimeControlAwaitingContinuationHandoff
        -> RuntimeControlAwaitingContinuationChoice
             -> RuntimeControlAwaitingContinuationText
             -> RuntimeControlAwaitingModelStep
@@ -232,40 +249,48 @@ used as a substitute for the runtime obligation.
 | File | Role |
 |---|---|
 | `internal/react/contract/structured.go`, `enums.go` | Phase/guide/report/direction/verification payloads and control/phase/step enums. |
-| `internal/react/session/phase.go`, `verification.go`, `context.go` | Mutable phase, verification, and compact context state. |
+| `internal/react/session/aggregate.go`, `execution.go`, `ledger.go`, `control.go` | Revisioned root storage, indexed goal execution ledger, and lifecycle projection. |
+| `internal/react/coordinator/state.go` | Single runtime root containing control, phase, guide, verification, continuation, and compact context state. |
+| `internal/react/flow/gate` | Turn-entry output policy and session-scoped correction decisions. |
 | `internal/react/flow/guidance` | Guide lookup eligibility and nested guide-step completion rules. |
-| `internal/react/flow/verification` | Mutation evidence requirements, command matching, and continuation decision. |
+| `internal/react/flow/verification` | Mutation verification target/command matching rules. |
 | `internal/react/flow/report`, `internal/react/flow/direction` | Final-report normalization and continuation options. |
 | `internal/react/protocol/calls.go`, `shim.go`, `schema.go` | Internal call names, native/shim normalization, and shim JSON repair. |
-| `internal/react/coordinator/iteration.go` | Anchor wiring, structured-call consumption, guide/report/direction lifecycle integration, and compatibility adapters. |
+| `internal/react/coordinator/iteration.go`, `turn_output.go`, `execution_state.go`, `revision.go` | Envelope policy, anchor wiring, structured-call consumption, goal/step execution, plan revision, and guide/report/direction lifecycle integration. |
+| `internal/react/coordinator/dispatch.go`, `termination.go`, `continuation.go` | Pre-dispatch commit, uncertain-result recovery, verification termination, and bounded segment handoff. |
 | `internal/react/coordinator/input.go`, `output.go`, `execution.go` | Continuation input, user-facing output, approval/tool execution. |
 | `prompts/default.tmpl`, `prompts/system_ko.tmpl` | Output schemas and model rules for phase planning, phase progress, nested guide progress, and final reporting. |
 
 ## Design constraints honored
 
 - **Directive gates for critical transitions.** When runtime has requested guide completion, final report, or mutation verification result, conflicting structured outputs are rejected instead of being silently executed or dropped. Anchors still provide context, but lifecycle safety no longer depends only on the model following a soft instruction.
-- **Conversation and observation gates.** Conversation/clarification requests cannot escape into `kubectl`/shell tool calls, and shell commands that only print or wait locally are rejected before dispatch because they do not produce cluster evidence.
+- **Turn-entry output policy.** Native function calls and shim JSON are normalized to the same typed output envelope. The control-state policy rejects missing, mixed, or mutually exclusive outputs before a domain consumer can change state.
+- **Atomic model transitions.** A model response is applied to a detached candidate rooted at the turn-entry revision. The candidate is committed once only after invariant audit; user messages, tools, guide lookup, and other external effects run after that commit.
+- **Conversation and observation gates.** Conversation/clarification requests cannot escape into `kubectl`/shell tool calls. Every command still passes normal read-only/mutation classification; user-visible progress belongs in `thought`, not a synthetic shell action.
 - **Single-case tracking.** Only the top guide case's `DiagnosticSteps` populates active nested guide progress. Multi-case progress is not tracked because the runtime only injects one case at a time.
-- **No MaxIteration coupling.** `MaxIterations` still ends the loop with the existing "Maximum number of iterations reached" message. Guide-exhaustion via `final_report` is independent and can fire well before `MaxIterations`.
+- **Bounded segment closure.** `MaxIterations` bounds one execution segment. The closure reserve first honors pending mutation verification, then requires one validated `continuation_handoff`. Explicit continuation keeps the same request, lineage, ledger, and safety counters.
 - **Phase owns guide.** Nested guide progress is subordinate to the active `guided_diagnosis` `phase_step`; guide completion should lead to parent `phase_progress`, not directly replace the phase workflow.
-- **Mutation needs verification.** A successful mutating command creates goal-level read-only evidence requirements unless the only available evidence is a successful target-unmapped `kubectl apply -f ...` output. Final report and phase completion are blocked until the model returns `mutation_verification_result` after the required observations.
+- **Mutation needs verification.** A mutating command must declare a concrete single or ordered-chain verification contract before dispatch. Target-unmapped mutations require concrete targets on every ordered chain check. Final report and phase completion are blocked until the model returns `mutation_verification_result` after the required observations.
+- **Failed is not unknown.** State-bearing evidence that disproves the expected state closes the current mutation attempt and allows one materially different action or an evidence-grounded `phase_plan_revision`. An execution/verification result that remains unknown is retained as an unresolved obligation and forces any final report to remain inconclusive. Active verification cannot be replaced; a closed unknown obligation is preserved outside the replaceable plan graph while the remaining strategy may be revised.
 
 ## Contract invariants
 
-- `session.State.Control` represents the next runtime obligation; phase and step status do not replace it.
-- An accepted phase plan populates `session.PhaseState`, and its current phase remains separate from nested guide or verification steps.
+- The aggregate root's `RuntimeControlState` represents the next runtime obligation; phase and step status do not replace it.
+- An accepted phase plan populates phase state and `GoalExecutionState`; its current phase remains separate from nested guide or verification steps.
+- Actions are bound to the runtime's single active step. Step and phase completion require the corresponding `step_result`/`phase_progress` transition unless the declared lightweight read-only bundle is closed by its successful observation.
+- Evidence-backed `phase_plan_revision` may replace the active and remaining graph, but it preserves completed history, mandatory obligations, phase/step lineage, and request-fixed attempt/revision budgets.
 - Active guide progress is valid only under the `guided_diagnosis` phase and is cleared when that parent phase or request ends.
 - `another_guide` must re-enter guidance through a declared phase path; it must not inject guide steps directly into an unrelated phase.
-- A successful mutation that needs direct-effect evidence populates verification requirements. Once all required evidence is collected, control must require exactly one `mutation_verification_result` before final reporting.
-- `progressing` or `unresolved` verification must keep a continuation/recheck obligation until resolved or the bounded retry policy closes inconclusively.
+- A successful mutation opens one direct verification under the same attempt. Ordered chains activate one distinct check at a time, and await-state rechecks retain the same verification ID. Single and chain procedures use separate evidence/result controls. Once active evidence is collected, control requires exactly one `mutation_verification_result` before progression.
+- `waiting` keeps the same verification ID and requires a new read-only observation after the runtime wait. The next result must reference that latest observation. `failed` or budget exhaustion requires a different safe strategy and never automatically repeats the mutation.
 - Continuation choice and free-text input are distinct controls with `react_choice` and `react_text` input owners.
 - `phase_progress.phase_completed` is the model's self-report for the top-level phase. It is ignored when the corresponding observation is blocked, declined, failed, errored, or structurally unrelated to the active phase goal.
 - `guide_progress.step_completed` is the model's self-report, not enforced by command matching. It is ignored when the corresponding observation is blocked, declined, failed, or errored. Misreported indices on successful observations are accepted (the worst case is premature parent phase-progress/final-report instruction or a step staying open).
 - Internal schema/correction errors, including invalid `next_directions`, are runtime errors rather than Kubernetes incident evidence. They must not trigger incident guidance offers.
 
-The coordinator still contains package-local compatibility fields for several of these concepts.
-They are migration state, not a second public contract; removing them in favor of `session.State`
-is tracked in [`TODO.md`](./TODO.md).
+The coordinator keeps one `runtimeState` reference to the revisioned `session.Aggregate` root. It
+does not maintain a second mutable mirror or hydrate/dual-write path. Public compatibility aliases
+remain only in the `internal/react` facade.
 
 ## Known implementation gaps
 
@@ -274,7 +299,6 @@ are tracked in [`../bug.md`](../bug.md):
 
 - `phase_progress` does not yet reject `evidence_useful=false` or every failed/blocked latest observation (`BUG-8`).
 - standalone `__guide_progress__` does not verify that the latest observation succeeded (`BUG-12`).
-- progressing/unresolved mutation verification does not reliably re-arm the same verification cycle (`BUG-9`, `BUG-14`).
 - `another_guide` rewind and `different_approach` continuation still have re-entry/branching risks (`BUG-1`, `BUG-13`).
 - shim structured acknowledgements for guide and mutation results still use native `FunctionCallResult` history (`BUG-5`).
 
@@ -334,9 +358,8 @@ Explicitly include:
 - invalid/missing `requirement_analysis`
 - requested `phase_progress`/`final_report` after guide completion
 - requested `mutation_verification_result` after mutation verification evidence is collected
-- `mutationContinuationRequired` after `progressing` or `unresolved`
+- await-state `waiting` recheck and post-verification continuation after `failed` or recheck-budget exhaustion
 - conversation/clarification requests attempting tool calls
-- self-talk shell actions such as `echo`, `printf`, `sleep`, or `read`
 - assistant-managed guidance tool names emitted as model tool calls
 - interactive command blocks
 - classified tool failures: `command_syntax`, `rbac_forbidden`, `resource_not_found`, `timeout_or_api_unavailable`, `partial_success`, `unknown`
@@ -375,10 +398,15 @@ The runtime already filters internal runtime/schema/correction text out of incid
 | Error class | Examples | User-visible? | Incident guidance candidate? |
 |---|---|---|---|
 | Kubernetes observation error | resource not found, API forbidden, timeout, partial result | Yes | Maybe, only if related to user diagnosis and the continuation choice UI is already shown |
-| Agent command error | command syntax, `kubectl` binary missing, self-talk shell action, interactive command | Yes as retry/correction context | No by itself |
+| Agent command error | command syntax, `kubectl` binary missing, read-only safety classification failure, interactive command | Yes as retry/correction context | No by itself |
 | Runtime schema error | invalid `next_directions`, invalid `final_report`, shim parse issue | No or compact message | No |
 | Provider error | LLM HTTP 500, context length, streaming error | Yes as assistant/runtime error | No |
 | User approval/policy outcome | declined, read-only blocked, RBAC blocker | Yes | No by itself |
+
+An RBAC blocker does not itself end the active diagnostic phase. The model must first choose permitted
+alternative evidence. If permission must change to satisfy the user request, that change is a separate risky
+mutation with normal read-only enforcement, exact approval, and direct verification; it is not an automatic
+retry of the forbidden observation.
 
 Acceptance criteria:
 

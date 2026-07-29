@@ -4,8 +4,11 @@
 >
 > `phase_plan` 수용 전 schema/graph validation, mutation verification phase requirement,
 > guided diagnosis lookup requirement, CRD guidance eligibility gate가 적용되어 있다.
+> 수용 후 graph 변경은 별도 `phase_plan_revision` contract로 제한되며 stable ID,
+> evidence reference, phase/step lineage, revision budget을 검증한다.
 > 현재 contract/validation/state 위치는 `internal/react/contract/structured.go`,
-> `flow/phase`, `session/phase.go`이며 coordinator 통합은 `coordinator/iteration.go`에 있다.
+> `flow/phase`, `session/execution.go`, `coordinator/state.go`이며 coordinator 통합은
+> `coordinator/iteration.go`, `execution_state.go`, `revision.go`에 있다.
 > 아래 옛 루트 파일 경로는 구현 이력이다.
 
 ## Problem
@@ -23,6 +26,11 @@ Model은 plan proposer일 수 있지만, runtime policy owner가 되어서는 �
 - `internal/react/coordinator/loop.go`
   - `runIteration`은 phase plan 이후 action/final/answer를 gate한다.
   - mutation verification과 resource guide eligibility는 phase plan 수용 전에 deterministic gate로 차단된다.
+- `internal/react/flow/phase/revision.go`, `internal/react/coordinator/revision.go`
+  - active/remaining graph 변경은 base revision과 기존 evidence ID를 요구한다.
+  - completed/skipped/superseded history는 보존하고 현재 nonterminal graph만 명시적으로 supersede한다.
+  - 같은 goal을 대체하는 phase/step은 lineage와 누적 attempt budget을 상속한다.
+  - 존재하지 않는 phase/step 및 dangling lineage mapping은 candidate commit 전에 거부한다.
 
 ## Desired Contract
 
@@ -42,7 +50,7 @@ Phase plan은 다음 두 계층으로 나눈다.
 `requirement_analysis.request_type` 또는 action이 mutation이면 다음 lifecycle이 필요하다.
 
 ```text
-context_resolution? -> observation_before_change -> mutation_planning -> approval -> mutation_execution -> mutation_verification -> response_synthesis
+context_resolution? -> observation_before_change -> mutation_planning -> approval(if risk.risky=true) -> mutation_execution -> mutation_verification -> response_synthesis
 ```
 
 `mutation_verification` 없는 plan은 invalid다.
@@ -95,6 +103,13 @@ type phasePlanValidationResult struct {
 
 6. `lightweight_lookup` single phase는 기존처럼 허용한다.
 
+7. accepted plan의 active/remaining graph를 바꾸려면 model은 action과 섞지 않은
+   `phase_plan_revision`을 제출해야 한다. Runtime은 exact base revision, evidence reference,
+   replacement graph, forward-only edge와 revision budget을 검증한다.
+
+8. Step/phase 이름이나 ID를 바꾸더라도 동일 goal이면 lineage를 보존한다. 실제로 새로운
+   evidence-driven goal만 새 lineage와 request-fixed attempt budget을 받는다.
+
 ## Current Gate Rules
 
 Mutation verification이 필요한 경우:
@@ -120,6 +135,8 @@ Resource guide phase로 판단하는 이름:
 - final/report phase 자체를 plan에서 금지하지는 않는다. 실제 종료 가능 여부는 `final_report`, mutation verification, guide completion gate가 runtime에서 별도로 막는다.
 - remediation request가 항상 mutation을 뜻한다고 단정하지 않는다. remediation plan이 실제 mutation execution phase를 선언하거나 requirement action이 mutation 계열일 때 verification을 강제한다.
 - aggregation 질문에서 deterministic aggregation command를 쓰는지는 phase plan이 아니라 action/prompt contract 쪽에서 다룬다.
+- Evidence의 의미가 plan 변경을 정당화하는지는 model이 판단한다. Runtime은 evidence ID의
+  존재, graph 절차, lineage와 budget 보존만 검증한다.
 
 ## Acceptance Criteria
 
@@ -127,6 +144,7 @@ Resource guide phase로 판단하는 이름:
 - built-in resource diagnosis에서 `guidance_lookup` phase를 포함한 plan은 accepted되지 않는다.
 - CRD 확인 후에만 `guidance_lookup`을 포함한 plan이 accepted된다.
 - lightweight lookup은 여전히 single phase로 동작한다.
+- dangling lineage mapping과 stale/base-budget 위반 revision은 committed state를 바꾸지 않는다.
 
 ## Regression Scenarios
 

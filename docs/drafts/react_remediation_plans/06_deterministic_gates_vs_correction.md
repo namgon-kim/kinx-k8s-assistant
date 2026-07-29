@@ -1,12 +1,15 @@
 # Plan 06: Deterministic Gates vs LLM Correction
 
-> 상태: 대부분 구현됨.
+> 상태: 구현됨.
 >
 > `GateOutcome`, `RetryScope`, `CorrectionMode`, `BranchPolicy`가 공통 gate 모델로
-> 적용되어 있다. 일부 gate의 pure decision/apply 분리와 code별 correction counter는
-> 후속 cleanup으로 남아 있다.
+> 적용되어 있다. Turn-entry output policy와 code/scope별 correction counter도
+> session goal execution state에 연결되어 있다.
 > 현재 공통 모델은 `internal/react/flow/gate`, snapshot/refs는 `contract`와 `session`,
 > 적용 pipeline은 `coordinator/iteration.go`에 있다. 아래 옛 루트 파일 경로는 구현 이력이다.
+> Code/scope별 correction state의 최종 소유권과 reset/escalation 계약은
+> [`08_turn_output_contract_and_goal_execution.md`](./08_turn_output_contract_and_goal_execution.md)의
+> `session.Corrections` 설계를 따른다. Plan 08은 별도 correction counter를 만들지 않는다.
 
 ## Problem
 
@@ -32,7 +35,14 @@
   - `validatePhasePlanForRequest`가 phase plan을 수용하기 전에 mutation verification/guidance eligibility를 결정한다.
   - gate에 막힌 phase plan은 `phaseStepState`로 수용되지 않으므로 이후 action dispatch로 내려가지 않는다.
 - `internal/react/coordinator/loop.go`, `internal/react/coordinator/execution.go`, `internal/react/coordinator/iteration.go`
-  - self-talk shell action, read-only unknown command, read-only known mutation, interactive command, target/resource validation, requested structured output enforcement가 `GateOutcome` correction/apply 경로를 사용한다.
+  - read-only unknown command, read-only known mutation, interactive command,
+    target/resource validation이 `GateOutcome` correction/apply 경로를 사용한다.
+- `internal/react/protocol`, `internal/react/flow/gate/output_policy.go`
+  - native/shim 응답을 typed output kind로 정규화하고 control별 required/exclusive/mix policy를
+    domain consumer보다 먼저 적용한다.
+- `internal/react/coordinator/execution_state.go`
+  - correction은 `Code + RetryScope + PhaseID/StepID/ObligationID` key와 request-fixed
+    protocol/domain/safety threshold로 누적하고 scope가 정상 전진할 때 reset한다.
 - `internal/react/coordinator/output.go`, `internal/react/coordinator/iteration.go`
   - tool execution failure를 `command_syntax`, `rbac_forbidden`, `resource_not_found`, `timeout_or_api_unavailable`, `partial_success`, `unknown`으로 분류한다.
   - 각 failure class는 `retryable`, `retry_scope`, `suggested_response`를 observation에 붙이고 `GateOutcomeToolExecutionFailure`로 이어진다.
@@ -47,15 +57,14 @@ Correction 자체는 필요하지만, 안전 정책의 최종 보증 수단이 �
 
 - read-only mutation block
 - namespace/scope mismatch block
-- mutation approval requirement
+- `risk.risky=true` command exact approval requirement
 - post-mutation verification requirement
 - CRD-only resource guide eligibility
 - incident runbook no-match handling
 - interactive command block
 - conversation/clarification tool-call block
-- non-observation shell action block
 - tool execution failure classification
-- destructive command approval and verification
+- risky command approval and mutation verification
 
 Correction은 model에게 다음 출력을 안내하는 보조 수단으로만 사용한다.
 
@@ -136,20 +145,74 @@ if !result.Valid {
 
 | Gate | Code / class | Deterministic result |
 |---|---|---|
-| Requested structured output ignored | `next_directions_required`, `guided_phase_progress_required`, `final_report_required` | conflicting calls rejected, directive re-queued |
+| Turn output contract 위반 | `turn_output_policy_<code>` | state 변경 전 reject, 현재 control directive 재요구 |
 | Conversation request used tool | `conversation_tool_call` | tool call rejected, plain answer/question or clarification phase completion requested |
-| Self-talk shell action | `non_observation_shell_action` | command not dispatched, current step retried |
 | Interactive command | `interactive_command_blocked` | command not dispatched, non-interactive alternative requested |
 | Read-only known mutation | read-only policy block | no dispatch, user request blocked |
 | Read-only unknown command shape | read-only unknown retry | no dispatch, agent command correction |
 | Tool execution failure | `tool_execution_<failure_class>` | observation annotated and branch/retry policy applied |
+| Tool invocation cancellation after dispatch | `tool_execution_unknown` | uncertain observation committed, prior action history preserved |
 
-## Remaining Work
+## Current Boundary
 
-- gate별 correction 반복 한도는 아직 공통 dedup/compaction 기반이다. 필요하면 `GateOutcome.Code`별 counter로 분리한다.
-- 일부 gate는 아직 pure decision 함수로 완전히 분리되어 있지 않다. 다만 apply/correction 의미는 `GateOutcome`으로 수렴한다.
-- `BranchRecheckStep`, `BranchMovePhase`, `BranchRewindPhase`는 primitive가 있지만 모든 production gate가 target phase/step을 지정하는 것은 아니다.
-- `ExpectedControl`은 apply 대상이 아니라 post-apply assertion이므로, 새 gate 추가 시 control을 직접 저장하거나 덮어쓰면 안 된다.
+- 같은 rejected model turn의 동일 correction key는 한 번만 증가하고 정상적인 step/phase 전진 시 reset한다.
+- threshold 도달 시 해당 `GateOutcome.BranchPolicy`가 retry, blocked, replan 또는 request block을 결정한다.
+- Step attempt, correction, verification evidence, mutation continuation, plan revision budget은 서로 합치지 않는다.
+- 일부 domain gate는 coordinator helper에서 decision input을 조립하지만 allow/block 의미와 counter 적용은
+  공통 contract를 따른다.
+- `BranchMovePhase`, `BranchRewindPhase`, `BranchSkipStep` primitive를 새 gate에 연결할 때는
+  target phase/step reference와 mandatory owner를 함께 검증해야 한다.
+- 이전 `BranchRecheckStep`은 production producer 없이 mutation continuation budget을 공유하던
+  중복 경로라 제거했다. Temporal verification retry는 active verification ID의
+  `mode=await_state`, `RechecksUsed`, verification evidence budget만 사용한다.
+- `ExpectedControl`은 post-apply assertion이며 새 control 값을 저장하는 명령이 아니다.
+- RBAC/Forbidden observation은 대상 상태의 성공 evidence가 아니지만 곧바로 request를 terminal block하지
+  않는다. Current-phase retry에서 permitted alternative를 선택하고, 권한 변경이 실제로 필요하면 model이
+  별도의 risky mutation과 direct verification을 제안해 exact user approval을 받는다.
+
+## Future kubectl verbose failure classification
+
+> 구현되지 않은 후속 작업이다. 현재 classifier는 normalized tool result와
+> stderr/error text를 사용하며 bounded `kubectl -v` metadata 수집은 수행하지 않는다. 현재
+> 공통 success 판정은 non-zero exit code를 실패로 처리하지만, 그 값만으로 Kubernetes failure
+> class를 정하지 않는다.
+
+kubectl process exit code는 성공, 일반 실패, 실행 불가, signal interruption을 구분하는
+참고 자료로 사용한다. 하나의 non-zero exit code가 NotFound, Forbidden, Conflict,
+Invalid, TooManyRequests, API server failure 등 여러 Kubernetes 오류에 사용될 수 있으므로
+exit code만으로 failure class를 결정하지 않는다.
+
+향후 classifier는 다음 우선순위를 사용한다.
+
+1. tool result가 제공하는 typed Kubernetes `Status.reason`과 HTTP status code
+2. kubectl 실행에서 수집한 bounded verbose HTTP metadata
+3. normalized stderr/error/status field
+4. bounded kubectl error pattern
+5. process exit code
+
+Bounded verbosity는 command의 read-only/mutation 성격과 무관하게 kubectl 실행 결과의
+실패 여부와 구체적인 사유를 확인하기 위한 진단 metadata다. Runtime은 선택된 verbosity
+정책을 실제 kubectl command 실행 시 적용하고, stdout/stderr와 분리된 normalized failure
+metadata로 수집한다.
+
+초기 수집 수준은 HTTP method, request URL과 response status를 확인할 수 있는 낮은
+verbosity부터 시작한다. 예를 들어 `kubectl --v=6 ...` 수준을 후보로 검증하되, header와
+body가 과도하게 노출되는 높은 verbosity를 자동으로 사용하지 않는다. 실제 level과
+수집 정책은 kubectl 버전별 출력, 성능과 보안 영향 검증 후 결정한다.
+
+Runtime은 verbose output을 model이나 history에 넣기 전에 다음을 강제한다.
+
+- Authorization header, bearer token, client certificate와 credential path 제거
+- Secret data, request/response body와 민감 query value 마스킹
+- 출력 크기와 line 수 제한
+- raw verbose output의 prompt 및 durable checkpoint 영구 저장 금지
+- verbose metadata와 실제 command result의 invocation ID 일치
+- namespace/target invariant와 기존 command execution contract 유지
+
+최소 회귀 사례는 HTTP `401`, `403`, `404`, `409`, `422`, `429`, `5xx`, timeout,
+TLS failure, command-not-found와 signal interruption이다. Verbose metadata는 command
+실패 원인을 분류하기 위한 자료이며 그 자체를 resource expected-state evidence로
+승격하지 않는다.
 
 ## Example
 
