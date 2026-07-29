@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
+	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
 )
 
 func TestGateOutcomeValidateChecksTargetPhaseAndStep(t *testing.T) {
@@ -47,7 +49,12 @@ func TestGateOutcomeValidateChecksTargetPhaseAndStep(t *testing.T) {
 }
 
 func TestGateOutcomeExpectedControlIsPostApplyAssertion(t *testing.T) {
-	loop := &Loop{control: RuntimeControlAwaitingModelStep}
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+		},
+		output: make(chan *api.Message, 1),
+	}
 	handled := loop.applyGateOutcome(GateOutcome{
 		Kind:            GateOutcomeModelOutputCorrection,
 		Code:            "expected_control_mismatch",
@@ -61,6 +68,14 @@ func TestGateOutcomeExpectedControlIsPostApplyAssertion(t *testing.T) {
 	}
 	if loop.loopLifecycle() != LoopLifecycleAwaitingUserInput {
 		t.Fatalf("lifecycle = %v, want LoopLifecycleAwaitingUserInput for post-apply expected control mismatch", loop.loopLifecycle())
+	}
+	select {
+	case message := <-loop.output:
+		if message.Type != api.MessageTypeError {
+			t.Fatalf("message type = %v, want error", message.Type)
+		}
+	default:
+		t.Fatal("expected-control mismatch did not emit a user-visible error")
 	}
 }
 
@@ -90,7 +105,11 @@ func TestGateOutcomeValidateRejectsIncompleteSkipStepTargets(t *testing.T) {
 }
 
 func TestPhasePlanValidationUsesGateOutcomeCorrectionPath(t *testing.T) {
-	loop := &Loop{control: RuntimeControlAwaitingModelStep}
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+		},
+	}
 	handled := loop.applyGateOutcome(phasePlanValidationResult{
 		Code:    "phase_plan_missing",
 		Message: "return phase_plan",
@@ -101,31 +120,33 @@ func TestPhasePlanValidationUsesGateOutcomeCorrectionPath(t *testing.T) {
 	if loop.loopLifecycle() != LoopLifecycleModelTurn {
 		t.Fatalf("lifecycle = %v, want LoopLifecycleModelTurn", loop.loopLifecycle())
 	}
-	if loop.currIteration != 1 {
-		t.Fatalf("currIteration = %d, want 1", loop.currIteration)
+	if loop.mutableRuntime().currIteration != 1 {
+		t.Fatalf("currIteration = %d, want 1", loop.mutableRuntime().currIteration)
 	}
 	found := false
-	for _, item := range loop.currChatContent {
+	for _, item := range loop.mutableRuntime().currChatContent {
 		text, ok := item.(string)
 		if ok && strings.Contains(text, "return phase_plan") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("expected model correction in currChatContent, got %#v", loop.currChatContent)
+		t.Fatalf("expected model correction in currChatContent, got %#v", loop.mutableRuntime().currChatContent)
 	}
 }
 
 func TestApplyGateOutcomeCanMoveToTargetPhase(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps: []phaseStep{
-				{Index: 1, Name: "observation", AllowedNext: []string{"verification"}},
-				{Index: 2, Name: "verification"},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 1,
+				PhaseSteps: []phaseStep{
+					{Index: 1, Name: "observation", AllowedNext: []string{"verification"}},
+					{Index: 2, Name: "verification"},
+				},
+				Completed: map[int]bool{},
 			},
-			Completed: map[int]bool{},
 		},
 	}
 	handled := loop.applyGateOutcome(GateOutcome{
@@ -139,22 +160,24 @@ func TestApplyGateOutcomeCanMoveToTargetPhase(t *testing.T) {
 	if !handled {
 		t.Fatal("expected outcome to be handled")
 	}
-	if got := loop.phaseStepState.CurrentPhaseIndex; got != 2 {
+	if got := loop.mutableRuntime().phaseStepState.CurrentPhaseIndex; got != 2 {
 		t.Fatalf("current phase index = %d, want 2", got)
 	}
 }
 
 func TestApplyGateOutcomeRejectsMoveOutsideAllowedNext(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps: []phaseStep{
-				{Index: 1, Name: "observation", AllowedNext: []string{"verification"}},
-				{Index: 2, Name: "verification"},
-				{Index: 3, Name: "remediation"},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 1,
+				PhaseSteps: []phaseStep{
+					{Index: 1, Name: "observation", AllowedNext: []string{"verification"}},
+					{Index: 2, Name: "verification"},
+					{Index: 3, Name: "remediation"},
+				},
+				Completed: map[int]bool{},
 			},
-			Completed: map[int]bool{},
 		},
 	}
 	handled := loop.applyGateOutcome(GateOutcome{
@@ -171,22 +194,24 @@ func TestApplyGateOutcomeRejectsMoveOutsideAllowedNext(t *testing.T) {
 	if loop.loopLifecycle() != LoopLifecycleAwaitingUserInput {
 		t.Fatalf("lifecycle = %v, want LoopLifecycleAwaitingUserInput for invalid branch", loop.loopLifecycle())
 	}
-	if got := loop.phaseStepState.CurrentPhaseIndex; got != 1 {
+	if got := loop.mutableRuntime().phaseStepState.CurrentPhaseIndex; got != 1 {
 		t.Fatalf("current phase index = %d, want unchanged phase 1", got)
 	}
 }
 
 func TestApplyGateOutcomeAllowsRuntimeOverrideToMutationLifecyclePhase(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps: []phaseStep{
-				{Index: 1, Name: "remediation", AllowedNext: []string{"reporting"}},
-				{Index: 2, Name: "reporting"},
-				{Index: 3, Name: "mutation_verification"},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 1,
+				PhaseSteps: []phaseStep{
+					{Index: 1, Name: "remediation", AllowedNext: []string{"reporting"}},
+					{Index: 2, Name: "reporting"},
+					{Index: 3, Name: "mutation_verification"},
+				},
+				Completed: map[int]bool{},
 			},
-			Completed: map[int]bool{},
 		},
 	}
 	handled := loop.applyGateOutcome(GateOutcome{
@@ -201,21 +226,23 @@ func TestApplyGateOutcomeAllowsRuntimeOverrideToMutationLifecyclePhase(t *testin
 	if !handled {
 		t.Fatal("expected override branch outcome to be handled")
 	}
-	if got := loop.phaseStepState.CurrentPhaseIndex; got != 3 {
+	if got := loop.mutableRuntime().phaseStepState.CurrentPhaseIndex; got != 3 {
 		t.Fatalf("current phase index = %d, want mutation verification phase", got)
 	}
 }
 
 func TestApplyGateOutcomeRejectsBackwardMoveWithoutRewind(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 2,
-			PhaseSteps: []phaseStep{
-				{Index: 1, Name: "observation"},
-				{Index: 2, Name: "verification"},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 2,
+				PhaseSteps: []phaseStep{
+					{Index: 1, Name: "observation"},
+					{Index: 2, Name: "verification"},
+				},
+				Completed: map[int]bool{},
 			},
-			Completed: map[int]bool{},
 		},
 	}
 	handled := loop.applyGateOutcome(GateOutcome{
@@ -233,21 +260,23 @@ func TestApplyGateOutcomeRejectsBackwardMoveWithoutRewind(t *testing.T) {
 	if loop.loopLifecycle() != LoopLifecycleAwaitingUserInput {
 		t.Fatalf("lifecycle = %v, want LoopLifecycleAwaitingUserInput for backward move", loop.loopLifecycle())
 	}
-	if got := loop.phaseStepState.CurrentPhaseIndex; got != 2 {
+	if got := loop.mutableRuntime().phaseStepState.CurrentPhaseIndex; got != 2 {
 		t.Fatalf("current phase index = %d, want unchanged phase 2", got)
 	}
 }
 
 func TestApplyGateOutcomeRejectsForwardRewind(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps: []phaseStep{
-				{Index: 1, Name: "observation"},
-				{Index: 2, Name: "verification"},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 1,
+				PhaseSteps: []phaseStep{
+					{Index: 1, Name: "observation"},
+					{Index: 2, Name: "verification"},
+				},
+				Completed: map[int]bool{},
 			},
-			Completed: map[int]bool{},
 		},
 	}
 	handled := loop.applyGateOutcome(GateOutcome{
@@ -264,31 +293,28 @@ func TestApplyGateOutcomeRejectsForwardRewind(t *testing.T) {
 	if loop.loopLifecycle() != LoopLifecycleAwaitingUserInput {
 		t.Fatalf("lifecycle = %v, want LoopLifecycleAwaitingUserInput for invalid rewind", loop.loopLifecycle())
 	}
-	if got := loop.phaseStepState.CurrentPhaseIndex; got != 1 {
+	if got := loop.mutableRuntime().phaseStepState.CurrentPhaseIndex; got != 1 {
 		t.Fatalf("current phase index = %d, want unchanged phase 1", got)
 	}
 }
 
-func TestApplyGateOutcomeRewindsPhaseWithScopedCleanup(t *testing.T) {
+func TestApplyGateOutcomeRewindsPhaseWithGuideScopedCleanup(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 3,
-			PhaseSteps: []phaseStep{
-				{Index: 1, Name: "observation"},
-				{Index: 2, Name: "guided_diagnosis"},
-				{Index: 3, Name: "mutation_verification"},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 3,
+				PhaseSteps: []phaseStep{
+					{Index: 1, Name: "observation"},
+					{Index: 2, Name: "guided_diagnosis"},
+					{Index: 3, Name: "mutation_verification"},
+				},
+				Completed: map[int]bool{1: true, 2: true},
 			},
-			Completed: map[int]bool{1: true, 2: true},
-		},
-		guideStepState:              &guideStepState{TotalSteps: 1, Completed: map[int]bool{1: true}},
-		resourceGuideInjected:       true,
-		resourceGuideQueries:        map[string]struct{}{"query": {}},
-		pendingMutationVerification: &pendingMutationVerification{Requirements: []mutationEvidenceRequirement{{ID: "direct"}}},
-		pendingResponseDirective:    "final_report",
-		completedActions: []actionRecord{
-			{Step: 1, Phase: &PhaseRef{Index: 1, Name: "observation"}},
-			{Step: 2, Phase: &PhaseRef{Index: 2, Name: "guided_diagnosis"}},
+			guideStepState:           &guideStepState{TotalSteps: 1, Completed: map[int]bool{1: true}},
+			resourceGuideInjected:    true,
+			resourceGuideQueries:     map[string]struct{}{"query": {}},
+			pendingResponseDirective: "final_report",
 		},
 	}
 	handled := loop.applyGateOutcome(GateOutcome{
@@ -305,68 +331,89 @@ func TestApplyGateOutcomeRewindsPhaseWithScopedCleanup(t *testing.T) {
 	if loop.loopLifecycle() != LoopLifecycleModelTurn {
 		t.Fatalf("lifecycle = %v, want LoopLifecycleModelTurn", loop.loopLifecycle())
 	}
-	if loop.phaseStepState.CurrentPhaseIndex != 2 {
-		t.Fatalf("current phase = %d, want 2", loop.phaseStepState.CurrentPhaseIndex)
+	if loop.mutableRuntime().phaseStepState.CurrentPhaseIndex != 2 {
+		t.Fatalf("current phase = %d, want 2", loop.mutableRuntime().phaseStepState.CurrentPhaseIndex)
 	}
-	if loop.phaseStepState.Completed[2] {
-		t.Fatalf("guided_diagnosis should no longer be completed: %#v", loop.phaseStepState.Completed)
+	if loop.mutableRuntime().phaseStepState.Completed[2] {
+		t.Fatalf("guided_diagnosis should no longer be completed: %#v", loop.mutableRuntime().phaseStepState.Completed)
 	}
-	if loop.guideStepState != nil || loop.resourceGuideInjected || loop.resourceGuideQueries != nil {
-		t.Fatalf("expected guide state cleanup, guide=%#v injected=%v queries=%#v", loop.guideStepState, loop.resourceGuideInjected, loop.resourceGuideQueries)
+	if loop.mutableRuntime().guideStepState != nil || loop.mutableRuntime().resourceGuideInjected || loop.mutableRuntime().resourceGuideQueries != nil {
+		t.Fatalf("expected guide state cleanup, guide=%#v injected=%v queries=%#v", loop.mutableRuntime().guideStepState, loop.mutableRuntime().resourceGuideInjected, loop.mutableRuntime().resourceGuideQueries)
 	}
-	if loop.pendingMutationVerification != nil {
-		t.Fatalf("expected mutation verification cleanup, pending=%#v", loop.pendingMutationVerification)
-	}
-	if loop.pendingResponseDirective != "" {
+	if loop.mutableRuntime().pendingResponseDirective != "" {
 		t.Fatalf("expected response directives to clear")
-	}
-	if len(loop.completedActions) != 1 || loop.completedActions[0].Step != 1 {
-		t.Fatalf("completed actions = %#v, want only pre-rewind actions", loop.completedActions)
 	}
 }
 
-func TestApplyGateOutcomeBranchRecheckStepConsumesMutationBudget(t *testing.T) {
-	loop := &Loop{
-		control:                      RuntimeControlAwaitingMutationContinuation,
-		mutationContinuationAttempts: maxMutationContinuationAttempts,
+func TestApplyGateOutcomeRejectsRewindWithMandatoryVerification(t *testing.T) {
+	owner := StepRef{
+		Phase:         PhaseRef{Index: 3, Name: "mutation_verification"},
+		Kind:          StepMutationEvidenceRequirement,
+		ID:            "direct",
+		GoalLineageID: "mutation-direct",
 	}
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingMutationVerificationEvidence,
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 3,
+				PhaseSteps: []phaseStep{
+					{Index: 1, Name: "observation"},
+					{Index: 2, Name: "guided_diagnosis"},
+					{Index: 3, Name: "mutation_verification"},
+				},
+				Completed: map[int]bool{1: true, 2: true},
+			},
+			pendingMutationVerification: &pendingMutationVerification{
+				Owner: owner,
+				Checks: []verificationRuntimeCheck{{
+					ID:     "direct",
+					Status: contract.VerificationCheckActive,
+				}},
+			},
+		},
+	}
+
 	handled := loop.applyGateOutcome(GateOutcome{
-		Kind:            GateOutcomeExternalStateWait,
-		Code:            "rollout_still_progressing",
-		ModelCorrection: "recheck rollout",
+		Kind:            GateOutcomeModelOutputCorrection,
+		Code:            "rewind_guided_diagnosis",
+		ModelCorrection: "rewind",
+		TargetPhase:     &PhaseRef{Name: "guided_diagnosis"},
 		CorrectionMode:  CorrectionModeAppendCompacted,
-		BranchPolicy:    BranchRecheckStep,
+		BranchPolicy:    BranchRewindPhase,
 	})
 	if !handled {
-		t.Fatal("expected recheck branch outcome to be handled")
+		t.Fatal("expected rewind outcome to be handled")
 	}
-	if loop.control != RuntimeControlAwaitingFinalReport {
-		t.Fatalf("control = %s, want final report after recheck budget exhaustion", loop.control)
+	if got := loop.mutableRuntime().phaseStepState.CurrentPhaseIndex; got != 3 {
+		t.Fatalf("current phase = %d, want unchanged phase 3", got)
 	}
-	if !strings.Contains(loop.pendingResponseDirective, "conclusive=false") {
-		t.Fatalf("directive = %q, want inconclusive final report instruction", loop.pendingResponseDirective)
+	if loop.mutableRuntime().pendingMutationVerification == nil {
+		t.Fatal("mandatory mutation verification was cleared by phase rewind")
 	}
-	if !strings.Contains(loop.pendingResponseDirective, "after 3 recheck attempts") {
-		t.Fatalf("directive = %q, want exhausted attempt count", loop.pendingResponseDirective)
+	if got := loop.controlState(); got != RuntimeControlAwaitingMutationVerificationEvidence {
+		t.Fatalf("control = %s, want mandatory verification control", got)
 	}
 }
 
 func TestApplyGateOutcomeSkipsGuideStep(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps:        []phaseStep{{Index: 1, Name: "guided_diagnosis"}},
-			Completed:         map[int]bool{},
-		},
-		guideStepState: &guideStepState{
-			TotalSteps: 2,
-			StepDetails: []guideStepDetail{
-				{Index: 1, Description: "already covered by live evidence"},
-				{Index: 2, Description: "check events"},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 1,
+				PhaseSteps:        []phaseStep{{Index: 1, Name: "guided_diagnosis"}},
+				Completed:         map[int]bool{},
 			},
-			Completed: map[int]bool{},
-			Skipped:   map[int]bool{},
+			guideStepState: &guideStepState{
+				TotalSteps: 2,
+				StepDetails: []guideStepDetail{
+					{Index: 1, Description: "already covered by live evidence"},
+					{Index: 2, Description: "check events"},
+				},
+				Completed: map[int]bool{},
+				Skipped:   map[int]bool{},
+			},
 		},
 	}
 	step := StepRef{
@@ -385,10 +432,10 @@ func TestApplyGateOutcomeSkipsGuideStep(t *testing.T) {
 	if !handled {
 		t.Fatal("expected skip outcome to be handled")
 	}
-	if !loop.guideStepState.Skipped[1] {
-		t.Fatalf("guide skipped map = %#v", loop.guideStepState.Skipped)
+	if !loop.mutableRuntime().guideStepState.Skipped[1] {
+		t.Fatalf("guide skipped map = %#v", loop.mutableRuntime().guideStepState.Skipped)
 	}
-	if remaining := loop.guideStepState.remainingSteps(); len(remaining) != 1 || remaining[0] != 2 {
+	if remaining := loop.mutableRuntime().guideStepState.remainingSteps(); len(remaining) != 1 || remaining[0] != 2 {
 		t.Fatalf("remaining = %#v, want [2]", remaining)
 	}
 	snapshot := loop.RuntimeSnapshot()
@@ -402,16 +449,20 @@ func TestApplyGateOutcomeSkipsGuideStep(t *testing.T) {
 
 func TestApplyGateOutcomeSkipsMutationEvidenceRequirement(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps:        []phaseStep{{Index: 1, Name: "mutation_verification"}},
-			Completed:         map[int]bool{},
-		},
-		pendingMutationVerification: &pendingMutationVerification{
-			Requirements: []mutationEvidenceRequirement{{ID: "generic", Kind: "generic"}},
-			Satisfied:    map[string]bool{},
-			Skipped:      map[string]bool{},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingModelStep,
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 1,
+				PhaseSteps:        []phaseStep{{Index: 1, Name: "mutation_verification"}},
+				Completed:         map[int]bool{},
+			},
+			pendingMutationVerification: &pendingMutationVerification{
+				Checks: []verificationRuntimeCheck{{
+					ID:           "generic",
+					Status:       contract.VerificationCheckActive,
+					EvidenceRefs: []string{"observation-1"},
+				}},
+			},
 		},
 	}
 	step := StepRef{
@@ -430,13 +481,10 @@ func TestApplyGateOutcomeSkipsMutationEvidenceRequirement(t *testing.T) {
 	if !handled {
 		t.Fatal("expected skip outcome to be handled")
 	}
-	if !loop.pendingMutationVerification.Skipped["generic"] {
-		t.Fatalf("skipped map = %#v", loop.pendingMutationVerification.Skipped)
+	if got := loop.mutableRuntime().pendingMutationVerification.Checks[0].Status; got != contract.VerificationCheckSkipped {
+		t.Fatalf("check status = %s, want skipped", got)
 	}
-	if remaining := loop.pendingMutationVerification.remainingRequirements(); len(remaining) != 0 {
-		t.Fatalf("remaining = %#v, want none", remaining)
-	}
-	if !loop.pendingMutationVerification.AwaitingResult {
+	if !loop.mutableRuntime().pendingMutationVerification.AwaitingResult {
 		t.Fatal("expected skipped final evidence to await mutation_verification_result")
 	}
 	snapshot := loop.RuntimeSnapshot()
@@ -445,75 +493,25 @@ func TestApplyGateOutcomeSkipsMutationEvidenceRequirement(t *testing.T) {
 	}
 }
 
-func TestRuntimeSnapshotProjectsCompletedGeneralActions(t *testing.T) {
-	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 2,
-			PhaseSteps: []phaseStep{
-				{Index: 1, Name: "observation"},
-				{Index: 2, Name: "verification"},
-			},
-			Completed: map[int]bool{1: true},
-		},
-		completedActions: []actionRecord{{
-			Step:    1,
-			Tool:    "kubectl",
-			Phase:   &PhaseRef{Index: 1, Name: "observation"},
-			Command: "kubectl get pods",
-		}},
-	}
-	snapshot := loop.RuntimeSnapshot()
-	if len(snapshot.ActiveSteps) != 1 {
-		t.Fatalf("active steps len = %d, want completed action projection", len(snapshot.ActiveSteps))
-	}
-	step := snapshot.ActiveSteps[0]
-	if step.Ref.Kind != StepGeneralAction || step.Status != StepCompleted {
-		t.Fatalf("step = %#v, want completed general action", step)
-	}
-	if step.Ref.Phase.Name != "observation" || step.Command != "kubectl get pods" {
-		t.Fatalf("step = %#v", step)
-	}
-}
-
 func TestMutationContinuationBudgetRequestsFinalReport(t *testing.T) {
 	loop := &Loop{}
 	result := mutationVerificationResult{
-		Status:          "progressing",
+		Status:          contract.VerificationFailed,
 		EvidenceSummary: []string{"rollout still progressing"},
 		NextAction:      "recheck rollout",
 	}
 	for i := 0; i < maxMutationContinuationAttempts; i++ {
 		loop.requestMutationContinuationOrBudgetReport(result)
-		if loop.control != RuntimeControlAwaitingMutationContinuation {
-			t.Fatalf("attempt %d control = %s, want mutation continuation", i+1, loop.control)
+		if loop.mutableRuntime().control != RuntimeControlAwaitingMutationContinuation {
+			t.Fatalf("attempt %d control = %s, want mutation continuation", i+1, loop.mutableRuntime().control)
 		}
 	}
 	loop.requestMutationContinuationOrBudgetReport(result)
-	if loop.control != RuntimeControlAwaitingFinalReport {
-		t.Fatalf("control = %s, want final_report after budget exhaustion", loop.control)
+	if loop.mutableRuntime().control != RuntimeControlAwaitingFinalReport {
+		t.Fatalf("control = %s, want final_report after budget exhaustion", loop.mutableRuntime().control)
 	}
-	if !strings.Contains(loop.pendingResponseDirective, "conclusive=false") {
-		t.Fatalf("directive = %q, want inconclusive final report instruction", loop.pendingResponseDirective)
-	}
-}
-
-func TestMutationContinuationBudgetResetsWhenVerificationLifecycleExpands(t *testing.T) {
-	loop := &Loop{
-		mutationContinuationAttempts: 2,
-	}
-	loop.mergeMutationVerification(pendingMutationVerification{
-		Requirements: []mutationEvidenceRequirement{{ID: "direct"}},
-	})
-	if loop.mutationContinuationAttempts != 0 {
-		t.Fatalf("attempts = %d, want reset for new verification", loop.mutationContinuationAttempts)
-	}
-	loop.mutationContinuationAttempts = 2
-	loop.mergeMutationVerification(pendingMutationVerification{
-		Requirements: []mutationEvidenceRequirement{{ID: "outcome"}},
-	})
-	if loop.mutationContinuationAttempts != 0 {
-		t.Fatalf("attempts = %d, want reset for expanded verification", loop.mutationContinuationAttempts)
+	if !strings.Contains(loop.mutableRuntime().pendingResponseDirective, "conclusive=false") {
+		t.Fatalf("directive = %q, want inconclusive final report instruction", loop.mutableRuntime().pendingResponseDirective)
 	}
 }
 
@@ -532,10 +530,10 @@ func TestToolFailureOutcomeClassifiesFailureKinds(t *testing.T) {
 	if !failed {
 		t.Fatal("expected forbidden result to be classified as tool failure")
 	}
-	if outcome.Kind != GateOutcomeToolExecutionFailure || outcome.Retryable || outcome.BranchPolicy != BranchBlockUserRequest {
-		t.Fatalf("outcome = %#v, want non-retryable tool execution failure", outcome)
+	if outcome.Kind != GateOutcomeToolExecutionFailure || !outcome.Retryable || outcome.BranchPolicy != BranchRetryStep {
+		t.Fatalf("outcome = %#v, want retryable current-phase tool execution failure", outcome)
 	}
-	if forbidden["failure_class"] != string(toolFailureRBAC) || forbidden["retry_scope"] != string(RetryScopeUserRequest) {
+	if forbidden["failure_class"] != string(toolFailureRBAC) || forbidden["retry_scope"] != string(RetryScopeCurrentPhase) {
 		t.Fatalf("forbidden annotations = %#v", forbidden)
 	}
 

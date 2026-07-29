@@ -5,52 +5,27 @@ import (
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/protocol"
 )
-
-func TestConsumePhaseProgressRejectsMixedOutputBeforePhaseAdvance(t *testing.T) {
-	loop := &Loop{
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps: []phaseStep{
-				{Index: 1, Name: "guided_diagnosis", AllowedNext: []string{"response_synthesis"}},
-				{Index: 2, Name: "response_synthesis"},
-			},
-			Completed: map[int]bool{},
-		},
-	}
-	loop.transitionControl(RuntimeControlAwaitingGuidedPhaseProgress)
-
-	_, handled := loop.consumePhaseProgress([]gollm.FunctionCall{
-		{Name: internalPhaseProgressCall, Arguments: map[string]any{"phase_completed": 1, "next_phase": "response_synthesis"}},
-		{Name: "kubectl", Arguments: map[string]any{"command": "kubectl get pods"}},
-	})
-	if !handled {
-		t.Fatal("mixed phase_progress output should be rejected")
-	}
-	if got := loop.phaseStepState.CurrentPhaseIndex; got != 1 {
-		t.Fatalf("current phase = %d, want unchanged phase 1", got)
-	}
-	if loop.control != RuntimeControlAwaitingGuidedPhaseProgress {
-		t.Fatalf("control = %s, want guided phase progress", loop.control)
-	}
-}
 
 func TestConsumePhaseProgressRejectsIncompleteGuidedDiagnosis(t *testing.T) {
 	loop := &Loop{
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps: []phaseStep{
-				{Index: 1, Name: "guided_diagnosis", AllowedNext: []string{"response_synthesis"}},
-				{Index: 2, Name: "response_synthesis"},
+		runtimeState: &runtimeState{
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 1,
+				PhaseSteps: []phaseStep{
+					{Index: 1, Name: "guided_diagnosis", AllowedNext: []string{"response_synthesis"}},
+					{Index: 2, Name: "response_synthesis"},
+				},
+				Completed: map[int]bool{},
 			},
-			Completed: map[int]bool{},
+			guideStepState: &guideStepState{TotalSteps: 2, Completed: map[int]bool{1: true}},
 		},
-		guideStepState: &guideStepState{TotalSteps: 2, Completed: map[int]bool{1: true}},
 	}
 	loop.transitionControl(RuntimeControlAwaitingGuidedDiagnosisStep)
 
 	_, handled := loop.consumePhaseProgress([]gollm.FunctionCall{{
-		Name: internalPhaseProgressCall,
+		Name: protocol.PhaseProgressCall,
 		Arguments: map[string]any{
 			"phase_completed": 1,
 			"next_phase":      "response_synthesis",
@@ -59,7 +34,7 @@ func TestConsumePhaseProgressRejectsIncompleteGuidedDiagnosis(t *testing.T) {
 	if !handled {
 		t.Fatal("incomplete guided_diagnosis must be rejected")
 	}
-	if got := loop.phaseStepState.CurrentPhaseIndex; got != 1 {
+	if got := loop.mutableRuntime().phaseStepState.CurrentPhaseIndex; got != 1 {
 		t.Fatalf("current phase = %d, want unchanged guided_diagnosis", got)
 	}
 }
@@ -171,10 +146,14 @@ func TestPhasePlanValidRejectsDuplicateOptionalExplicitStepRefs(t *testing.T) {
 }
 
 func TestValidatePhasePlanForRequestRequiresMutationVerification(t *testing.T) {
-	loop := &Loop{requirementAnalysis: &requirementAnalysis{
-		RequestType: "mutation",
-		Action:      "create_configmap",
-	}}
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			requirementAnalysis: &requirementAnalysis{
+				RequestType: "mutation",
+				Action:      "create_configmap",
+			},
+		},
+	}
 	plan := phasePlan{
 		RequestGoal:       "create configmap",
 		CurrentPhaseIndex: 1,
@@ -198,11 +177,13 @@ func TestValidatePhasePlanForRequestRequiresMutationVerification(t *testing.T) {
 
 func TestValidatePhasePlanForReadOnlyRequestDoesNotRequireMutationVerification(t *testing.T) {
 	loop := &Loop{
-		cfg: &config.Config{ReadOnly: true},
-		requirementAnalysis: &requirementAnalysis{
-			RequestType: "mutation",
-			Action:      "create_configmap",
+		runtimeState: &runtimeState{
+			requirementAnalysis: &requirementAnalysis{
+				RequestType: "mutation",
+				Action:      "create_configmap",
+			},
 		},
+		cfg: &config.Config{ReadOnly: true},
 	}
 	plan := phasePlan{
 		RequestGoal:       "explain read-only limitation",
@@ -217,7 +198,11 @@ func TestValidatePhasePlanForReadOnlyRequestDoesNotRequireMutationVerification(t
 }
 
 func TestValidatePhasePlanForRequestRejectsGuidanceWithoutCRD(t *testing.T) {
-	loop := &Loop{resourceClassification: &resourceClassification{Kind: resourceClassificationBuiltin}}
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			resourceClassification: &resourceClassification{Kind: resourceClassificationBuiltin},
+		},
+	}
 	plan := phasePlan{
 		RequestGoal:       "diagnose pod",
 		CurrentPhaseIndex: 1,
@@ -232,17 +217,21 @@ func TestValidatePhasePlanForRequestRejectsGuidanceWithoutCRD(t *testing.T) {
 		t.Fatalf("expected guidance rejection for built-in resource, got %#v", result)
 	}
 
-	loop.resourceClassification = &resourceClassification{Kind: resourceClassificationCRD}
+	loop.mutableRuntime().resourceClassification = &resourceClassification{Kind: resourceClassificationCRD}
 	if result := loop.validatePhasePlanForRequest(plan); !result.Valid {
 		t.Fatalf("expected guidance phases after CRD classification, got %#v", result)
 	}
 }
 
 func TestValidatePhasePlanForRequestAllowsLightweightLookup(t *testing.T) {
-	loop := &Loop{requirementAnalysis: &requirementAnalysis{
-		RequestType: "lookup",
-		Action:      "count_pods",
-	}}
+	loop := &Loop{
+		runtimeState: &runtimeState{
+			requirementAnalysis: &requirementAnalysis{
+				RequestType: "lookup",
+				Action:      "count_pods",
+			},
+		},
+	}
 	plan := phasePlan{
 		RequestGoal:       "count pods",
 		CurrentPhaseIndex: 1,

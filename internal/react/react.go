@@ -25,44 +25,50 @@ type StepKind = coordinator.StepKind
 type StepStatus = coordinator.StepStatus
 
 const (
-	RuntimeControlUnset                                = coordinator.RuntimeControlUnset
-	RuntimeControlAwaitingUserQuery                    = coordinator.RuntimeControlAwaitingUserQuery
-	RuntimeControlAwaitingRequirementAnalysis          = coordinator.RuntimeControlAwaitingRequirementAnalysis
-	RuntimeControlAwaitingPhasePlan                    = coordinator.RuntimeControlAwaitingPhasePlan
-	RuntimeControlAwaitingModelStep                    = coordinator.RuntimeControlAwaitingModelStep
-	RuntimeControlAwaitingResourceGuideLookup          = coordinator.RuntimeControlAwaitingResourceGuideLookup
-	RuntimeControlAwaitingGuidedDiagnosisStep          = coordinator.RuntimeControlAwaitingGuidedDiagnosisStep
-	RuntimeControlAwaitingGuidedPhaseProgress          = coordinator.RuntimeControlAwaitingGuidedPhaseProgress
-	RuntimeControlAwaitingFinalReport                  = coordinator.RuntimeControlAwaitingFinalReport
-	RuntimeControlAwaitingNextDirections               = coordinator.RuntimeControlAwaitingNextDirections
-	RuntimeControlAwaitingContinuationChoice           = coordinator.RuntimeControlAwaitingContinuationChoice
-	RuntimeControlAwaitingContinuationText             = coordinator.RuntimeControlAwaitingContinuationText
-	RuntimeControlAwaitingApproval                     = coordinator.RuntimeControlAwaitingApproval
-	RuntimeControlExecutingTool                        = coordinator.RuntimeControlExecutingTool
-	RuntimeControlAwaitingMutationVerificationEvidence = coordinator.RuntimeControlAwaitingMutationVerificationEvidence
-	RuntimeControlAwaitingMutationVerificationResult   = coordinator.RuntimeControlAwaitingMutationVerificationResult
-	RuntimeControlAwaitingMutationContinuation         = coordinator.RuntimeControlAwaitingMutationContinuation
-	RuntimeControlExited                               = coordinator.RuntimeControlExited
+	RuntimeControlUnset                                     = coordinator.RuntimeControlUnset
+	RuntimeControlAwaitingUserQuery                         = coordinator.RuntimeControlAwaitingUserQuery
+	RuntimeControlAwaitingRequirementAnalysis               = coordinator.RuntimeControlAwaitingRequirementAnalysis
+	RuntimeControlAwaitingPhasePlan                         = coordinator.RuntimeControlAwaitingPhasePlan
+	RuntimeControlAwaitingModelStep                         = coordinator.RuntimeControlAwaitingModelStep
+	RuntimeControlAwaitingResourceGuideLookup               = coordinator.RuntimeControlAwaitingResourceGuideLookup
+	RuntimeControlAwaitingGuidedDiagnosisStep               = coordinator.RuntimeControlAwaitingGuidedDiagnosisStep
+	RuntimeControlAwaitingGuidedPhaseProgress               = coordinator.RuntimeControlAwaitingGuidedPhaseProgress
+	RuntimeControlAwaitingFinalReport                       = coordinator.RuntimeControlAwaitingFinalReport
+	RuntimeControlAwaitingNextDirections                    = coordinator.RuntimeControlAwaitingNextDirections
+	RuntimeControlAwaitingContinuationChoice                = coordinator.RuntimeControlAwaitingContinuationChoice
+	RuntimeControlAwaitingContinuationText                  = coordinator.RuntimeControlAwaitingContinuationText
+	RuntimeControlAwaitingApproval                          = coordinator.RuntimeControlAwaitingApproval
+	RuntimeControlAwaitingToolResult                        = coordinator.RuntimeControlAwaitingToolResult
+	RuntimeControlAwaitingMutationVerificationEvidence      = coordinator.RuntimeControlAwaitingMutationVerificationEvidence
+	RuntimeControlAwaitingMutationVerificationResult        = coordinator.RuntimeControlAwaitingMutationVerificationResult
+	RuntimeControlAwaitingMutationVerificationChainEvidence = coordinator.RuntimeControlAwaitingMutationVerificationChainEvidence
+	RuntimeControlAwaitingMutationVerificationChainResult   = coordinator.RuntimeControlAwaitingMutationVerificationChainResult
+	RuntimeControlAwaitingMutationContinuation              = coordinator.RuntimeControlAwaitingMutationContinuation
+	RuntimeControlAwaitingContinuationHandoff               = coordinator.RuntimeControlAwaitingContinuationHandoff
+	RuntimeControlExited                                    = coordinator.RuntimeControlExited
 
 	// Compatibility aliases preserve the facade used before the package split.
-	ControlIdle                                 = RuntimeControlUnset
-	ControlAwaitingUserQuery                    = RuntimeControlAwaitingUserQuery
-	ControlAwaitingRequirementAnalysis          = RuntimeControlAwaitingRequirementAnalysis
-	ControlAwaitingPhasePlan                    = RuntimeControlAwaitingPhasePlan
-	ControlAwaitingModelStep                    = RuntimeControlAwaitingModelStep
-	ControlAwaitingResourceGuideLookup          = RuntimeControlAwaitingResourceGuideLookup
-	ControlAwaitingGuidedDiagnosisStep          = RuntimeControlAwaitingGuidedDiagnosisStep
-	ControlAwaitingGuidedPhaseProgress          = RuntimeControlAwaitingGuidedPhaseProgress
-	ControlAwaitingFinalReport                  = RuntimeControlAwaitingFinalReport
-	ControlAwaitingNextDirections               = RuntimeControlAwaitingNextDirections
-	ControlAwaitingContinuationChoice           = RuntimeControlAwaitingContinuationChoice
-	ControlAwaitingContinuationText             = RuntimeControlAwaitingContinuationText
-	ControlAwaitingApproval                     = RuntimeControlAwaitingApproval
-	ControlExecutingTool                        = RuntimeControlExecutingTool
-	ControlAwaitingMutationVerificationEvidence = RuntimeControlAwaitingMutationVerificationEvidence
-	ControlAwaitingMutationVerificationResult   = RuntimeControlAwaitingMutationVerificationResult
-	ControlAwaitingMutationContinuation         = RuntimeControlAwaitingMutationContinuation
-	ControlExited                               = RuntimeControlExited
+	ControlIdle                                      = RuntimeControlUnset
+	ControlAwaitingUserQuery                         = RuntimeControlAwaitingUserQuery
+	ControlAwaitingRequirementAnalysis               = RuntimeControlAwaitingRequirementAnalysis
+	ControlAwaitingPhasePlan                         = RuntimeControlAwaitingPhasePlan
+	ControlAwaitingModelStep                         = RuntimeControlAwaitingModelStep
+	ControlAwaitingResourceGuideLookup               = RuntimeControlAwaitingResourceGuideLookup
+	ControlAwaitingGuidedDiagnosisStep               = RuntimeControlAwaitingGuidedDiagnosisStep
+	ControlAwaitingGuidedPhaseProgress               = RuntimeControlAwaitingGuidedPhaseProgress
+	ControlAwaitingFinalReport                       = RuntimeControlAwaitingFinalReport
+	ControlAwaitingNextDirections                    = RuntimeControlAwaitingNextDirections
+	ControlAwaitingContinuationChoice                = RuntimeControlAwaitingContinuationChoice
+	ControlAwaitingContinuationText                  = RuntimeControlAwaitingContinuationText
+	ControlAwaitingApproval                          = RuntimeControlAwaitingApproval
+	ControlAwaitingToolResult                        = RuntimeControlAwaitingToolResult
+	ControlAwaitingMutationVerificationEvidence      = RuntimeControlAwaitingMutationVerificationEvidence
+	ControlAwaitingMutationVerificationResult        = RuntimeControlAwaitingMutationVerificationResult
+	ControlAwaitingMutationVerificationChainEvidence = RuntimeControlAwaitingMutationVerificationChainEvidence
+	ControlAwaitingMutationVerificationChainResult   = RuntimeControlAwaitingMutationVerificationChainResult
+	ControlAwaitingMutationContinuation              = RuntimeControlAwaitingMutationContinuation
+	ControlAwaitingContinuationHandoff               = RuntimeControlAwaitingContinuationHandoff
+	ControlExited                                    = RuntimeControlExited
 
 	InputOwnerOrchestrator = coordinator.InputOwnerOrchestrator
 	InputOwnerReactChoice  = coordinator.InputOwnerReactChoice
@@ -82,21 +88,26 @@ const (
 	InputHandlerReactApproval    = coordinator.InputHandlerReactApproval
 	InputHandlerUserQuery        = coordinator.InputHandlerUserQuery
 
-	PhasePending   = coordinator.PhasePending
-	PhaseActive    = coordinator.PhaseActive
-	PhaseCompleted = coordinator.PhaseCompleted
-	PhaseSkipped   = coordinator.PhaseSkipped
+	PhasePending    = coordinator.PhasePending
+	PhaseActive     = coordinator.PhaseActive
+	PhaseCompleted  = coordinator.PhaseCompleted
+	PhaseSkipped    = coordinator.PhaseSkipped
+	PhaseSuperseded = coordinator.PhaseSuperseded
 
 	StepGeneralAction               = coordinator.StepGeneralAction
+	StepLightweightLookup           = coordinator.StepLightweightLookup
 	StepExplicitPhase               = coordinator.StepExplicitPhase
 	StepResourceGuideDiagnostic     = coordinator.StepResourceGuideDiagnostic
 	StepMutationEvidenceRequirement = coordinator.StepMutationEvidenceRequirement
 
-	StepPending   = coordinator.StepPending
-	StepActive    = coordinator.StepActive
-	StepCompleted = coordinator.StepCompleted
-	StepSkipped   = coordinator.StepSkipped
-	StepRetrying  = coordinator.StepRetrying
+	StepPending    = coordinator.StepPending
+	StepActive     = coordinator.StepActive
+	StepCompleted  = coordinator.StepCompleted
+	StepAchieved   = coordinator.StepAchieved
+	StepBlocked    = coordinator.StepBlocked
+	StepSkipped    = coordinator.StepSkipped
+	StepRetrying   = coordinator.StepRetrying
+	StepSuperseded = coordinator.StepSuperseded
 )
 
 func New(cfg *config.Config) (*Loop, error) {

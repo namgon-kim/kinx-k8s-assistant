@@ -22,36 +22,33 @@
 
 ### BUG-2. delete mutation verification이 NotFound에서 deadlock될 수 있음
 
+- Status: RESOLVED
 - Severity: HIGH
-- Area: `internal/react/coordinator/iteration.go`, `internal/react/flow/verification`, `internal/react/session/verification.go`
+- Area: `internal/react/coordinator/iteration.go`, `internal/react/flow/verification`, `internal/react/coordinator/state.go`
 - Scenario: 사용자가 "prod 네임스페이스 web 파드 삭제해줘"라고 요청한다. 모델이 `kubectl delete pod web -n prod`를 제안하고 사용자가 승인한다. 삭제는 성공한다.
-- What happens: runtime은 direct-effect requirement를 만들고 `kubectl get pod web -n prod -o yaml` 같은 검증 command를 요구한다. 삭제가 성공했으므로 검증 command는 NotFound/error를 반환한다. requirement satisfaction은 `toolResultSucceeded(result)`가 true일 때만 기록되므로 NotFound는 만족으로 처리되지 않는다. 이름 `web`이 포함된 다른 command도 계속 NotFound가 되고, 이름 없는 command는 requirement matching에서 거부될 수 있다.
-- Why wrong: 삭제의 성공 증거는 객체가 사라진 것인데, 현재 검증 성공 판정은 generic tool success/error만 본다.
-- Impact: `AwaitingResult`로 진입하지 못하고 MaxIterations까지 소진될 수 있다.
+- Resolution: active verification command의 Kubernetes `NotFound`, `Forbidden`, `Unauthorized` 응답은 observation으로 기록한다. NotFound는 state-bearing evidence이고 Forbidden/Unauthorized는 access blocker다. Access blocker는 `failed` 판단에는 사용할 수 있지만 `satisfied`/`waiting`을 성립시키지 못한다.
 
 ### BUG-3. exec/run/cp/debug/attach/apply -k target extraction이 잘못된 verification requirement를 만들 수 있음
 
+- Status: RESOLVED for mutation verification
 - Severity: MEDIUM
 - Area: `internal/react/coordinator/execution.go`, `internal/react/coordinator/iteration.go`, `internal/react/kube/resource.go`, `internal/react/flow/verification`
 - Scenario A: 사용자가 "kustomize overlay 반영해줘"라고 요청하고 모델이 `kubectl apply -k ./overlays/prod`를 실행한다.
 - Scenario B: 사용자가 "이 파드에서 명령 실행해줘"라고 요청하고 모델이 `kubectl exec mypod -- ...`를 실행한다.
-- What happens: `isKubectlApplyFileCommand`는 `-f/--filename`만 파일 apply 예외로 본다. `-k`는 예외가 아니므로 `./overlays/prod`가 resource kind처럼 추출될 수 있다. `exec`, `run`, `cp`, `debug`, `attach`에서도 첫 위치 인자의 의미가 verb별로 다른데 `firstKubectlResourceArg`는 이를 구분하지 않는다.
-- Why wrong: mutating kubectl verb의 인자 형태를 verb별로 해석하지 않고 공통 위치 인자 추출로 처리한다.
-- Impact: 매칭 불가능하거나 의미 없는 verification requirement가 생겨 verification deadlock으로 이어질 수 있다.
+- Resolution: mutation verification은 command 위치 인자에서 resource/name을 추론하지 않는다. Single mutation은 실행 전에 concrete action target이 필요하고 ordered check는 action target을 상속하거나 concrete override를 선언한다. `firstKubectlResourceArg` 계열 helper는 namespace/command safety gate에만 남아 있으며 verification requirement를 만들지 않는다.
 
 ### BUG-5. shim mode에서 structured ack가 native FunctionCallResult로 주입됨
 
+- Status: RESOLVED
 - Severity: HIGH
 - Area: `internal/react/coordinator/iteration.go`, `internal/react/protocol`
 - Scenario: shim mode provider에서 resource guide 진단 또는 mutation verification을 사용한다. 모델이 `guide_progress` 또는 `mutation_verification_result`를 JSON shim으로 반환한다.
-- What happens: `consumeGuideProgress`와 `consumeMutationVerificationResult`가 shim 여부와 무관하게 `gollm.FunctionCallResult{ID: call.ID}`를 history에 append한다. shim synthetic call은 ID가 비어 있을 수 있어 다음 provider 요청에 선행 tool_use 없는 tool_result가 포함될 수 있다.
-- Why wrong: `appendToolObservation`에는 shim일 때 문자열로 기록하는 분기가 있지만, 이 두 structured consumer에는 같은 분기가 없다.
-- Impact: Anthropic-style shim 요청이 malformed될 수 있다.
+- Resolution: 모든 structured ack는 `appendFunctionCallResult`를 사용한다. Shim mode는 문자열 observation으로, native mode는 `gollm.FunctionCallResult`로 기록한다.
 
 ### BUG-6. correction dedup이 복구 후에도 유지되어 조기 종료할 수 있음
 
 - Severity: MEDIUM
-- Area: `internal/react/coordinator/loop.go`, `internal/react/coordinator/iteration.go`, `internal/react/session/context.go`
+- Area: `internal/react/coordinator/loop.go`, `internal/react/coordinator/iteration.go`, `internal/react/coordinator/state.go`
 - Scenario: 긴 진단 중 모델이 한 번 잘못된 `phase_progress`를 내고 runtime correction 후 정상 복구한다. 여러 iteration 뒤 동일한 종류의 실수를 다시 한다.
 - What happens: `contextBlockHashes`가 query 내내 유지되어 같은 `(code, message)` correction이 다시 발생하면 `appendContextBlock`이 false를 반환할 수 있다. 이 경우 즉시 "반복되어 진단 중단" 경로로 갈 수 있다.
 - Why wrong: 모델이 correction을 무시하고 즉시 반복한 경우와, 정상 복구 후 독립적으로 재발한 경우를 구분하지 않는다.
@@ -76,11 +73,11 @@
 
 ### BUG-9. progressing/unresolved mutation result가 recheck를 재무장하지 않음
 
+- Status: RESOLVED
 - Severity: MEDIUM
-- Area: `internal/react/coordinator/iteration.go`, `internal/react/flow/verification`, `internal/react/session/verification.go`
+- Area: `internal/react/coordinator/iteration.go`, `internal/react/flow/verification`, `internal/react/coordinator/state.go`
 - Scenario: 사용자가 deployment scale/remediation을 승인한다. 변경 후 검증했더니 rollout이 아직 진행 중이라 모델이 `mutation_verification_result.status=progressing`을 반환한다.
-- Missing logic: `progressing`/`unresolved` 이후 `mutationContinuationRequired`로 action 한 번은 강제하지만, 다음 successful observation 하나면 flag가 clear된다. 같은 mutation에 대한 `pendingMutationVerification`과 `AwaitingResult`가 다시 만들어지지 않아 두 번째 verification result 요구로 이어지기 어렵다.
-- Impact: `maxMutationContinuationAttempts=3` recheck budget과 "resolved 될 때까지 recheck" 계약이 실질적으로 강제되지 않는다.
+- Resolution: mutation action은 `mode=await_state`를 미리 선언한다. `waiting` result는 같은 VerificationID와 AttemptID를 유지하고 runtime wait 후 같은 check를 재무장한다. 각 result는 최신 observation을 참조해야 한다.
 
 ### BUG-10. verification phase의 순서/역할 제약 검증이 없음
 
@@ -118,27 +115,29 @@
 
 ### BUG-14. mutation recheck budget exhausted branch is effectively dead
 
+- Status: RESOLVED
 - Severity: MEDIUM
 - Area: `internal/react/coordinator/iteration.go`, `internal/react/flow/verification`
 - Scenario: mutation verification이 계속 `progressing`이라 세 번 recheck 후 inconclusive report를 강제해야 한다.
-- What happens: BUG-9 때문에 단일 mutation에서는 `mutationContinuationAttempts`가 1을 넘기 어렵다. 같은 mutation에 대해 두 번째 `mutation_verification_result`가 요구되지 않으면 budget exhausted branch도 실행되지 않는다.
-- Why wrong: recheck budget을 둔 목적은 외부 상태가 안정되지 않을 때 deterministic하게 inconclusive report로 닫기 위함인데, 현재 흐름에서는 그 분기가 실질적으로 죽어 있다.
+- Resolution: await-state check는 request-fixed verification evidence budget에서 계산한 bounded recheck counter를 직접 증가시킨다. 기본값은 initial observation 1회와 recheck 5회이며, 소진 시 mutation attempt를 unknown으로 닫고 mutation 자동 반복 없이 다른 safe strategy 또는 inconclusive 종료로 전환한다.
 
 ### BUG-15. choiceInputYesNo path is production-dead and bypass-prone if reintroduced
 
+- Status: RESOLVED
 - Severity: LOW / latent
 - Area: `internal/orchestrator/orchestrator.go`, `internal/react/coordinator/input.go`
 - Scenario: 현재 approval과 continuation choice는 모두 numbered `UserChoiceRequest`로 렌더링된다. agent prompt 중 `(y/n)` 문자열을 쓰는 production `UserChoiceRequest`는 보이지 않는다.
-- What happens: `choiceInputYesNo` 판정과 y/n remapping은 테스트 외 production에서 실행될 가능성이 낮다. 재도입되면 `choiceInputAccepted`가 `decision.Accepted`를 보지 않고 `inputKind == InputApproval`만으로 통과시켜 `DecideInputDispatch` gate를 우회할 수 있다.
-- Why wrong: dead path가 다시 활성화될 때 input owner/control-state gate와 어긋날 수 있다.
+- Resolution: `UserChoiceRequest`는 번호 입력만 사용하고 `DecideInputDispatch`가
+  `InputHandlerReactChoice`를 허용한 경우에만 전달한다. 문자열 `(y/n)` 감지와 remapping은 제거했다.
 
 ### BUG-16. guideProgressAllowedForCurrentPhase nil-phase branch is dead but unsafe
 
+- Status: RESOLVED
 - Severity: LOW / latent
 - Area: `internal/react/coordinator/iteration.go`, `internal/react/flow/guidance`
 - Scenario: resource guide가 정상 주입되면 `guideStepState`는 `guided_diagnosis` phase 진입과 함께 설정된다.
-- What happens: 이 invariant가 유지되는 동안 `guideProgressAllowedForCurrentPhase`의 `phaseStepState == nil -> true` branch는 실행될 일이 없다. 하지만 향후 리팩터링으로 `guideStepState`만 남고 `phaseStepState`가 nil이 되면 guide progress를 허용한다.
-- Why wrong: nil phase state는 "허용"보다 "불변식 위반"에 가깝다. dead branch가 향후 오작동의 fail-open 지점이 될 수 있다.
+- Resolution: `guideStepState` 또는 `phaseStepState`가 없으면 fail-closed 처리하고, 현재 phase가
+  `guided_diagnosis`일 때만 guide progress를 허용한다.
 
 ## 4. read-only classifier items covered by kubectl-readonly replacement
 
@@ -202,7 +201,7 @@
 ### BUG-24. follow-up all-namespaces intent can be overwritten by prior namespace
 
 - Severity: MEDIUM
-- Area: `internal/react/coordinator/iteration.go`, `internal/react/flow/request`, `internal/react/session/context.go`
+- Area: `internal/react/coordinator/iteration.go`, `internal/react/flow/request`, `internal/react/coordinator/state.go`
 - Scenario: 직전 요청이 `tenant-a` namespace의 cluster 진단이었다. 다음에 사용자가 "이번엔 모든 namespace에서 관련 pod를 확인해줘"라고 한다. 모델이 `scope.namespace="all_namespaces"`로 표현하지만 `scope.type="all_namespaces"`는 빠뜨린다.
 - Evidence: `requirementAnalysisFromFunctionCall`은 `scope.namespace`가 all-namespaces 값이면 `analysis.Scope.Namespace`를 비워 둔다. 이후 prior context merge에서 `analysis.Scope.Namespace`가 비어 있으면 이전 namespace를 다시 채운다. `requestContextFromRequirementAnalysis`의 all-namespaces 보정은 `scope.type=="all_namespaces"`일 때만 확실히 동작한다.
 - Why wrong: explicit all-namespaces intent가 namespace 값 표현으로 들어온 경우, follow-up defaulting이 이를 "namespace 없음"으로 오해한다.

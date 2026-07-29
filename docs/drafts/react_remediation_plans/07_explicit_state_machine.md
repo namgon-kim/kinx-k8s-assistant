@@ -1,14 +1,13 @@
 # Plan 07: Explicit State Machine
 
-> 상태: 패키지 경계와 enum 도입 완료, source-of-truth 이전은 부분 구현됨.
+> 상태: 구현됨.
 >
 > 현재 enum/event/effect/structured contract는 `internal/react/contract`, mutable state는
 > `internal/react/session`, 실행 조정은 `internal/react/coordinator`로 분리됐다.
 > `RuntimeSnapshot.Control`, input dispatch decision, runtime-state anchor, cleanup policy도
-> 반영됐다. 다만 `coordinator.Loop`에 기존 request/phase/guide/verification 필드와
-> package-local compatibility control이 남아 있어 `session.State` 단일 소유권 이전은
-> 후속 cleanup으로 남아 있다. 아래의 옛 단일-package 경로와 필드 목록은 이전 구조를
-> 설명하는 설계 이력으로 읽는다.
+> 반영됐다. `Loop`의 package-local mutable mirror는 제거됐고 request/phase/guide/verification
+> 값은 `session.Aggregate[runtimeState]`가 소유하는 하나의 revisioned root에 있다.
+> 아래의 옛 단일-package 경로, flag 목록과 단계별 제안은 이전 구조와 migration 이력으로 읽는다.
 
 ## 목적
 
@@ -28,7 +27,7 @@
 
 ## 왜 07이 필요한가
 
-현재 `react.Loop`에는 `State` enum이 있지만 실제 제어 의미는 여러 필드 조합에서 나온다.
+리팩터링 전 `react.Loop`에는 `State` enum이 있었지만 실제 제어 의미는 여러 필드 조합에서 나왔다.
 
 예:
 
@@ -131,7 +130,7 @@ const (
 관련 필드:
 
 - `pendingCalls`
-- `skipPermissions`
+- command risk 기반 exact approval state. 영구 skip state는 두지 않는다.
 - `pendingMutationVerification`
 - `mutationContinuationRequired`
 - `pendingResponseDirective`
@@ -146,7 +145,7 @@ const (
 점검 필요:
 
 - approval이 verification을 우회하지 않는가?
-- `yes_and_dont_ask_me_again`도 verification은 우회하지 않는가?
+- `risk.risky=false`도 read-only, target, verification을 우회하지 않는가?
 - target 없는 successful `kubectl apply -f ...` 정책이 state machine에서 별도 예외로 명시되는가?
 - 여러 mutation이 하나의 목표를 이룰 때 verification requirement가 누적되는가?
 - verification evidence가 unresolved인데 conclusive final report로 닫히지 않는가?
@@ -279,9 +278,11 @@ const (
     ControlAwaitingFinalReport ControlState = "awaiting_final_report"
     ControlAwaitingNextDirections ControlState = "awaiting_next_directions"
     ControlAwaitingApproval ControlState = "awaiting_approval"
-    ControlExecutingTool ControlState = "executing_tool"
+    ControlAwaitingToolResult ControlState = "awaiting_tool_result"
     ControlAwaitingMutationVerificationEvidence ControlState = "awaiting_mutation_verification_evidence"
     ControlAwaitingMutationVerificationResult ControlState = "awaiting_mutation_verification_result"
+    ControlAwaitingMutationVerificationChainEvidence ControlState = "awaiting_mutation_verification_chain_evidence"
+    ControlAwaitingMutationVerificationChainResult ControlState = "awaiting_mutation_verification_chain_result"
     ControlAwaitingMutationContinuation ControlState = "awaiting_mutation_continuation"
     ControlAwaitingContinuationChoice ControlState = "awaiting_continuation_choice"
     ControlAwaitingContinuationText ControlState = "awaiting_continuation_text"
@@ -296,7 +297,8 @@ const (
 - `ControlAwaitingGuidedDiagnosisStep`는 top-level phase가 아니다. `guided_diagnosis` phase 내부 nested state다. 이 상태는 `guide_progress` object만 기다린다는 뜻이 아니라, 다음 guide step을 진행하는 `action` 또는 관찰 후 `guide_progress`를 기다린다는 뜻이다.
 - `ControlAwaitingMutationVerificationEvidence`도 top-level phase가 아니다. mutation lifecycle gate다.
 - `ControlAwaitingMutationContinuation`은 `progressing`/`unresolved` result 이후 계속 진단해야 하는 상태다.
-- `ControlExecutingTool`은 `dispatchToolCalls` 동기 실행 구간에서 published snapshot에 표시된다.
+- `ControlAwaitingToolResult`는 immutable dispatch intent가 commit된 뒤 tool result reconciliation이
+  끝날 때까지 published snapshot에 표시된다. 외부 tool은 이 committed state 이후에만 실행된다.
 - `ControlComplete`는 "요청이 막 끝났다"는 전이 이벤트에 가깝다. 현재 코드의 안정 상태로는 `StateDone`이 곧 `ControlAwaitingUserQuery`로 해석된다.
 
 ## 제안 RuntimeState
@@ -341,7 +343,7 @@ type RuntimeState struct {
 제안 우선순위:
 
 1. `StateExited` -> `ControlExited`
-2. `toolDispatchInProgress` -> `ControlExecutingTool`
+2. committed pending dispatch -> `ControlAwaitingToolResult`
 3. `StateWaitingApproval` -> `ControlAwaitingApproval`
 4. `StateWaitingDirectionChoice` -> `ControlAwaitingContinuationChoice`
 5. `StateWaitingDirectionText` -> `ControlAwaitingContinuationText`
@@ -402,15 +404,14 @@ type RuntimeState struct {
 | From | Event | To | Notes |
 | --- | --- | --- | --- |
 | `ControlAwaitingModelStep` | mutating action proposed | `ControlAwaitingApproval` | read-only mode면 mutation lifecycle 시작 전 차단. |
-| `ControlAwaitingApproval` | approved | `ControlExecutingTool` | 승인된 command만 실행. |
-| `ControlExecutingTool` | successful mutation with targets | `ControlAwaitingMutationVerificationEvidence` | requirement 생성/merge. |
-| `ControlExecutingTool` | successful targetless `kubectl apply -f ...` with all apply results successful | `ControlAwaitingModelStep` | 정책상 apply output 자체를 evidence로 보고 추가 generic verification 없음. |
-| `ControlAwaitingMutationVerificationEvidence` | read-only evidence collected, remaining exists | same | 다음 evidence 요구. |
-| `ControlAwaitingMutationVerificationEvidence` | all requirements satisfied | `ControlAwaitingMutationVerificationResult` | 바로 final report 금지. |
-| `ControlAwaitingMutationVerificationResult` | `resolved` | `ControlAwaitingModelStep` | phase_progress/final_report 가능. |
-| `ControlAwaitingMutationVerificationResult` | `progressing` | `ControlAwaitingMutationContinuation` | wait/recheck 또는 다음 observation. |
-| `ControlAwaitingMutationVerificationResult` | `unresolved` | `ControlAwaitingMutationContinuation` | 다른 진단/수정 접근. |
-| `ControlAwaitingMutationContinuation` | useful action result | `ControlAwaitingModelStep` or `ControlAwaitingMutationVerificationEvidence` | 추가 mutation이면 verification 재진입. |
+| `ControlAwaitingApproval` | approved and dispatch intent committed | `ControlAwaitingToolResult` | 승인 payload hash와 attempt를 먼저 commit한 command만 실행. |
+| `ControlAwaitingToolResult` | successful mutation with single verification | `ControlAwaitingMutationVerificationEvidence` | 같은 AttemptID 아래 direct check 하나를 활성화. |
+| `ControlAwaitingToolResult` | successful mutation with ordered chain | `ControlAwaitingMutationVerificationChainEvidence` | chain의 current check 하나만 활성화. |
+| mutation evidence control | read-only evidence collected | corresponding mutation result control | 바로 final report 금지. |
+| single/chain result control | `satisfied` and chain remains | `ControlAwaitingMutationVerificationChainEvidence` | 다음 ordered check 활성화. |
+| single/chain result control | final `satisfied` | `ControlAwaitingModelStep` | mutation attempt 완료 후 다음 declared plan step 진행. |
+| single/chain result control | `waiting` on `await_state` | corresponding evidence control | runtime wait 후 같은 VerificationID 재확인. |
+| single/chain result control | `failed` or recheck budget exhausted | `ControlAwaitingMutationContinuation` | mutation 자동 반복 없이 다른 안전 전략 요구. |
 
 ### Final / Continuation
 
@@ -583,7 +584,7 @@ anchor := snapshot.AnchorText()
 - 같은 gate가 반복 correction 실패 시 terminal state로 이동한다.
 - gate가 block한 상태와 `ControlState`가 서로 모순되지 않는다.
 
-## 구현 순서
+## 구현 결과
 
 ## Implementation Status
 
@@ -592,20 +593,27 @@ anchor := snapshot.AnchorText()
 - `internal/react/react.go` facade와 `coordinator` implementation 경계를 만들었다.
 - `contract/enums.go`에 lifecycle, runtime control, phase, step, input enum을 분리했다.
 - `contract/structured.go`, `action.go`, `snapshot.go`에 공유 payload/read model을 분리했다.
-- `session.State`에 control, phase, verification, context state container와 cleanup/snapshot API를 도입했다.
+- `session.Aggregate[runtimeState]`에 control, phase, verification, context와 goal execution ledger를
+  하나의 revisioned root로 묶었다. 초기 migration용 `session.State`/phase/verification/context
+  사본은 aggregate 전환 후 제거했다.
 - request/phase/guidance/verification/report/direction/gate 규칙을 `flow` 하위 package로 분류했다.
 - protocol, kube, prompt, provider, language 책임을 별도 package로 이동했다.
 - orchestrator는 facade의 `RuntimeControlState`와 input dispatch API를 사용한다.
 - 기존 외부 API는 facade alias로 유지해 package 이동이 호출자 변경으로 번지지 않게 했다.
+- `RuntimeControlState`가 model turn과 non-model input owner를 명시적으로 분류한다.
+- native/shim model output은 control별 policy를 domain consumer보다 먼저 통과한다.
+- model turn은 detached candidate에만 상태 effect를 적용하고 audit/CAS 성공 시 root를 한 번 교체한다.
+- request/tool/guidance I/O와 message/translation은 commit 이후 effect boundary에서 실행한다.
+- tool effect는 immutable dispatch intent와 attempt를 먼저 commit하고
+  `AwaitingToolResult`에서 reconciliation한다. 실행 결과를 commit하지 못한 mutation은 자동
+  재실행하지 않고 unknown observation/verification으로 복구한다.
+- bounded execution segment는 `AwaitingContinuationHandoff` model turn을 거쳐
+  `AwaitingContinuationChoice`로 이동하며 request/lineage/budget을 유지한다.
+- package-local test fixture도 같은 `runtimeState` root를 사용하며 별도 hydrate/dual-write 경로가 없다.
 
-아직 의도적으로 남긴 범위:
-
-- `coordinator.Loop`의 package-local `control`, `inputOwner`, request/phase/guide/verification
-  compatibility 필드는 아직 남아 있다.
-- 일부 runtime transition과 snapshot/anchor 계산은 `session.State`만 사용하지 않는다.
-- `coordinator/iteration.go`는 여러 flow의 integration과 기존 helper 로직을 함께 보유한다.
-- 따라서 `session.State` 단일 source of truth, transition invariant, effect-driven coordinator는
-  후속 cleanup 범위다.
+아래 Step 1-7은 모두 반영된 migration 순서다. `pendingResponseDirective`는 model 유도용
+context이며 control source of truth로 사용하지 않는다. `coordinator/iteration.go`에 integration
+helper가 남아 있는 것은 I/O orchestration 경계이며 mutable state mirror를 뜻하지 않는다.
 
 ### Step 1. Snapshot만 추가
 
@@ -725,8 +733,8 @@ anchor := snapshot.AnchorText()
 7. verification result `progressing`
    - Expected: `ControlAwaitingMutationContinuation`, final_report reject.
 
-8. targetless `kubectl apply -f file.yaml` 성공
-   - Expected: apply output success policy로 generic verification을 만들지 않음.
+8. targetless `kubectl apply -f file.yaml` 제안
+   - Expected: concrete target을 가진 ordered verification chain이 없으면 실행 전 reject.
 
 ### Guide/RAG
 
@@ -771,7 +779,7 @@ anchor := snapshot.AnchorText()
 - 이번 07 수정에서 모든 flag를 즉시 제거하지 않는다.
 - phase plan을 hierarchical phase graph로 바꾸지 않는다.
 - guide step을 top-level phase로 승격하지 않는다.
-- mutation verification checker를 모든 리소스에 강제하지 않는다.
+- runtime이 verification evidence의 의미를 대신 판정하지 않는다. Runtime은 target, ID, 최신 evidence, 순서와 budget만 검증한다.
 - incident guidance를 ReAct execution owner로 만들지 않는다.
 - prompt wording만으로 state 문제를 해결했다고 보지 않는다.
 
@@ -783,28 +791,30 @@ anchor := snapshot.AnchorText()
 - input ownership을 잘못 옮기면 slash meta command 또는 approval UX가 깨질 수 있다.
 - `pendingResponseDirective`를 너무 빨리 제거하면 context compaction 이후 모델 유도력이 약해질 수 있다.
 
-## 구현 전 최종 질문
+## 적용된 결정
 
-수정 전에 다음 결정을 코드로 고정해야 한다.
+구현에서 다음 결정을 고정했다.
 
 1. `ControlState`는 기존 `State`를 대체하지 않고 당분간 projection으로 둘 것인가?
-   - 권장: 예. 먼저 projection/snapshot으로 도입한다.
+   - `RuntimeControlState`를 authoritative obligation으로 사용하고 lifecycle/input owner는 여기서 파생한다.
 
 2. `pendingResponseDirective`는 source of truth인가, state에서 파생되는 설명인가?
-   - 권장: source of truth가 아니라 state에서 파생되는 설명으로 낮춘다. 단, compaction 대응을 위해 transition 기간에는 유지한다.
+   - source of truth가 아니라 control transition을 model에게 설명하는 bounded context다.
 
 3. `guidedPhaseProgressRequested`와 `finalReportRequested`가 동시에 true가 되면 어떤 것이 우선인가?
-   - 권장: mutation verification이 최우선이고, guide 완료 후에는 phase plan의 allowed_next에 따라 하나만 요구하도록 audit에서 금지한다.
+   - 별도 boolean request flag를 제거하고 서로 다른 explicit control state와 output policy로 분리했다.
+     Mutation verification obligation은 final/guidance output보다 우선한다.
 
 4. `inputOwner` atomic은 제거할 것인가?
-   - 권장: 바로 제거하지 않는다. 먼저 `ControlState` 기반 계산과 비교한 뒤 compatibility layer로 유지한다.
+   - 외부 알림용 atomic projection은 유지하지만 authoritative owner는 snapshot control에서 계산한다.
 
 5. transition 함수는 모든 field assignment를 즉시 감쌀 것인가?
-   - 권장: 아니다. 상태 위험도가 큰 지점부터 감싼다. mutation verification, guide completion, continuation input, approval부터 시작한다.
+   - top-level control은 `transitionControl`만 변경한다. Model turn의 연관 상태 변경은 detached
+     candidate 전체에 적용하고 audit/CAS로 원자 commit한다.
 
-## 문서 업데이트 대상
+## 함께 갱신된 문서
 
-07 구현이 진행되면 다음 문서도 같이 갱신해야 한다.
+현재 state model은 다음 문서와 동기화되어 있다.
 
 - `docs/architecture_orchestrator_react.md`
   - ReAct runtime state section

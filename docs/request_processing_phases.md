@@ -9,11 +9,12 @@ Related contracts:
 
 Current code ownership:
 
-- `internal/react/contract/structured.go`: immutable `PhasePlan`, `PhaseStep`, and `PhaseProgress` payloads;
-- `internal/react/flow/phase`: plan start, progress, and graph validation rules;
-- `internal/react/session/phase.go`: mutable accepted plan/current phase/completed-step state;
+- `internal/react/contract/structured.go`, `execution.go`: immutable phase payloads and stable goal/phase/step/criterion contracts;
+- `internal/react/flow/phase`: plan start, progress, graph validation, and plan-revision rules;
+- `internal/react/session/execution.go`: goal execution, attempt, observation, and correction ledger cloned under the revisioned runtime root;
+- `internal/react/coordinator/state.go`: the single revisioned runtime root containing accepted phase and request state;
 - `internal/react/flow/guidance` and `internal/react/flow/verification`: nested guide and mutation-verification decisions;
-- `internal/react/coordinator/iteration.go`: protocol consumption, compatibility adapters, and model-turn integration.
+- `internal/react/coordinator/iteration.go`, `execution_state.go`, `revision.go`: protocol consumption, execution-contract projection, plan revision, and model-turn integration.
 
 ## Core Principle
 
@@ -52,14 +53,15 @@ The current implementation uses the phase-owned guide entry path:
 
 1. `requirement_analysis` classifies intent, target, scope, and operational focus.
 2. The model emits a `phase_plan` made of ordered `phase_step` entries.
-3. Runtime stores the accepted phase plan and injects only the active `phase_step` anchor on each iteration.
-4. The model emits one action or one response for the active phase.
-5. The model reports `phase_progress` when the active `phase_step` is complete.
-6. Runtime records that completion, advances to the next `phase_step`, and injects the next phase anchor.
+3. Runtime stores the accepted phase plan, projects it to stable goal/phase/step/criterion IDs, fixes the request budget profile, and injects only the active execution anchor on each iteration.
+4. The model emits one action or one response for the active step. Runtime binds actions to the single active step. Command tools must declare `risk.risky`; only `risky=true` requires exact human approval. Accepted actions become immutable dispatch intents before execution and their attempts/observations remain under that lineage.
+5. The model reports `step_result` with existing observation IDs and criterion results when a non-lightweight step reaches `achieved`, `blocked`, or `replan_required`.
+6. Runtime accepts `phase_progress` only after the active phase's execution steps are achieved, then advances to a declared next phase.
 7. Runtime discovery classifies the accepted primary resource as built-in, CRD-backed, or unknown and exposes that eligibility to the model.
 8. The model decides whether to enter a guidance phase. Runtime does not automatically inject RAG only because a CRD was observed.
 9. If guidance is selected and injected, guide diagnostic steps become nested `guidance_step` entries inside the active `guided_diagnosis` phase.
-10. `final_report` closes the request after either ordinary phase completion or guided diagnosis completion.
+10. If new evidence invalidates the active or remaining graph, the model may emit one standalone `phase_plan_revision`; runtime validates its evidence reference, revision budget, lineage, history, and mandatory obligations before replacement.
+11. `final_report` closes the request after either ordinary phase completion or guided diagnosis completion.
 
 This removes the old shortcut:
 
@@ -115,6 +117,39 @@ The runtime stores this plan compactly. Each iteration should include only:
 - completed `phase_step` indices;
 - valid next `phase_step` names.
 
+The accepted plan is also projected to a request-local execution contract:
+
+- stable goal, phase, step, criterion, and lineage IDs are assigned by runtime;
+- exactly one execution step is active for ordinary actions;
+- the request-fixed budget profile supplies step, correction, verification-evidence, mutation-continuation, plan-revision, max-iteration, and closure-reserve limits;
+- every execution-approved action is first committed as an immutable dispatch intent and attempt; every reconciled result creates an observation record;
+- prompt anchors include only bounded recent attempts, linked observations, criterion outcomes, and recent prior-phase outcomes while the in-memory ledger remains complete.
+
+The model does not invent bookkeeping IDs for actions. Runtime derives the active step and may
+treat a model-supplied step reference only as an assertion. A conflicting assertion is rejected.
+Before closing a non-lightweight step, the model returns a standalone `step_result` using IDs from
+the execution anchor and evidence references that already exist in the observation ledger.
+
+## Plan Revision Contract
+
+Plan revision is for evidence-driven changes to the active and remaining workflow, such as changing
+from a workload hypothesis to a node-level diagnosis after live observations invalidate the
+original path. It is not an unrestricted jump or an action bundle.
+
+A `phase_plan_revision` must:
+
+- be the only semantic output in that model turn;
+- reference the current base revision and existing observation IDs;
+- replace the complete active and remaining nonterminal graph;
+- preserve completed/skipped/superseded history and mandatory guide/mutation-verification obligations;
+- preserve phase and step lineage for replacement work so renaming IDs cannot reset attempt budgets;
+- stay within the request-fixed plan revision budget.
+
+Runtime validates structure and procedure, not whether the model's diagnosis is factually correct.
+The model decides whether evidence justifies a new hypothesis and states the revised goals and
+completion criteria. The runtime checks that the cited evidence exists and that the transition is
+legal, then applies the accepted revision atomically.
+
 The model must report phase completion explicitly, for example:
 
 ```json
@@ -131,6 +166,12 @@ The model must report phase completion explicitly, for example:
 If the active phase has `allowed_next`, `phase_progress.next_phase` must be one of those declared phase names. If `next_phase` is omitted, runtime advances to the first declared allowed next phase. Runtime must not fall through to an undeclared later phase. If the active phase has no `allowed_next`, it is terminal and `next_phase` should be omitted.
 
 Runtime should not infer a phase as complete just because one command ran. It may reject or ignore completion for blocked, declined, malformed, or internal-error observations.
+
+Ordinary phase activation treats `blocked` as a terminal step status and selects the next pending
+step instead of silently reviving blocked work. Only an explicit rewind transition may reset a
+blocked step to `pending`; that transition also clears the rewound criteria before activation.
+Phase move/rewind is rejected while a stable owner ID still has a mandatory mutation-verification
+obligation. Display names such as `mutation` or `verification` are not used to infer cleanup scope.
 
 ## `phase_step` and `guidance_step` Hierarchy
 
@@ -244,14 +285,20 @@ The important distinction is that `guidance_step` is procedural content from a r
 The phase-owned guidance flow is implemented in this order:
 
 1. `phase_plan` and `phase_progress` are accepted by shim parsing and function-call conversion.
-2. Runtime stores the accepted `phase_plan`, completed phase indices, and active `phase_step`.
-3. Runtime injects a `phase_step` anchor on every iteration after requirement analysis is accepted.
-4. Prompts require the model to return `phase_plan` before ordinary actions and `phase_progress` when a phase completes.
-5. CRD discovery is exposed as eligibility context for the next model turn, not as automatic guide injection.
-6. Runtime-driven initial guide injection paths are disabled.
-7. Top-level `resource_guide_lookup` is allowed only as the model-selected action inside the `guidance_lookup` phase.
-8. Nested guide progress is scoped under `guided_diagnosis`, and nested guide completion requires parent `phase_progress`.
-9. Final-report prompting distinguishes completed `phase_step` entries and nested `guidance_step` entries conceptually.
+2. Runtime stores the accepted `phase_plan`, completed phase indices, active phase, and stable goal execution contract.
+3. Runtime injects bounded phase/step/attempt/observation anchors on every iteration after requirement analysis is accepted.
+4. Native and shim outputs use the same typed output policy before domain consumers run.
+5. Prompts require `phase_plan` before ordinary actions, `step_result` for explicit step closure, and `phase_progress` only after the phase's execution steps are achieved.
+6. Evidence-backed `phase_plan_revision` can atomically replace the active and remaining graph while preserving lineage and request-fixed budgets.
+7. CRD discovery is exposed as eligibility context for the next model turn, not as automatic guide injection.
+8. Runtime-driven initial guide injection paths are disabled.
+9. Top-level `resource_guide_lookup` is allowed only as the model-selected action inside the `guidance_lookup` phase.
+10. Nested guide progress is scoped under `guided_diagnosis`, and nested guide completion requires parent `phase_progress`.
+11. Final-report prompting distinguishes completed `phase_step` entries and nested `guidance_step` entries conceptually.
+12. Tool invocation uses a committed dispatch intent and canonical payload hash; reconciliation failure cannot recreate the same mutation as an unapproved pending action.
+13. RBAC observations remain in history as access blockers and cannot satisfy or keep waiting a mutation verification. A general RBAC failure returns to the current phase for permitted alternative evidence; when an RBAC change is genuinely required, the model must propose a separate risky mutating action that receives exact user approval and direct verification.
+14. Max-iteration closure produces a validated `continuation_handoff`; resuming retains request lineage, ledger, and safety counters.
+15. A state-bearing `failed` verification closes that attempt and permits a materially different action or evidence-backed plan revision. Only unknown execution/verification outcomes remain mandatory unresolved obligations that force an inconclusive report. An active verification blocks plan replacement; an already-closed unknown obligation stays outside the replaceable plan graph, so a revision may change the remaining strategy but cannot remove that obligation or make the final report conclusive.
 
 Remaining hardening should focus on stricter semantic validation of phase completion, not on adding another guide-entry path.
 
@@ -262,7 +309,7 @@ Remaining hardening should focus on stricter semantic validation of phase comple
 | `requirement_analysis` | Classify the user request before choosing tools or guidance. | Structured intent, target candidates, scope, operational focus, ambiguities. |
 | `context_resolution` | Apply previous conversation context and resolve follow-up references. | Updated target/scope defaults or clarification need. |
 | `clarification` | Ask the user when target/scope/action cannot be determined safely. | User-facing question, no kubectl action. |
-| `safety_policy` | Enforce read-only mode, mutation approval, and unsafe command rejection. | Allowed action, approval request, or blocked action. |
+| `safety_policy` | Enforce read-only mode, risk-flagged command approval, and unsafe command rejection. | Allowed action, approval request, or blocked action. |
 | `observation_planning` | Model declares what evidence must be collected before answering or guide lookup. | One next kubectl/tool diagnostic action. |
 | `observation_execution` | Execute the approved observation action. | Raw tool observation. |
 | `observation_completion` | Model reports whether enough observation exists for the request's next step. | Continue observation, synthesize answer, or consider guidance. |
@@ -284,7 +331,7 @@ The exact path depends on request type. Not every request needs every phase.
 | Diagnosis | `requirement_analysis -> context_resolution -> observation_planning -> observation_execution -> observation_completion -> guidance_decision(optional) -> final_report` |
 | Follow-up diagnosis | `requirement_analysis -> context_resolution -> observation_planning -> observation_execution -> observation_completion -> guidance_decision(optional) -> final_report` |
 | Explanation | `requirement_analysis -> response_synthesis`, unless live state is required. |
-| Mutation/remediation | `requirement_analysis -> safety_policy -> approval(if needed) -> execution -> verification_observation -> mutation_verification_result -> phase_progress/final_report` |
+| Mutation/remediation | `requirement_analysis -> safety_policy -> approval(if risk.risky=true) -> execution -> verification_observation -> mutation_verification_result -> phase_progress/final_report` |
 | Configuration/meta request | Runtime-specific handler when possible; otherwise `requirement_analysis -> response_synthesis`. |
 
 ## Observation Roles
@@ -305,20 +352,25 @@ Observation is a first-class phase before RAG. The model declares the intended o
 
 Mutation/remediation requests have an additional runtime contract after successful execution. Approval only authorizes the change; it does not prove the user's goal was achieved.
 
-After a successful mutating tool observation, runtime creates goal-level verification requirements from the action target and the accepted request context. The model must satisfy those requirements with read-only observations before it can close the phase or emit a final report.
+Every mutating action declares one concrete action target and a direct verification contract. Runtime does not infer a missing mutation resource or name from the command. It binds the verification contract to the mutation attempt and requires read-only evidence before the mutation step can close. An ordered-chain check inherits the action target when its own target is omitted and uses a concrete check target only as an explicit override.
 
 The contract is:
 
 1. The mutating action runs through normal read-only and approval gates.
-2. Runtime records one or more `mutationEvidenceRequirement` entries for the user goal.
-3. The model may issue one or more read-only verification observations that match the remaining requirements.
-4. When all requirements are satisfied, runtime asks for exactly one `mutation_verification_result`.
-5. `mutation_verification_result.status=resolved` permits `phase_progress` or `final_report`.
-6. `status=progressing` or `status=unresolved` requires another ReAct action before phase completion or final report.
+2. Runtime opens one verification ID under the same step attempt. A single verification has one check; an ordered chain has two or more distinct checks with only one active at a time.
+3. The model issues one read-only observation for the active verification check.
+4. Runtime asks for exactly one `mutation_verification_result` with the active verification ID and evidence references including the latest observation for that check.
+5. `status=satisfied` completes the check and activates the next chain check or closes the direct mutation verification.
+6. `status=waiting` is valid for state convergence and rechecks the same verification ID up to five times without consuming another step attempt.
+7. `status=failed` requires a materially different safe strategy or an evidence-grounded plan revision; runtime does not repeat the mutation automatically.
 
-This is intentionally goal-level, not line-level. If several mutating commands are required to complete one remediation, runtime accumulates verification requirements across the sequence instead of treating each command as independently done.
+One step attempt contains at most one mutating primary action. Mutation, direct verification, ordered chain checks, and temporal rechecks belong to that attempt. The initial phase plan declares the complete expected procedure. When the resource changed by the mutation differs from the original user-visible target, direct mutation verification and original-outcome verification are consecutive independent plan steps rather than checks in one mutation-verification chain. If live evidence requires an undeclared outcome step or a different route, the model emits a standalone evidence-backed `phase_plan_revision` before acting on that route.
 
-`kubectl apply -f ...` has one special policy: when runtime cannot extract a concrete target and the apply output reports success for all applied objects, that output is accepted as the apply evidence and no generic follow-up verification is invented. If the command provides a concrete target, normal verification can still be required for that target.
+Single checks use the `awaiting_mutation_verification_evidence/result` control pair. Ordered chains use
+`awaiting_mutation_verification_chain_evidence/result`; only the active chain index is exposed as an executable
+obligation, and a satisfied result advances to the next index.
+
+Generic multi-resource mutations without one concrete `action.target.resource` and `action.target.name` are rejected before execution. The model must declare one honest primary mutation target; when a command cannot be represented by one such target, it must be split or replaced with a more specific action. Ordered checks may override their inherited target only for another concrete direct condition.
 
 ## Observation Completion
 
@@ -342,7 +394,12 @@ Important cases:
 - For an explicitly named resource diagnosis, do not inspect nodes, related resources, events, or logs before `primary_status` has observed the primary object. Complete the observation phase after primary status when it is sufficient so runtime can expose CRD discovery/classification before guidance or related-resource diagnosis.
 - A multi-resource command can complete observation when the resources are related to the accepted target or operational focus.
 - An observation with runtime/internal errors, approval decline, blocked execution, or malformed schema is not diagnostic evidence.
-- A Kubernetes `NotFound` or `Forbidden` result can be diagnostic evidence only when it directly answers or advances the user's request.
+- Kubernetes `NotFound` can be state-bearing evidence when absence directly answers the request.
+  `Forbidden`/`Unauthorized` is an access blocker: it proves that inspection was denied, not the
+  resource state, and therefore cannot satisfy or keep waiting a mutation verification.
+- A forbidden observation is not an automatic permission grant. Do not repeat it unchanged. Prefer
+  permitted evidence; if the request requires an RBAC change, propose that change as a separate
+  `risk.risky=true` mutation subject to read-only policy, exact approval, and direct verification.
 
 ## Guidance Decision
 

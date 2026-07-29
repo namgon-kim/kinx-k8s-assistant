@@ -6,8 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/request"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/protocol"
 )
 
 func TestBuildSystemPromptIncludesReadOnlyInstructions(t *testing.T) {
@@ -27,6 +29,80 @@ func TestBuildSystemPromptIncludesReadOnlyInstructions(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "read-only enabled") {
 		t.Fatalf("expected read-only instructions in prompt: %q", prompt)
+	}
+}
+
+func TestRuntimeActionMetadataAugmentsSchemaCopyOnly(t *testing.T) {
+	original := &gollm.FunctionDefinition{
+		Name: "kubectl",
+		Parameters: &gollm.Schema{
+			Type:       gollm.TypeObject,
+			Properties: map[string]*gollm.Schema{"command": {Type: gollm.TypeString}},
+			Required:   []string{"command"},
+		},
+	}
+	clone := cloneFunctionDefinition(original)
+	augmentRuntimeActionMetadataSchema(clone)
+
+	for _, name := range []string{"target", "step_ref", "retry_of", "retry_reason", "changed_since", "verification"} {
+		if clone.Parameters.Properties[name] == nil {
+			t.Fatalf("runtime metadata property %q was not added", name)
+		}
+		if original.Parameters.Properties[name] != nil {
+			t.Fatalf("runtime metadata property %q mutated registry schema", name)
+		}
+	}
+	verification := clone.Parameters.Properties["verification"]
+	if strings.TrimSpace(verification.Description) == "" {
+		t.Fatal("verification schema has no native function-call description")
+	}
+	target := clone.Parameters.Properties["target"]
+	for _, name := range []string{"resource", "namespace", "name"} {
+		if property := target.Properties[name]; property == nil || strings.TrimSpace(property.Description) == "" {
+			t.Fatalf("action target property %q has no description", name)
+		}
+	}
+	for _, name := range []string{"shape", "mode", "expected_state", "checks"} {
+		if property := verification.Properties[name]; property == nil || strings.TrimSpace(property.Description) == "" {
+			t.Fatalf("verification property %q has no description", name)
+		}
+	}
+	check := verification.Properties["checks"].Items
+	for _, name := range []string{"mode", "target", "expected_state", "suggested_command"} {
+		if property := check.Properties[name]; property == nil || strings.TrimSpace(property.Description) == "" {
+			t.Fatalf("verification check property %q has no description", name)
+		}
+	}
+}
+
+func TestRuntimeActionMetadataPreservesToolOwnedTargetSchema(t *testing.T) {
+	originalTarget := &gollm.Schema{
+		Type:        gollm.TypeString,
+		Description: "Tool-owned destination.",
+	}
+	definition := &gollm.FunctionDefinition{
+		Name: "custom",
+		Parameters: &gollm.Schema{
+			Type: gollm.TypeObject,
+			Properties: map[string]*gollm.Schema{
+				"target": originalTarget,
+			},
+		},
+	}
+
+	augmentRuntimeActionMetadataSchema(definition)
+
+	if definition.Parameters.Properties["target"] != originalTarget {
+		t.Fatal("runtime action metadata replaced a tool-owned target schema")
+	}
+	runtimeTarget := definition.Parameters.Properties["runtime_target"]
+	if runtimeTarget == nil {
+		t.Fatal("tool-owned target collision did not create runtime_target metadata")
+	}
+	for _, name := range []string{"resource", "namespace", "name"} {
+		if property := runtimeTarget.Properties[name]; property == nil || strings.TrimSpace(property.Description) == "" {
+			t.Fatalf("runtime target property %q has no description", name)
+		}
 	}
 }
 
@@ -96,18 +172,32 @@ func TestCollectFunctionDefinitionsIncludesInternalStructuredCalls(t *testing.T)
 	}
 
 	for _, name := range []string{
-		internalRequirementAnalysisCall,
-		internalRequestContextCall,
-		internalPhasePlanCall,
-		internalPhaseProgressCall,
-		internalGuideProgressCall,
-		internalResourceGuideLookupCall,
-		internalFinalReportCall,
-		internalNextDirectionsCall,
-		internalMutationVerificationResultCall,
+		protocol.RequirementAnalysisCall,
+		protocol.RequestContextCall,
+		protocol.PhasePlanCall,
+		protocol.PhasePlanRevisionCall,
+		protocol.StepResultCall,
+		protocol.PhaseProgressCall,
+		protocol.GuideProgressCall,
+		protocol.ResourceGuideLookupCall,
+		protocol.FinalReportCall,
+		protocol.NextDirectionsCall,
+		protocol.MutationVerificationResultCall,
 	} {
 		if !names[name] {
 			t.Fatalf("expected internal function definition %q", name)
 		}
 	}
+	for _, def := range defs {
+		if def.Name != protocol.MutationVerificationResultCall {
+			continue
+		}
+		for _, name := range []string{"verification_id", "status", "evidence_refs"} {
+			if property := def.Parameters.Properties[name]; property == nil || strings.TrimSpace(property.Description) == "" {
+				t.Fatalf("mutation verification result property %q has no description", name)
+			}
+		}
+		return
+	}
+	t.Fatal("mutation verification result function was not registered")
 }

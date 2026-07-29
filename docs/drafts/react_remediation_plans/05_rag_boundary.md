@@ -122,7 +122,7 @@ web-app deployment 문제인데 runbook 검색 결과가 `Node NotReady`이고 d
 
 - target compatibility는 resource kind 중심이다. namespace/name mismatch는 현재 incident client validation이 제공하는 `ValidationResult`를 신뢰한다.
 - runbook `related_objects`가 비어 있으면 target kind로 폐기하지 않는다. runbook metadata가 부족한 상태에서 정상 케이스를 과도하게 차단하지 않기 위한 fail-open 지점이다.
-- runbook summary는 remediation을 실행하지 않고 active ReAct loop에 remediation prompt도 주입하지 않는다. 사용자가 실제 변경을 원하면 별도 ReAct 요청으로 들어가고, 그 이후는 approval과 mutation verification lifecycle을 따른다.
+- runbook summary는 remediation을 실행하지 않고 active ReAct loop에 remediation prompt도 주입하지 않는다. 사용자가 실제 변경을 원하면 별도 ReAct 요청으로 들어가고, 그 이후는 risk flag 기반 approval과 mutation verification lifecycle을 따른다.
 
 ## Regression Scenarios
 

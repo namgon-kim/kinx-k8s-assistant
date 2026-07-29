@@ -35,7 +35,6 @@ type BranchPolicy string
 const (
 	StayCurrent      BranchPolicy = "stay_current"
 	RetryStep        BranchPolicy = "retry_step"
-	RecheckStep      BranchPolicy = "recheck_step"
 	SkipStep         BranchPolicy = "skip_step"
 	MovePhase        BranchPolicy = "move_phase"
 	RewindPhase      BranchPolicy = "rewind_phase"

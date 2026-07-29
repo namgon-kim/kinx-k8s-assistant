@@ -28,10 +28,10 @@
 
 | 문서 | 적용 상태 | 주요 코드 위치 |
 | --- | --- | --- |
-| [`architecture_orchestrator_react.md`](./architecture_orchestrator_react.md) | 새 package layout 기준 갱신됨. facade/coordinator/session/flow/contract 경계와 이전 중인 compatibility state를 구분 | `cmd/k8s-assistant`, `internal/orchestrator`, `internal/react/*`, `internal/toolconnector`, `internal/guidance` |
-| [`requirement_analysis.md`](./requirement_analysis.md) | 코드 기준 갱신됨. follow-up 계약과 현재 keyword/all-namespaces gap(`BUG-23`, `BUG-24`)을 구분 | `internal/react/contract/structured.go`, `internal/react/prompt/requirement.go`, `internal/react/flow/request`, `internal/react/session/context.go`, `internal/react/coordinator/iteration.go` |
-| [`request_processing_phases.md`](./request_processing_phases.md) | 코드 기준 갱신됨. phase-owned guidance와 phase validation gap(`BUG-7`, `BUG-8`, `BUG-10`, `BUG-21`) 반영 | `internal/react/flow/phase`, `internal/react/session/phase.go`, `internal/react/flow/guidance`, `internal/react/flow/verification`, `internal/react/coordinator/iteration.go` |
-| [`guide_progress_and_continuation.md`](./guide_progress_and_continuation.md) | 코드 기준 갱신됨. control/session 경계와 guide/verification/continuation known gaps를 별도 표기 | `internal/react/flow/{guidance,verification,report,direction}`, `internal/react/session`, `internal/react/protocol`, `internal/react/coordinator` |
+| [`architecture_orchestrator_react.md`](./architecture_orchestrator_react.md) | 새 package layout 기준 갱신됨. revisioned session aggregate, immutable dispatch, evidence qualification, bounded continuation과 plan revision 경계를 반영 | `cmd/k8s-assistant`, `internal/orchestrator`, `internal/react/*`, `internal/toolconnector`, `internal/guidance` |
+| [`requirement_analysis.md`](./requirement_analysis.md) | 코드 기준 갱신됨. follow-up 계약과 현재 keyword/all-namespaces gap(`BUG-23`, `BUG-24`)을 구분 | `internal/react/contract/structured.go`, `internal/react/prompt/requirement.go`, `internal/react/flow/request`, `internal/react/coordinator/{state,iteration}.go` |
+| [`request_processing_phases.md`](./request_processing_phases.md) | 코드 기준 갱신됨. stable goal/phase/step contract, step result, evidence-based plan revision과 phase validation gap(`BUG-7`, `BUG-8`, `BUG-10`, `BUG-21`) 반영 | `internal/react/flow/phase`, `internal/react/session/execution.go`, `internal/react/flow/guidance`, `internal/react/flow/verification`, `internal/react/coordinator/{state,iteration,execution_state,revision}.go` |
+| [`guide_progress_and_continuation.md`](./guide_progress_and_continuation.md) | 코드 기준 갱신됨. aggregate state, turn-entry output policy와 guide/verification/continuation known gaps를 별도 표기 | `internal/react/flow/{gate,guidance,verification,report,direction}`, `internal/react/session`, `internal/react/protocol`, `internal/react/coordinator` |
 | [`TODO.md`](./TODO.md) | 남은 TODO와 설계 변경 drop 사유 요약 | hardening, cleanup, 중단된 과거 설계 추적 |
 | [`README.md`](./README.md) | 이 인덱스 문서. 적용/미적용 상태를 추적함 | docs 분류 기준 |
 
@@ -43,11 +43,13 @@
 | [`drafts/react_remediation_plans/00_overview.md`](./drafts/react_remediation_plans/00_overview.md) | 코드 기준 갱신됨 | remediation plan 묶음의 현황 인덱스로 유지. |
 | [`drafts/react_remediation_plans/01_user_input_ownership.md`](./drafts/react_remediation_plans/01_user_input_ownership.md) | 구현됨 | 현재 구현 기준으로 유지하거나 안정 문서에 병합 가능. |
 | [`drafts/react_remediation_plans/02_phase_plan_runtime_contract.md`](./drafts/react_remediation_plans/02_phase_plan_runtime_contract.md) | 구현됨 | `request_processing_phases.md`와 중복되는 부분은 장기적으로 통합. |
-| [`drafts/react_remediation_plans/03_mutation_lifecycle.md`](./drafts/react_remediation_plans/03_mutation_lifecycle.md) | 대부분 구현됨 | mutation verification 계약은 안정 문서 승격 후보. |
+| [`drafts/react_remediation_plans/03_mutation_lifecycle.md`](./drafts/react_remediation_plans/03_mutation_lifecycle.md) | 구현됨 | mutation verification 계약은 안정 문서 승격 후보. kubectl failure/manifest parsing 후속은 plan 06과 TODO에서 추적. |
 | [`drafts/react_remediation_plans/04_namespace_scope_invariant.md`](./drafts/react_remediation_plans/04_namespace_scope_invariant.md) | 부분 구현됨, TODO 분리 | file/manifest 기반 namespace 검증은 [`TODO.md`](./TODO.md)에서 추적. |
 | [`drafts/react_remediation_plans/05_rag_boundary.md`](./drafts/react_remediation_plans/05_rag_boundary.md) | 구현됨, 코드 기준 갱신됨 | incident plan은 summary 입력일 뿐 자동 실행/주입 경로가 아님. |
-| [`drafts/react_remediation_plans/06_deterministic_gates_vs_correction.md`](./drafts/react_remediation_plans/06_deterministic_gates_vs_correction.md) | 대부분 구현됨, 코드 기준 갱신됨 | tool failure 분류와 runtime gate 구현 반영. 남은 gate pure decision 함수화는 [`TODO.md`](./TODO.md)에서 추적. |
-| [`drafts/react_remediation_plans/07_explicit_state_machine.md`](./drafts/react_remediation_plans/07_explicit_state_machine.md) | 패키지 경계/enum 도입 완료, 상태 이전은 부분 구현 | `contract`, `session`, `coordinator` 분리는 반영됨. coordinator compatibility 필드 제거와 `session.State` 단일화는 [`TODO.md`](./TODO.md)에서 추적. |
+| [`drafts/react_remediation_plans/06_deterministic_gates_vs_correction.md`](./drafts/react_remediation_plans/06_deterministic_gates_vs_correction.md) | 구현됨, 코드 기준 갱신됨 | tool failure 분류, runtime gate와 session-scoped correction counter를 반영. 남은 semantic gate hardening은 [`TODO.md`](./TODO.md)에서 추적. |
+| [`drafts/react_remediation_plans/07_explicit_state_machine.md`](./drafts/react_remediation_plans/07_explicit_state_machine.md) | 구현됨 | `contract`, `session`, `coordinator` 분리와 revisioned aggregate 단일 source of truth를 반영. |
+| [`drafts/react_remediation_plans/08_turn_output_contract_and_goal_execution.md`](./drafts/react_remediation_plans/08_turn_output_contract_and_goal_execution.md) | 2026-07-28 source 대조 기준 Stage 0A와 1-6 코드 구현됨 | typed output matrix, atomic turn pipeline, immutable dispatch, stable execution contract, bounded indexed ledger, plan revision, compatibility cleanup의 현재 구현 기록. |
+| [`drafts/react_remediation_plans/09_durable_session_persistence.md`](./drafts/react_remediation_plans/09_durable_session_persistence.md) | 미구현 파생 계획 | checkpoint/journal과 crash recovery는 turn contract와 분리된 후속 범위다. |
 | [`drafts/draft_troubleshooting_v1.md`](./drafts/draft_troubleshooting_v1.md) | Legacy 초안, 현재 구조와 다수 불일치 | `trouble_shooting` MCP/server, `internal/troubleshooting`, `troubleshooting-upload`, kubectl-ai Agent 재주입 흐름은 현재 구현 기준이 아니다. 현재 기준은 `internal/guidance` 내장 client와 `log-analyzer` 분리다. |
 | [`drafts/draft_for_cluster-api.md`](./drafts/draft_for_cluster-api.md) | 미구현 설계 초안, 후반부 최종 권장안만 현재 원칙과 가까움 | 초반의 `cluster-api-server` MCP, `trouble-shooting` MCP, `internal/troubleshooting/runbooks` 경로는 현재 구현 기준이 아니다. Cluster API 도메인 확장 논의로 보관. |
 | [`drafts/draft_runbook_iksv2.md`](./drafts/draft_runbook_iksv2.md) | RAG/runbook 원천 초안, 코드 구현 상태 대상 아님 | 정제본은 `docs/rag/`와 `internal/guidance/runbooks/`를 기준으로 본다. |
@@ -88,7 +90,7 @@
 | `request_processing_phases.md` legacy guide-trigger 문구 | 코드상 자동 initial guide injection은 비활성화됐고 `guidance_lookup` phase에서만 `resource_guide_lookup`을 허용함 | 현재 runtime strategy로 수정 완료. |
 | `guide_progress_and_continuation.md` anchor 순서 | 코드상 effective order는 `runtime_state` → `requirement_analysis` → `phase_step` → `guide_step` → `mutation_verification` | 문서 수정 완료. |
 | `guide_progress_and_continuation.md` guide step matching | 코드상 rendered command의 whitespace-normalized exact match만 자동 완료로 인정함 | 문서 수정 완료. |
-| runtime gate 설명 부족 | 코드상 conversation tool-call, self-talk shell, interactive command, assistant-managed guidance tool, tool failure classification gate가 있음 | `architecture_orchestrator_react.md`, `guide_progress_and_continuation.md`, plan 06에 반영 완료. |
+| runtime gate 설명 부족 | 코드상 conversation tool-call, interactive command, read-only effect classification, assistant-managed guidance tool, tool failure classification gate가 있음 | `architecture_orchestrator_react.md`, `guide_progress_and_continuation.md`, plan 06에 반영 완료. |
 | incident guidance 실행 경계 | `Analyze`는 plan을 만들지만 orchestrator가 summary만 출력하고 unsafe/incomplete command는 숨기며 ReAct에 remediation을 주입하지 않음 | `architecture_orchestrator_react.md`, plan 05에 반영 완료. |
 
 ## 코드 레이아웃 기준
@@ -101,9 +103,9 @@
 | `cmd/test-banner` | banner 출력 확인용 개발 helper |
 | `internal/react/react.go` | 외부 facade와 공개 compatibility alias |
 | `internal/react/coordinator` | loop lifecycle, model turn, input, execution, output, dependency wiring |
-| `internal/react/session` | mutable control/phase/verification/context state와 snapshot/cleanup |
+| `internal/react/session` | revisioned aggregate, lifecycle projection, goal execution ledger |
 | `internal/react/flow` | request/phase/guidance/verification/report/direction/gate reducer와 validation |
-| `internal/react/contract` | immutable enum, event/effect, structured payload, runtime snapshot |
+| `internal/react/contract` | immutable enum, event/effect, structured payload, shared runtime references |
 | `internal/react/protocol` | internal structured call, schema, native/shim normalization |
 | `internal/react/kube` | kubectl command parsing, resource/target normalization, read-only policy |
 | `internal/react/{prompt,provider,language}` | prompt rendering, LLM setup, user-facing translation |

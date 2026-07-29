@@ -5,6 +5,18 @@ import (
 	"strings"
 )
 
+func InvalidShimStructuredOutputArguments(answerMixed bool, unknownKeys []string) map[string]any {
+	arguments := map[string]any{}
+	if answerMixed {
+		arguments["answer_mixed_with_structured_output"] = true
+	}
+	if len(unknownKeys) > 0 {
+		keys := append([]string(nil), unknownKeys...)
+		arguments["unknown_top_level_keys"] = keys
+	}
+	return arguments
+}
+
 func ExtractJSON(input string) (string, bool) {
 	const marker = "```json"
 	first := strings.Index(input, marker)

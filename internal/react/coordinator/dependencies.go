@@ -16,8 +16,10 @@ import (
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/tools"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/config"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/guidance"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/flow/request"
 	reactprompt "github.com/namgon-kim/kinx-k8s-assistant/internal/react/prompt"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/protocol"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/provider"
 	"github.com/namgon-kim/kinx-k8s-assistant/internal/toolconnector"
 )
@@ -41,6 +43,39 @@ func newToolRegistry(ctx context.Context, executor sandbox.Executor, cfg *config
 
 func newGuidanceClient(cfg *config.Config) (*guidance.Client, error) {
 	return guidance.NewResourceGuideClient(cfg)
+}
+
+type loopDependencies struct {
+	modelClient    func(*config.Config) (gollm.Client, error)
+	executor       func() sandbox.Executor
+	toolRegistry   func(context.Context, sandbox.Executor, *config.Config) (*toolconnector.Registry, error)
+	guidanceClient func(*config.Config) (*guidance.Client, error)
+}
+
+func defaultLoopDependencies() loopDependencies {
+	return loopDependencies{
+		modelClient:    newModelClient,
+		executor:       newExecutor,
+		toolRegistry:   newToolRegistry,
+		guidanceClient: newGuidanceClient,
+	}
+}
+
+func (d loopDependencies) withDefaults() loopDependencies {
+	defaults := defaultLoopDependencies()
+	if d.modelClient == nil {
+		d.modelClient = defaults.modelClient
+	}
+	if d.executor == nil {
+		d.executor = defaults.executor
+	}
+	if d.toolRegistry == nil {
+		d.toolRegistry = defaults.toolRegistry
+	}
+	if d.guidanceClient == nil {
+		d.guidanceClient = defaults.guidanceClient
+	}
+	return d
 }
 
 type PromptProfile struct {
@@ -189,7 +224,9 @@ func collectFunctionDefinitionsForProfile(registry tools.Tools, profile ToolProf
 		if tool == nil {
 			continue
 		}
-		defs = append(defs, tool.FunctionDefinition())
+		definition := cloneFunctionDefinition(tool.FunctionDefinition())
+		augmentRuntimeActionMetadataSchema(definition)
+		defs = append(defs, definition)
 	}
 	if includeInternal {
 		defs = append(defs, internalStructuredFunctionDefinitions()...)
@@ -200,61 +237,204 @@ func collectFunctionDefinitionsForProfile(registry tools.Tools, profile ToolProf
 	return defs
 }
 
+func cloneFunctionDefinition(source *gollm.FunctionDefinition) *gollm.FunctionDefinition {
+	if source == nil {
+		return nil
+	}
+	clone := *source
+	clone.Parameters = cloneFunctionSchema(source.Parameters)
+	return &clone
+}
+
+func cloneFunctionSchema(source *gollm.Schema) *gollm.Schema {
+	if source == nil {
+		return nil
+	}
+	clone := *source
+	clone.Required = append([]string(nil), source.Required...)
+	clone.Items = cloneFunctionSchema(source.Items)
+	if source.Properties != nil {
+		clone.Properties = make(map[string]*gollm.Schema, len(source.Properties))
+		for name, property := range source.Properties {
+			clone.Properties[name] = cloneFunctionSchema(property)
+		}
+	}
+	return &clone
+}
+
+func augmentRuntimeActionMetadataSchema(definition *gollm.FunctionDefinition) {
+	if definition == nil || definition.Parameters == nil {
+		return
+	}
+	if definition.Parameters.Properties == nil {
+		definition.Parameters.Properties = map[string]*gollm.Schema{}
+	}
+	runtimeTargetName := "target"
+	if definition.Parameters.Properties[runtimeTargetName] != nil {
+		runtimeTargetName = "runtime_target"
+	}
+	definition.Parameters.Properties[runtimeTargetName] = buildFunctionSchema(reflect.TypeOf(contract.ActionTarget{}))
+	definition.Parameters.Properties[runtimeTargetName].Description = "Coordinator-owned Kubernetes action target. This is named runtime_target only when the tool owns a different target argument."
+	describeSchemaProperty(definition.Parameters.Properties[runtimeTargetName], "resource", "Concrete Kubernetes resource kind; required for a mutating action and never unknown.")
+	describeSchemaProperty(definition.Parameters.Properties[runtimeTargetName], "namespace", "Exact namespace for a known namespaced target; include the same namespace in the command.")
+	describeSchemaProperty(definition.Parameters.Properties[runtimeTargetName], "name", "Concrete resource name; required for a mutating action.")
+	definition.Parameters.Properties["step_ref"] = buildFunctionSchema(reflect.TypeOf(StepRef{}))
+	definition.Parameters.Properties["retry_of"] = &gollm.Schema{Type: gollm.TypeString}
+	definition.Parameters.Properties["retry_reason"] = &gollm.Schema{Type: gollm.TypeString}
+	definition.Parameters.Properties["changed_since"] = &gollm.Schema{
+		Type:  gollm.TypeArray,
+		Items: &gollm.Schema{Type: gollm.TypeString},
+	}
+	definition.Parameters.Properties["verification"] = mutationVerificationProposalSchema()
+	if definition.Parameters.Properties["command"] != nil {
+		risk := buildFunctionSchema(reflect.TypeOf(contract.CommandRisk{}))
+		risk.Description = "Required runtime risk declaration for every command action."
+		describeSchemaProperty(risk, "risky", "Set true when the exact command or its effects require explicit human review.")
+		describeSchemaProperty(risk, "reason", "Required when risky=true. Explain the concrete risk shown to the user.")
+		risk.Required = appendUniqueString(risk.Required, "risky")
+		definition.Parameters.Properties["risk"] = risk
+		definition.Parameters.Required = appendUniqueString(definition.Parameters.Required, "risk")
+	}
+}
+
+func appendUniqueString(values []string, value string) []string {
+	for _, current := range values {
+		if current == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func mutationVerificationProposalSchema() *gollm.Schema {
+	schema := buildFunctionSchema(reflect.TypeOf(contract.VerificationSpec{}))
+	schema.Description = "Required for every mutating action. Declares direct post-mutation verification; omit for ordinary read-only observations."
+	describeSchemaProperty(schema, "shape", "Use single for one direct condition or chain for two or more distinct direct conditions evaluated in order.")
+	describeSchemaProperty(schema, "mode", "For shape=single: immediate or await_state. Use await_state only when the same expected state may need temporal rechecks.")
+	describeSchemaProperty(schema, "expected_state", "For shape=single: the exact state that proves the mutation directly affected its target.")
+	describeSchemaProperty(schema, "initial_delay_seconds", "Optional delay before the first read-only verification, clamped by runtime to 0-30 seconds.")
+	describeSchemaProperty(schema, "recheck_interval_seconds", "For await_state: delay between read-only rechecks, clamped by runtime to 1-30 seconds.")
+	describeSchemaProperty(schema, "policy", "For shape=chain: must be ordered.")
+	describeSchemaProperty(schema, "checks", "For shape=chain: at least two distinct direct checks. The runtime activates one check at a time in the declared order.")
+
+	checks := schema.Properties["checks"]
+	if checks == nil || checks.Items == nil {
+		return schema
+	}
+	check := checks.Items
+	describeSchemaProperty(check, "mode", "immediate or await_state for this check.")
+	describeSchemaProperty(check, "target", "Optional concrete target override for this distinct direct check. Omit it to inherit the mutating action target.")
+	describeSchemaProperty(check, "expected_state", "One exact state this check must establish.")
+	describeSchemaProperty(check, "suggested_command", "A read-only kubectl command suitable for collecting this check's evidence.")
+	describeSchemaProperty(check, "initial_delay_seconds", "Optional delay before the first observation for this check, clamped to 0-30 seconds.")
+	describeSchemaProperty(check, "recheck_interval_seconds", "For await_state: delay between observations, clamped to 1-30 seconds.")
+	if target := check.Properties["target"]; target != nil {
+		describeSchemaProperty(target, "resource", "Concrete override resource kind; never use unknown.")
+		describeSchemaProperty(target, "namespace", "Exact override namespace for a namespaced target.")
+		describeSchemaProperty(target, "name", "Exact override resource name.")
+	}
+	return schema
+}
+
+func describeSchemaProperty(schema *gollm.Schema, name, description string) {
+	if schema == nil || schema.Properties == nil || schema.Properties[name] == nil {
+		return
+	}
+	schema.Properties[name].Description = description
+}
+
 func internalStructuredFunctionDefinitions() []*gollm.FunctionDefinition {
 	return []*gollm.FunctionDefinition{
 		internalStructuredFunctionDefinition(
-			internalRequirementAnalysisCall,
+			protocol.RequirementAnalysisCall,
 			"Submit the required first-pass classification of the user's request before choosing any tool action.",
 			requirementAnalysis{},
 		),
 		internalStructuredFunctionDefinition(
-			internalRequestContextCall,
+			protocol.RequestContextCall,
 			"Submit the accepted runtime request context derived from requirement_analysis.",
 			requestContext{},
 		),
 		internalStructuredFunctionDefinition(
-			internalPhasePlanCall,
+			protocol.PhasePlanCall,
 			"Submit the ordered forward-only phase plan before choosing actions for the accepted request.",
 			phasePlan{},
 		),
 		internalStructuredFunctionDefinition(
-			internalPhaseProgressCall,
+			protocol.PhasePlanRevisionCall,
+			"Replace the active and remaining plan graph using existing observation references while preserving phase and step goal lineage.",
+			phasePlanRevision{},
+		),
+		internalStructuredFunctionDefinition(
+			protocol.StepResultCall,
+			"Close the active execution step as achieved, blocked, or requiring a plan revision, with runtime observation references.",
+			stepResult{},
+		),
+		internalStructuredFunctionDefinition(
+			protocol.PhaseProgressCall,
 			"Complete or advance the active top-level phase_step when its completion condition is satisfied.",
 			phaseProgress{},
 		),
 		internalStructuredFunctionDefinition(
-			internalGuideProgressCall,
+			protocol.GuideProgressCall,
 			"Record completion of a nested resource-guide diagnostic step while guided_diagnosis is active.",
 			guideProgress{},
 		),
 		internalStructuredFunctionDefinition(
-			internalResourceGuideLookupCall,
+			protocol.ResourceGuideLookupCall,
 			"Request a runtime-managed resource-guide lookup from the guidance_lookup phase for a CRD-backed resource family and operational problem focus.",
 			resourceGuideLookup{},
 		),
 		internalStructuredFunctionDefinition(
-			internalFinalReportCall,
+			protocol.FinalReportCall,
 			"Submit the structured final diagnostic report when enough evidence has been collected or blockers are known.",
 			finalReport{},
 		),
 		internalStructuredFunctionDefinition(
-			internalNextDirectionsCall,
+			protocol.NextDirectionsCall,
 			"Submit 1-3 continuation options after an inconclusive final_report.",
 			nextDirections{},
 		),
 		internalStructuredFunctionDefinition(
-			internalMutationVerificationResultCall,
-			"Interpret collected mutation verification evidence before final reporting or further remediation.",
+			protocol.MutationVerificationResultCall,
+			"Classify the active mutation verification as satisfied, waiting on the same await-state ID, or failed using exact runtime evidence references.",
 			mutationVerificationResult{},
+		),
+		internalStructuredFunctionDefinition(
+			protocol.ContinuationHandoffCall,
+			"Close the bounded execution segment without resetting the active request, lineage, evidence, or safety budgets.",
+			contract.ContinuationHandoff{},
 		),
 	}
 }
 
 func internalStructuredFunctionDefinition(name, description string, value any) *gollm.FunctionDefinition {
+	parameters := buildFunctionSchema(reflect.TypeOf(value))
+	if name == protocol.MutationVerificationResultCall {
+		parameters.Description = "Required only when runtime requests the result for the active mutation verification."
+		describeSchemaProperty(parameters, "verification_id", "Exact active verification ID supplied by runtime.")
+		describeSchemaProperty(parameters, "status", "satisfied, waiting, or failed. waiting is valid only for the same await_state verification.")
+		describeSchemaProperty(parameters, "evidence_refs", "Observation IDs recorded for the active verification; include its latest observation.")
+		describeSchemaProperty(parameters, "evidence_summary", "Concise facts established by the referenced observations.")
+		describeSchemaProperty(parameters, "reason", "Why the referenced evidence supports this status.")
+		describeSchemaProperty(parameters, "next_action", "Required only for failed: a materially different diagnostic or remediation direction.")
+	}
+	if name == protocol.ContinuationHandoffCall {
+		parameters.Description = "Required only when runtime requests bounded execution-segment closure. This does not create a new request or reset lineage and budgets."
+		describeSchemaProperty(parameters, "request_id", "Exact active runtime request ID.")
+		describeSchemaProperty(parameters, "goal_id", "Exact active runtime goal ID.")
+		describeSchemaProperty(parameters, "current_judgement", "Concise evidence-based status at segment closure; do not claim completion.")
+		describeSchemaProperty(parameters, "completed_steps", "Only terminal runtime step IDs from the execution anchor.")
+		describeSchemaProperty(parameters, "evidence_refs", "Only existing runtime observation IDs.")
+		describeSchemaProperty(parameters, "unresolved_steps", "Every active or pending runtime step ID; do not omit a nonterminal step.")
+		describeSchemaProperty(parameters, "mandatory_obligations", "Every unresolved mandatory obligation supplied by runtime; do not omit any.")
+		describeSchemaProperty(parameters, "recommended_next_step", "The first safe action or decision after explicit continuation.")
+		describeSchemaProperty(parameters, "conclusive", "Must be false because this closes only the current bounded segment.")
+	}
 	return &gollm.FunctionDefinition{
 		Name:        name,
 		Description: description,
-		Parameters:  buildFunctionSchema(reflect.TypeOf(value)),
+		Parameters:  parameters,
 	}
 }
 

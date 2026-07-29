@@ -1,11 +1,11 @@
 package coordinator
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/gollm"
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
 )
 
 func TestInputDispatchDecisionTable(t *testing.T) {
@@ -76,35 +76,47 @@ func TestInputDispatchDecisionTable(t *testing.T) {
 	}
 }
 
-func TestNextDirectionsRequiredGateBlocksOtherStructuredOutput(t *testing.T) {
-	loop := &Loop{
-		control: RuntimeControlAwaitingNextDirections,
-		pendingFinalReport: &finalReport{
-			Conclusive:      false,
-			Attempted:       []string{"observed deployment"},
-			MostLikelyCause: "inconclusive",
-			EvidenceMissing: []string{"pod events"},
-		},
-	}
-	if !loop.enforceRequestedStructuredDirective([]gollm.FunctionCall{{Name: "kubectl"}}) {
-		t.Fatal("next_directions_required gate should block action")
-	}
-	if !strings.Contains(loop.pendingResponseDirective, "next_directions") {
-		t.Fatalf("expected next_directions directive, got %q", loop.pendingResponseDirective)
-	}
-}
-
 func TestRuntimeStateAuditAllowsMutationVerificationToPrecedeRequestedReport(t *testing.T) {
 	snapshot := RuntimeSnapshot{
-		Lifecycle:                   LoopLifecycleModelTurn,
-		Control:                     RuntimeControlAwaitingMutationVerificationEvidence,
-		PendingMutationVerification: &pendingMutationVerification{},
+		Lifecycle: LoopLifecycleModelTurn,
+		Control:   RuntimeControlAwaitingMutationVerificationEvidence,
+		PendingMutationVerification: &pendingMutationVerification{
+			Checks: []verificationRuntimeCheck{{
+				ID:     "verification-1",
+				Status: contract.VerificationCheckActive,
+			}},
+		},
 	}
 	if got := snapshot.AuditError(); got != "" {
 		t.Fatalf("audit error = %q, want none because mutation verification control takes precedence", got)
 	}
 	if got := snapshot.Control; got != RuntimeControlAwaitingMutationVerificationEvidence {
 		t.Fatalf("control = %s, want %s", got, RuntimeControlAwaitingMutationVerificationEvidence)
+	}
+}
+
+func TestProjectRuntimeSnapshotUsesDetachedStateOnly(t *testing.T) {
+	state := runtimeState{
+		control:       RuntimeControlAwaitingModelStep,
+		originalQuery: "inspect pods",
+		phaseStepState: &phaseStepState{
+			CurrentPhaseIndex: 1,
+			PhaseSteps: []phaseStep{{
+				Index: 1,
+				Name:  "observation_execution",
+			}},
+			Completed: map[int]bool{},
+		},
+	}
+
+	snapshot := projectRuntimeSnapshot(&state, 7)
+
+	if snapshot.Revision != 7 || snapshot.Control != RuntimeControlAwaitingModelStep {
+		t.Fatalf("snapshot revision/control = %d/%s", snapshot.Revision, snapshot.Control)
+	}
+	snapshot.Phase.Completed[1] = true
+	if state.phaseStepState.Completed[1] {
+		t.Fatal("projected phase state shares storage with runtime root")
 	}
 }
 
@@ -132,9 +144,11 @@ func TestRuntimeStateControlLetsGuidedPhaseProgressPrecedeFinalReport(t *testing
 
 func TestRuntimeStateAuditRejectsFinalReportWithPendingVerification(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingFinalReport,
-		pendingMutationVerification: &pendingMutationVerification{
-			Requirements: []mutationEvidenceRequirement{{ID: "direct"}},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingFinalReport,
+			pendingMutationVerification: &pendingMutationVerification{
+				Checks: []verificationRuntimeCheck{{ID: "direct"}},
+			},
 		},
 	}
 
@@ -143,88 +157,84 @@ func TestRuntimeStateAuditRejectsFinalReportWithPendingVerification(t *testing.T
 	}
 }
 
+func TestRuntimeStateAuditRejectsVerificationShapeControlMismatch(t *testing.T) {
+	loop := &Loop{runtimeState: &runtimeState{
+		control: RuntimeControlAwaitingMutationVerificationChainEvidence,
+		pendingMutationVerification: &pendingMutationVerification{
+			Shape: contract.VerificationSingle,
+			Checks: []verificationRuntimeCheck{{
+				ID:     "verification-1",
+				Status: contract.VerificationCheckActive,
+			}},
+		},
+	}}
+	if got := loop.RuntimeSnapshot().AuditError(); got == "" {
+		t.Fatal("single verification was accepted under chain evidence control")
+	}
+}
+
 func TestTransitionControlDerivesLifecycle(t *testing.T) {
-	loop := &Loop{}
+	loop := &Loop{runtimeState: &runtimeState{
+		control:      RuntimeControlAwaitingModelStep,
+		pendingCalls: []PendingCall{{}},
+	}}
 	loop.transitionControl(RuntimeControlAwaitingApproval)
 	if loop.loopLifecycle() != LoopLifecycleWaitingApproval {
 		t.Fatalf("lifecycle = %v, want approval wait", loop.loopLifecycle())
 	}
 
+	loop.mutableRuntime().pendingMutationVerification = &pendingMutationVerification{
+		Checks: []verificationRuntimeCheck{{ID: "direct", Status: contract.VerificationCheckActive}},
+	}
 	loop.transitionControl(RuntimeControlAwaitingMutationVerificationEvidence)
 	if loop.loopLifecycle() != LoopLifecycleModelTurn {
 		t.Fatalf("lifecycle = %v, want model turn", loop.loopLifecycle())
 	}
 }
 
-func TestTransitionAfterToolFailureLeavesNoExecutingControl(t *testing.T) {
-	loop := &Loop{}
-	loop.transitionControl(RuntimeControlExecutingTool)
-	loop.transitionAfterToolFailure()
-	if loop.control != RuntimeControlAwaitingModelStep {
-		t.Fatalf("control = %s, want model step after tool failure", loop.control)
-	}
-
-	loop.transitionControl(RuntimeControlAwaitingMutationVerificationEvidence)
-	loop.transitionAfterToolFailure()
-	if loop.control != RuntimeControlAwaitingMutationVerificationEvidence {
-		t.Fatalf("tool failure recovery must preserve a more specific control, got %s", loop.control)
-	}
-}
-
-func TestRefreshInputOwnerPublishesExecutingToolSnapshot(t *testing.T) {
-	loop := &Loop{
-		control: RuntimeControlExecutingTool,
-	}
-	loop.refreshInputOwner()
-	snapshot, ok := loop.PublishedRuntimeSnapshot()
-	if !ok {
-		t.Fatal("expected published snapshot")
-	}
-	if snapshot.Control != RuntimeControlExecutingTool {
-		t.Fatalf("control = %s, want %s", snapshot.Control, RuntimeControlExecutingTool)
-	}
-}
-
 func TestRuntimeSnapshotProjectsPhaseAndSteps(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingModelStep,
-		phaseStepState: &phaseStepState{
-			RequestGoal:       "fix web app",
-			CurrentPhaseIndex: 2,
-			PhaseSteps: []phaseStep{
-				{Index: 1, Name: "lightweight_lookup", Goal: "inspect", CompletionCondition: "evidence collected"},
-				{
-					Index:               2,
-					Name:                "guided_diagnosis",
-					Goal:                "diagnose",
-					CompletionCondition: "guide completed",
-					Steps: []phaseExecutionStep{
-						{
-							ID:              "inspect_pods",
-							Kind:            "observation",
-							Description:     "Inspect pod state before following guide details",
-							Command:         "kubectl get pods -n app",
-							ExpectedOutcome: "pod state is visible",
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingMutationVerificationChainEvidence,
+			phaseStepState: &phaseStepState{
+				RequestGoal:       "fix web app",
+				CurrentPhaseIndex: 2,
+				PhaseSteps: []phaseStep{
+					{Index: 1, Name: "lightweight_lookup", Goal: "inspect", CompletionCondition: "evidence collected"},
+					{
+						Index:               2,
+						Name:                "guided_diagnosis",
+						Goal:                "diagnose",
+						CompletionCondition: "guide completed",
+						Steps: []phaseExecutionStep{
+							{
+								ID:              "inspect_pods",
+								Kind:            "observation",
+								Description:     "Inspect pod state before following guide details",
+								Command:         "kubectl get pods -n app",
+								ExpectedOutcome: "pod state is visible",
+							},
 						},
 					},
 				},
+				Completed: map[int]bool{1: true},
 			},
-			Completed: map[int]bool{1: true},
-		},
-		guideStepState: &guideStepState{
-			TotalSteps: 2,
-			StepDetails: []guideStepDetail{
-				{Index: 1, Description: "check pods", RenderedCommand: "kubectl get pods", ExpectedOutcome: "pods listed"},
-				{Index: 2, Description: "check events", RenderedCommand: "kubectl get events", ExpectedOutcome: "events listed"},
+			guideStepState: &guideStepState{
+				TotalSteps: 2,
+				StepDetails: []guideStepDetail{
+					{Index: 1, Description: "check pods", RenderedCommand: "kubectl get pods", ExpectedOutcome: "pods listed"},
+					{Index: 2, Description: "check events", RenderedCommand: "kubectl get events", ExpectedOutcome: "events listed"},
+				},
+				Completed: map[int]bool{1: true},
 			},
-			Completed: map[int]bool{1: true},
-		},
-		pendingMutationVerification: &pendingMutationVerification{
-			Requirements: []mutationEvidenceRequirement{
-				{ID: "mutation_1_direct", Kind: "direct_effect", Purpose: "check configmap", SuggestedCommand: "kubectl get configmap web -n app"},
-				{ID: "mutation_1_outcome", Kind: "outcome", Purpose: "check rollout", SuggestedCommand: "kubectl rollout status deployment/web -n app"},
+			pendingMutationVerification: &pendingMutationVerification{
+				Shape:       contract.VerificationChain,
+				ActiveIndex: 1,
+				Checks: []verificationRuntimeCheck{
+					{ID: "mutation_1_direct", ExpectedState: "check configmap", SuggestedCommand: "kubectl get configmap web -n app", Status: contract.VerificationCheckSatisfied},
+					{ID: "mutation_1_chain_2", ExpectedState: "check rollout", SuggestedCommand: "kubectl rollout status deployment/web -n app", Status: contract.VerificationCheckActive},
+				},
 			},
-			Satisfied: map[string]bool{"mutation_1_direct": true},
 		},
 	}
 	snapshot := loop.RuntimeSnapshot()
@@ -249,42 +259,40 @@ func TestRuntimeSnapshotProjectsPhaseAndSteps(t *testing.T) {
 	if got := snapshot.PhaseRuntime.Phases[1].Steps[0].Status; got != StepPending {
 		t.Fatalf("declared phase step status = %s, want %s", got, StepPending)
 	}
-	if len(snapshot.ActiveSteps) != 4 {
-		t.Fatalf("active steps len = %d, want 4", len(snapshot.ActiveSteps))
+	if len(snapshot.ActiveSteps) != 2 {
+		t.Fatalf("active steps len = %d, want 2", len(snapshot.ActiveSteps))
 	}
-	if got := snapshot.ActiveSteps[0].Ref.Kind; got != StepResourceGuideDiagnostic {
-		t.Fatalf("first step kind = %s, want %s", got, StepResourceGuideDiagnostic)
+	if got := snapshot.ActiveSteps[0].Ref.Kind; got != StepMutationEvidenceRequirement {
+		t.Fatalf("first step kind = %s, want %s", got, StepMutationEvidenceRequirement)
 	}
 	if got := snapshot.ActiveSteps[0].Status; got != StepCompleted {
-		t.Fatalf("guide step 1 status = %s, want %s", got, StepCompleted)
+		t.Fatalf("verification check 1 status = %s, want %s", got, StepCompleted)
 	}
 	if got := snapshot.ActiveSteps[1].Status; got != StepActive {
-		t.Fatalf("guide step 2 status = %s, want %s", got, StepActive)
+		t.Fatalf("verification check 2 status = %s, want %s", got, StepActive)
 	}
-	if got := snapshot.ActiveSteps[2].Ref.ID; got != "mutation_1_direct" {
-		t.Fatalf("mutation step id = %q, want mutation_1_direct", got)
-	}
-	if got := snapshot.ActiveSteps[2].Status; got != StepCompleted {
-		t.Fatalf("mutation direct status = %s, want %s", got, StepCompleted)
-	}
-	if got := snapshot.ActiveSteps[3].Status; got != StepActive {
-		t.Fatalf("mutation outcome status = %s, want %s", got, StepActive)
+	if projected := loop.activeProjectedStepRef(); projected == nil ||
+		projected.Kind != StepMutationEvidenceRequirement ||
+		projected.ID != "mutation_1_chain_2" {
+		t.Fatalf("projected active step = %#v, want active mutation verification check", projected)
 	}
 }
 
 func TestRuntimeSnapshotProjectsPendingCallAsEphemeralGeneralAction(t *testing.T) {
 	loop := &Loop{
-		control: RuntimeControlAwaitingApproval,
-		phaseStepState: &phaseStepState{
-			CurrentPhaseIndex: 1,
-			PhaseSteps:        []phaseStep{{Index: 1, Name: "remediation_execution"}},
-			Completed:         map[int]bool{},
-		},
-		pendingCalls: []PendingCall{
-			{FunctionCall: gollm.FunctionCall{
-				Name:      "kubectl",
-				Arguments: map[string]any{"command": "kubectl rollout restart deployment/web -n app"},
-			}},
+		runtimeState: &runtimeState{
+			control: RuntimeControlAwaitingApproval,
+			phaseStepState: &phaseStepState{
+				CurrentPhaseIndex: 1,
+				PhaseSteps:        []phaseStep{{Index: 1, Name: "remediation_execution"}},
+				Completed:         map[int]bool{},
+			},
+			pendingCalls: []PendingCall{
+				{FunctionCall: gollm.FunctionCall{
+					Name:      "kubectl",
+					Arguments: map[string]any{"command": "kubectl rollout restart deployment/web -n app"},
+				}},
+			},
 		},
 	}
 	snapshot := loop.RuntimeSnapshot()
@@ -305,75 +313,81 @@ func TestRuntimeSnapshotProjectsPendingCallAsEphemeralGeneralAction(t *testing.T
 
 func TestRuntimeCleanupPoliciesClearControlBoundaryState(t *testing.T) {
 	loop := &Loop{
-		control:                      RuntimeControlAwaitingFinalReport,
-		pendingCalls:                 []PendingCall{{FunctionCall: gollm.FunctionCall{Name: "kubectl"}}},
-		pendingResponseDirective:     "final_report",
-		pendingFinalReport:           &finalReport{},
-		pendingNextDirections:        &nextDirections{},
-		pendingDirectionPrompt:       &directionPromptState{},
-		mutationContinuationAttempts: 2,
-		pendingMutationVerification:  &pendingMutationVerification{},
+		runtimeState: &runtimeState{
+			control:                      RuntimeControlAwaitingFinalReport,
+			pendingCalls:                 []PendingCall{{FunctionCall: gollm.FunctionCall{Name: "kubectl"}}},
+			pendingResponseDirective:     "final_report",
+			pendingFinalReport:           &finalReport{},
+			pendingNextDirections:        &nextDirections{},
+			pendingDirectionPrompt:       &directionPromptState{},
+			mutationContinuationAttempts: 2,
+			pendingMutationVerification:  &pendingMutationVerification{},
+		},
 	}
 
 	loop.applyRuntimeCleanup(cleanupExitPolicy())
 
-	if len(loop.pendingCalls) != 0 {
-		t.Fatalf("pendingCalls = %#v, want cleared", loop.pendingCalls)
+	if len(loop.mutableRuntime().pendingCalls) != 0 {
+		t.Fatalf("pendingCalls = %#v, want cleared", loop.mutableRuntime().pendingCalls)
 	}
-	if loop.pendingResponseDirective != "" {
-		t.Fatalf("response directive still set: %q", loop.pendingResponseDirective)
+	if loop.mutableRuntime().pendingResponseDirective != "" {
+		t.Fatalf("response directive still set: %q", loop.mutableRuntime().pendingResponseDirective)
 	}
-	if loop.pendingFinalReport != nil || loop.pendingNextDirections != nil || loop.pendingDirectionPrompt != nil {
+	if loop.mutableRuntime().pendingFinalReport != nil || loop.mutableRuntime().pendingNextDirections != nil || loop.mutableRuntime().pendingDirectionPrompt != nil {
 		t.Fatalf("direction lifecycle still set")
 	}
-	if loop.mutationContinuationAttempts != 0 {
-		t.Fatalf("mutation continuation attempts = %d, want 0", loop.mutationContinuationAttempts)
+	if loop.mutableRuntime().mutationContinuationAttempts != 0 {
+		t.Fatalf("mutation continuation attempts = %d, want 0", loop.mutableRuntime().mutationContinuationAttempts)
 	}
-	if loop.pendingMutationVerification == nil {
+	if loop.mutableRuntime().pendingMutationVerification == nil {
 		t.Fatal("exit cleanup should not discard mutation verification evidence obligation")
 	}
 }
 
 func TestApprovalDeclinedCleanupPreservesResponseDirectives(t *testing.T) {
 	loop := &Loop{
-		control:                  RuntimeControlAwaitingFinalReport,
-		pendingCalls:             []PendingCall{{FunctionCall: gollm.FunctionCall{Name: "kubectl"}}},
-		pendingResponseDirective: "return final_report",
+		runtimeState: &runtimeState{
+			control:                  RuntimeControlAwaitingFinalReport,
+			pendingCalls:             []PendingCall{{FunctionCall: gollm.FunctionCall{Name: "kubectl"}}},
+			pendingResponseDirective: "return final_report",
+		},
 	}
 
 	loop.applyRuntimeCleanup(cleanupApprovalDeclinedPolicy())
 
-	if len(loop.pendingCalls) != 0 {
-		t.Fatalf("pendingCalls = %#v, want cleared", loop.pendingCalls)
+	if len(loop.mutableRuntime().pendingCalls) != 0 {
+		t.Fatalf("pendingCalls = %#v, want cleared", loop.mutableRuntime().pendingCalls)
 	}
-	if loop.control != RuntimeControlAwaitingFinalReport || loop.pendingResponseDirective != "return final_report" {
-		t.Fatalf("approval cleanup must preserve control and directive: control=%s directive=%q", loop.control, loop.pendingResponseDirective)
+	if loop.mutableRuntime().control != RuntimeControlAwaitingFinalReport || loop.mutableRuntime().pendingResponseDirective != "return final_report" {
+		t.Fatalf("approval cleanup must preserve control and directive: control=%s directive=%q", loop.mutableRuntime().control, loop.mutableRuntime().pendingResponseDirective)
 	}
 }
 
 func TestDirectionCleanupPreservesPendingCalls(t *testing.T) {
 	loop := &Loop{
-		control:                     RuntimeControlAwaitingMutationContinuation,
-		pendingCalls:                []PendingCall{{FunctionCall: gollm.FunctionCall{Name: "kubectl"}}},
-		pendingResponseDirective:    "next_directions",
-		pendingFinalReport:          &finalReport{},
-		pendingNextDirections:       &nextDirections{},
-		pendingDirectionPrompt:      &directionPromptState{},
-		pendingMutationVerification: &pendingMutationVerification{},
+		runtimeState: &runtimeState{
+			control:                     RuntimeControlAwaitingMutationContinuation,
+			pendingCalls:                []PendingCall{{FunctionCall: gollm.FunctionCall{Name: "kubectl"}}},
+			pendingResponseDirective:    "next_directions",
+			pendingFinalReport:          &finalReport{},
+			pendingNextDirections:       &nextDirections{},
+			pendingDirectionPrompt:      &directionPromptState{},
+			pendingMutationVerification: &pendingMutationVerification{},
+		},
 	}
 
 	loop.applyRuntimeCleanup(cleanupDirectionPromptPolicy())
 
-	if len(loop.pendingCalls) != 1 {
-		t.Fatalf("pendingCalls = %#v, want preserved", loop.pendingCalls)
+	if len(loop.mutableRuntime().pendingCalls) != 1 {
+		t.Fatalf("pendingCalls = %#v, want preserved", loop.mutableRuntime().pendingCalls)
 	}
-	if loop.pendingFinalReport != nil || loop.pendingNextDirections != nil || loop.pendingDirectionPrompt != nil {
+	if loop.mutableRuntime().pendingFinalReport != nil || loop.mutableRuntime().pendingNextDirections != nil || loop.mutableRuntime().pendingDirectionPrompt != nil {
 		t.Fatalf("direction lifecycle still set")
 	}
-	if loop.pendingMutationVerification == nil || loop.control != RuntimeControlAwaitingMutationContinuation {
+	if loop.mutableRuntime().pendingMutationVerification == nil || loop.mutableRuntime().control != RuntimeControlAwaitingMutationContinuation {
 		t.Fatalf("verification lifecycle should be preserved")
 	}
-	if loop.pendingResponseDirective != "" {
+	if loop.mutableRuntime().pendingResponseDirective != "" {
 		t.Fatalf("response directives still set")
 	}
 }
@@ -385,72 +399,43 @@ func TestAuditRuntimeStateHandlesWaitingStateInvariants(t *testing.T) {
 	}{
 		{
 			name: "approval without pending calls",
-			loop: &Loop{control: RuntimeControlAwaitingApproval},
+			loop: &Loop{
+				runtimeState: &runtimeState{
+					control: RuntimeControlAwaitingApproval,
+				},
+			},
 		},
 		{
 			name: "direction choice without prompt",
-			loop: &Loop{control: RuntimeControlAwaitingContinuationChoice},
+			loop: &Loop{
+				runtimeState: &runtimeState{
+					control: RuntimeControlAwaitingContinuationChoice,
+				},
+			},
 		},
 		{
 			name: "direction text with stale choice prompt",
 			loop: &Loop{
-				control:                RuntimeControlAwaitingContinuationText,
-				pendingDirectionPrompt: &directionPromptState{},
+				runtimeState: &runtimeState{
+					control:                RuntimeControlAwaitingContinuationText,
+					pendingDirectionPrompt: &directionPromptState{},
+				},
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.loop.output = make(chan *api.Message, 1)
-			if !tt.loop.auditRuntimeState() {
+			handled, err := tt.loop.auditRuntimeState()
+			if err != nil {
+				t.Fatalf("auditRuntimeState() error = %v", err)
+			}
+			if !handled {
 				t.Fatal("expected audit to handle invalid waiting lifecycle")
 			}
 			if tt.loop.loopLifecycle() != LoopLifecycleAwaitingUserInput {
 				t.Fatalf("lifecycle = %v, want LoopLifecycleAwaitingUserInput", tt.loop.loopLifecycle())
 			}
 		})
-	}
-}
-
-func TestNextDirectionsRequiredGateBlocksPlainAnswer(t *testing.T) {
-	loop := &Loop{
-		control: RuntimeControlAwaitingNextDirections,
-		pendingFinalReport: &finalReport{
-			Conclusive:      false,
-			Attempted:       []string{"observed deployment"},
-			MostLikelyCause: "inconclusive",
-			EvidenceMissing: []string{"pod events"},
-		},
-	}
-	if !loop.rejectPlainAnswerDuringNextDirections("I can answer now.") {
-		t.Fatal("next_directions plain-answer gate should block text")
-	}
-	if loop.loopLifecycle() != LoopLifecycleModelTurn {
-		t.Fatalf("lifecycle = %v, want LoopLifecycleModelTurn", loop.loopLifecycle())
-	}
-	if !strings.Contains(loop.pendingResponseDirective, "next_directions") {
-		t.Fatalf("expected next_directions directive, got %q", loop.pendingResponseDirective)
-	}
-}
-
-func TestNextDirectionsRequiredGateStopsAfterRepeatedPlainAnswer(t *testing.T) {
-	loop := &Loop{
-		control: RuntimeControlAwaitingNextDirections,
-		output:  make(chan *api.Message, 1),
-		pendingFinalReport: &finalReport{
-			Conclusive:      false,
-			Attempted:       []string{"observed deployment"},
-			MostLikelyCause: "inconclusive",
-			EvidenceMissing: []string{"pod events"},
-		},
-	}
-	if !loop.rejectPlainAnswerDuringNextDirections("I can answer now.") {
-		t.Fatal("first plain answer should be handled")
-	}
-	if !loop.rejectPlainAnswerDuringNextDirections("I can answer now.") {
-		t.Fatal("repeated plain answer should be handled")
-	}
-	if loop.loopLifecycle() != LoopLifecycleAwaitingUserInput {
-		t.Fatalf("lifecycle = %v, want LoopLifecycleAwaitingUserInput", loop.loopLifecycle())
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/GoogleCloudPlatform/kubectl-ai/pkg/api"
+	"github.com/namgon-kim/kinx-k8s-assistant/internal/react/contract"
 	"k8s.io/klog/v2"
 )
 
@@ -16,9 +17,17 @@ func (l *Loop) waitForInput(ctx context.Context) bool {
 	case raw := <-l.input:
 		if raw == io.EOF {
 			klog.V(0).InfoS("react waitForInput received EOF")
-			l.applyRuntimeCleanup(cleanupExitPolicy())
-			l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "종료합니다.")
-			l.transitionControl(RuntimeControlExited)
+			if err := l.mutateRuntimeAtomically(func() error {
+				if warning := l.finalizePendingMutationVerification("input stream reached EOF", contract.AttemptUnknown); warning != "" {
+					l.addMessage(api.MessageSourceAgent, api.MessageTypeError, warning)
+				}
+				l.applyRuntimeCleanup(cleanupExitPolicy())
+				l.addMessage(api.MessageSourceAgent, api.MessageTypeText, "종료합니다.")
+				l.transitionControl(RuntimeControlExited)
+				return nil
+			}); err != nil {
+				klog.ErrorS(err, "react EOF cleanup rejected")
+			}
 			return false
 		}
 		input, ok := raw.(*api.UserInputResponse)
@@ -50,8 +59,16 @@ func (l *Loop) waitForApproval(ctx context.Context) bool {
 	case raw := <-l.input:
 		if raw == io.EOF {
 			klog.V(0).InfoS("react waitForApproval received EOF")
-			l.applyRuntimeCleanup(cleanupExitPolicy())
-			l.transitionControl(RuntimeControlExited)
+			if err := l.mutateRuntimeAtomically(func() error {
+				if warning := l.finalizePendingMutationVerification("approval input stream reached EOF", contract.AttemptUnknown); warning != "" {
+					l.addMessage(api.MessageSourceAgent, api.MessageTypeError, warning)
+				}
+				l.applyRuntimeCleanup(cleanupExitPolicy())
+				l.transitionControl(RuntimeControlExited)
+				return nil
+			}); err != nil {
+				klog.ErrorS(err, "react approval EOF cleanup rejected")
+			}
 			return false
 		}
 		choice, ok := raw.(*api.UserChoiceResponse)

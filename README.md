@@ -11,7 +11,7 @@
 | `cmd/k8s-assistant` | 메인 CLI |
 | `internal/react/react.go` | 외부 facade. `New`, `Loop`, runtime snapshot/input type을 노출 |
 | `internal/react/coordinator` | model turn, 입력, tool 실행, 출력 등 ReAct I/O orchestration |
-| `internal/react/session` | control/phase/verification/context mutable session state |
+| `internal/react/session` | revisioned aggregate와 goal/phase/step attempt/observation ledger |
 | `internal/react/flow` | request, phase, guidance, verification, report, direction, gate 규칙 |
 | `internal/react/contract` | package 간 immutable enum, event/effect, structured payload |
 | `internal/react/protocol`, `internal/react/kube` | native/shim 호출 규약과 kubectl command/read-only 정책 |
@@ -198,7 +198,7 @@ Qdrant에 runbook 또는 resource guide 자료를 올릴 때:
 | [`docs/architecture_orchestrator_react.md`](./docs/architecture_orchestrator_react.md) | Orchestrator와 ReAct loop 구조 |
 | [`docs/reviews/react_loop_structure_review.md`](./docs/reviews/react_loop_structure_review.md) | ReAct loop 구조 리스크 리뷰 |
 | [`docs/requirement_analysis.md`](./docs/requirement_analysis.md) | 요청 분석 계약 |
-| [`docs/request_processing_phases.md`](./docs/request_processing_phases.md) | phase plan/progress 계약 |
+| [`docs/request_processing_phases.md`](./docs/request_processing_phases.md) | phase plan/progress, goal/step 실행, plan revision 계약 |
 | [`docs/guide_progress_and_continuation.md`](./docs/guide_progress_and_continuation.md) | guide progress, final_report, next_directions 흐름 |
 | [`docs/TODO.md`](./docs/TODO.md) | 남은 TODO와 drop 사유 |
 | [`bug.md`](./bug.md) | 현재 확인한 버그/리스크 목록 |
@@ -216,7 +216,7 @@ internal/
   react/
     react.go              # public facade
     coordinator/          # model/input/tool/output orchestration
-    session/              # mutable control/phase/verification/context state
+    session/              # revisioned aggregate and execution ledger
     flow/                 # request/phase/guidance/verification/report/gate rules
     contract/             # shared enum, event/effect, structured payload
     protocol/, kube/      # native/shim protocol and kubectl policy
