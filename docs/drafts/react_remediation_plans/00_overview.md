@@ -1,5 +1,12 @@
 # ReAct Remediation Plans Overview
 
+> 상태: Active index.
+>
+> 이 문서는 remediation plan의 현재 disposition을 추적한다. `Resolved`는 현재 코드와
+> stable 문서에 계약이 반영됐음을, `Active`는 독립 후속 작업이 남았음을, `Planned`는
+> 아직 착수하지 않은 별도 프로젝트임을 뜻한다. `Dropped`는 현재 구조에서 더 이상
+> 실행하지 않는 계획이며 구현 기준으로 사용하지 않는다.
+
 이 문서는 현재 `internal/react`와 `internal/orchestrator` 구조가 사용자의 기대와 다르게 개발된 지점을 고정하고, 항목별 수정 계획을 연결한다.
 
 핵심 결론은 다음과 같다.
@@ -12,17 +19,17 @@
 
 ## Plan Set
 
-| Plan | Scope | Priority |
-| --- | --- | --- |
-| [`01_user_input_ownership.md`](./01_user_input_ownership.md) | ReAct 입력 소유권과 orchestrator side-flow 차단 | High |
-| [`02_phase_plan_runtime_contract.md`](./02_phase_plan_runtime_contract.md) | model-owned phase plan을 runtime contract로 제한 | High |
-| [`03_mutation_lifecycle.md`](./03_mutation_lifecycle.md) | mutation의 plan -> approve -> execute -> verify -> report 강제 | Critical |
-| [`04_namespace_scope_invariant.md`](./04_namespace_scope_invariant.md) | request namespace/scope와 action command 일치 강제 | Critical |
-| [`05_rag_boundary.md`](./05_rag_boundary.md) | resource guide와 incident runbook 경계 정리 | High |
-| [`06_deterministic_gates_vs_correction.md`](./06_deterministic_gates_vs_correction.md) | LLM correction 의존을 deterministic gate로 전환 | High |
-| [`07_explicit_state_machine.md`](./07_explicit_state_machine.md) | implicit flags를 명시적 state machine으로 정리 | High |
-| [`08_turn_output_contract_and_goal_execution.md`](./08_turn_output_contract_and_goal_execution.md) | turn output contract, goal/step execution, attempt ledger, plan revision | High |
-| [`09_durable_session_persistence.md`](./09_durable_session_persistence.md) | checkpoint/journal, crash consistency, durable session recovery | High |
+| Plan | Scope | Priority | Status |
+| --- | --- | --- | --- |
+| [`01_user_input_ownership.md`](./01_user_input_ownership.md) | ReAct 입력 소유권과 orchestrator side-flow 차단 | High | Resolved |
+| [`02_phase_plan_runtime_contract.md`](./02_phase_plan_runtime_contract.md) | model-owned phase plan을 runtime contract로 제한 | High | Resolved |
+| [`03_mutation_lifecycle.md`](./03_mutation_lifecycle.md) | mutation의 plan -> approve -> execute -> verify -> report 강제 | Critical | Resolved |
+| [`04_namespace_scope_invariant.md`](./04_namespace_scope_invariant.md) | request namespace/scope와 action command 일치 강제 | Critical | Active |
+| [`05_rag_boundary.md`](./05_rag_boundary.md) | resource guide와 incident runbook 경계 정리 | High | Resolved |
+| [`06_deterministic_gates_vs_correction.md`](./06_deterministic_gates_vs_correction.md) | LLM correction 의존을 deterministic gate로 전환 | High | Resolved |
+| [`07_explicit_state_machine.md`](./07_explicit_state_machine.md) | implicit flags를 명시적 state machine으로 정리 | High | Resolved |
+| [`08_turn_output_contract_and_goal_execution.md`](./08_turn_output_contract_and_goal_execution.md) | turn output contract, goal/step execution, attempt ledger, plan revision | High | Resolved |
+| [`09_durable_session_persistence.md`](./09_durable_session_persistence.md) | checkpoint/journal, crash consistency, durable session recovery | High | Planned |
 
 ## Current Evidence
 
@@ -78,7 +85,7 @@
 - 특정 resource 이름이나 특정 runbook title을 필터링하는 방식은 원칙적으로 피한다.
 - guidance를 Kubernetes 변경 실행기로 만들지 않는다.
 
-## Execution Order
+## Original Plan Order
 
 1. `04_namespace_scope_invariant.md`
 2. `03_mutation_lifecycle.md`
@@ -90,4 +97,6 @@
 8. `08_turn_output_contract_and_goal_execution.md`
 9. `09_durable_session_persistence.md`
 
-이 순서는 사용자가 실제로 본 오류를 먼저 닫기 위한 것이다. namespace/mutation 문제는 cluster 변경을 잘못 수행할 수 있으므로 최우선이다.
+이 순서는 최초 계획 당시 사용자가 실제로 본 오류를 먼저 닫기 위한 것이었다. 현재는
+Plan 04의 manifest namespace 검증과 별도 프로젝트인 Plan 09만 미완료이므로 신규 작업
+순서로 사용하지 않는다.

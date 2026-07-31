@@ -13,6 +13,16 @@
 | `docs/rag/` | guidance RAG 업로드/검색용 정제 문서 | 코드 계약 문서가 아니라 운영 지식 입력이다. |
 | `docs/rag_raws/` | RAG 문서 작성 전 원천/메모 | 런타임 계약이나 사용자 문서로 간주하지 않는다. |
 
+문서 상태는 다음 의미로 사용한다.
+
+| 상태 | 의미 |
+| --- | --- |
+| `Resolved` | 해당 계획의 acceptance contract가 현재 코드와 안정 문서에 반영됐다. 관련 영역의 독립 hardening TODO까지 모두 끝났다는 뜻은 아니다. |
+| `Active` | 현재 구조에 유효하며 아직 구현 또는 정리가 남아 있다. |
+| `Planned` | 기존 구현과 분리된 후속 프로젝트이며 아직 착수하지 않았다. |
+| `Dropped` | 현재 구조에서는 실행하지 않는다. 역사적 근거만 보존할 수 있다. |
+| `Reference` | 코드 구현 상태를 추적하는 계획이 아니라 domain/RAG 입력 자료다. |
+
 ## 문서별 감사 결과
 
 ### Root Docs
@@ -28,6 +38,7 @@
 
 | 문서 | 적용 상태 | 주요 코드 위치 |
 | --- | --- | --- |
+| [`react_agent_architecture_blueprint.md`](./react_agent_architecture_blueprint.md) | 현재 Agent를 system context, runtime state, atomic turn, output contract, dispatch, verification, guidance, continuation 관점의 상세 설계도로 설명 | `internal/orchestrator`, `internal/react/*`, `internal/toolconnector`, `internal/guidance` |
 | [`architecture_orchestrator_react.md`](./architecture_orchestrator_react.md) | 새 package layout 기준 갱신됨. revisioned session aggregate, immutable dispatch, evidence qualification, bounded continuation과 plan revision 경계를 반영 | `cmd/k8s-assistant`, `internal/orchestrator`, `internal/react/*`, `internal/toolconnector`, `internal/guidance` |
 | [`requirement_analysis.md`](./requirement_analysis.md) | 코드 기준 갱신됨. follow-up 계약과 현재 keyword/all-namespaces gap(`BUG-23`, `BUG-24`)을 구분 | `internal/react/contract/structured.go`, `internal/react/prompt/requirement.go`, `internal/react/flow/request`, `internal/react/coordinator/{state,iteration}.go` |
 | [`request_processing_phases.md`](./request_processing_phases.md) | 코드 기준 갱신됨. stable goal/phase/step contract, step result, evidence-based plan revision과 phase validation gap(`BUG-7`, `BUG-8`, `BUG-10`, `BUG-21`) 반영 | `internal/react/flow/phase`, `internal/react/session/execution.go`, `internal/react/flow/guidance`, `internal/react/flow/verification`, `internal/react/coordinator/{state,iteration,execution_state,revision}.go` |
@@ -37,22 +48,22 @@
 
 ### Drafts
 
-| 문서 | 구현 상태 | 정리 방향 |
+| 문서 | 상태 | 정리 방향 |
 | --- | --- | --- |
-| [`drafts/react_gate_outcome_design.md`](./drafts/react_gate_outcome_design.md) | gate 구조는 구현됨, control 파생 전제는 state renewal로 대체 | `GateOutcome` 설계 이력으로 유지. 현재 control/session 계약은 architecture 문서와 plan 07을 기준으로 본다. |
-| [`drafts/react_remediation_plans/00_overview.md`](./drafts/react_remediation_plans/00_overview.md) | 코드 기준 갱신됨 | remediation plan 묶음의 현황 인덱스로 유지. |
-| [`drafts/react_remediation_plans/01_user_input_ownership.md`](./drafts/react_remediation_plans/01_user_input_ownership.md) | 구현됨 | 현재 구현 기준으로 유지하거나 안정 문서에 병합 가능. |
-| [`drafts/react_remediation_plans/02_phase_plan_runtime_contract.md`](./drafts/react_remediation_plans/02_phase_plan_runtime_contract.md) | 구현됨 | `request_processing_phases.md`와 중복되는 부분은 장기적으로 통합. |
-| [`drafts/react_remediation_plans/03_mutation_lifecycle.md`](./drafts/react_remediation_plans/03_mutation_lifecycle.md) | 구현됨 | mutation verification 계약은 안정 문서 승격 후보. kubectl failure/manifest parsing 후속은 plan 06과 TODO에서 추적. |
-| [`drafts/react_remediation_plans/04_namespace_scope_invariant.md`](./drafts/react_remediation_plans/04_namespace_scope_invariant.md) | 부분 구현됨, TODO 분리 | file/manifest 기반 namespace 검증은 [`TODO.md`](./TODO.md)에서 추적. |
-| [`drafts/react_remediation_plans/05_rag_boundary.md`](./drafts/react_remediation_plans/05_rag_boundary.md) | 구현됨, 코드 기준 갱신됨 | incident plan은 summary 입력일 뿐 자동 실행/주입 경로가 아님. |
-| [`drafts/react_remediation_plans/06_deterministic_gates_vs_correction.md`](./drafts/react_remediation_plans/06_deterministic_gates_vs_correction.md) | 구현됨, 코드 기준 갱신됨 | tool failure 분류, runtime gate와 session-scoped correction counter를 반영. 남은 semantic gate hardening은 [`TODO.md`](./TODO.md)에서 추적. |
-| [`drafts/react_remediation_plans/07_explicit_state_machine.md`](./drafts/react_remediation_plans/07_explicit_state_machine.md) | 구현됨 | `contract`, `session`, `coordinator` 분리와 revisioned aggregate 단일 source of truth를 반영. |
-| [`drafts/react_remediation_plans/08_turn_output_contract_and_goal_execution.md`](./drafts/react_remediation_plans/08_turn_output_contract_and_goal_execution.md) | 2026-07-28 source 대조 기준 Stage 0A와 1-6 코드 구현됨 | typed output matrix, atomic turn pipeline, immutable dispatch, stable execution contract, bounded indexed ledger, plan revision, compatibility cleanup의 현재 구현 기록. |
-| [`drafts/react_remediation_plans/09_durable_session_persistence.md`](./drafts/react_remediation_plans/09_durable_session_persistence.md) | 미구현 파생 계획 | checkpoint/journal과 crash recovery는 turn contract와 분리된 후속 범위다. |
-| [`drafts/draft_troubleshooting_v1.md`](./drafts/draft_troubleshooting_v1.md) | Legacy 초안, 현재 구조와 다수 불일치 | `trouble_shooting` MCP/server, `internal/troubleshooting`, `troubleshooting-upload`, kubectl-ai Agent 재주입 흐름은 현재 구현 기준이 아니다. 현재 기준은 `internal/guidance` 내장 client와 `log-analyzer` 분리다. |
-| [`drafts/draft_for_cluster-api.md`](./drafts/draft_for_cluster-api.md) | 미구현 설계 초안, 후반부 최종 권장안만 현재 원칙과 가까움 | 초반의 `cluster-api-server` MCP, `trouble-shooting` MCP, `internal/troubleshooting/runbooks` 경로는 현재 구현 기준이 아니다. Cluster API 도메인 확장 논의로 보관. |
-| [`drafts/draft_runbook_iksv2.md`](./drafts/draft_runbook_iksv2.md) | RAG/runbook 원천 초안, 코드 구현 상태 대상 아님 | 정제본은 `docs/rag/`와 `internal/guidance/runbooks/`를 기준으로 본다. |
+| [`drafts/react_gate_outcome_design.md`](./drafts/react_gate_outcome_design.md) | Resolved | `GateOutcome`과 branch/correction 계약은 적용됨. package split 이전 N차 실행 순서는 완료된 migration 이력으로 보존한다. |
+| [`drafts/react_remediation_plans/00_overview.md`](./drafts/react_remediation_plans/00_overview.md) | Active index | remediation plan 묶음의 authoritative disposition 표로 유지한다. |
+| [`drafts/react_remediation_plans/01_user_input_ownership.md`](./drafts/react_remediation_plans/01_user_input_ownership.md) | Resolved | 현재 구현 기준으로 유지하거나 안정 문서에 병합 가능. |
+| [`drafts/react_remediation_plans/02_phase_plan_runtime_contract.md`](./drafts/react_remediation_plans/02_phase_plan_runtime_contract.md) | Resolved | 현재 계약은 `request_processing_phases.md`에 반영됐고 draft는 상세 이력으로 유지한다. |
+| [`drafts/react_remediation_plans/03_mutation_lifecycle.md`](./drafts/react_remediation_plans/03_mutation_lifecycle.md) | Resolved | mutation verification 계약은 안정 문서에 반영됨. kubectl failure/manifest parsing은 독립 TODO다. |
+| [`drafts/react_remediation_plans/04_namespace_scope_invariant.md`](./drafts/react_remediation_plans/04_namespace_scope_invariant.md) | Active | file/manifest 기반 namespace 검증은 [`TODO.md`](./TODO.md)에서 추적한다. |
+| [`drafts/react_remediation_plans/05_rag_boundary.md`](./drafts/react_remediation_plans/05_rag_boundary.md) | Resolved | incident plan은 summary 입력일 뿐 자동 실행/주입 경로가 아니다. |
+| [`drafts/react_remediation_plans/06_deterministic_gates_vs_correction.md`](./drafts/react_remediation_plans/06_deterministic_gates_vs_correction.md) | Resolved | runtime gate와 session correction state는 적용됨. kubectl verbose 분류와 semantic hardening은 독립 TODO다. |
+| [`drafts/react_remediation_plans/07_explicit_state_machine.md`](./drafts/react_remediation_plans/07_explicit_state_machine.md) | Resolved | revisioned aggregate 단일 source of truth를 반영했으며 Step 1~7은 완료된 migration 이력이다. |
+| [`drafts/react_remediation_plans/08_turn_output_contract_and_goal_execution.md`](./drafts/react_remediation_plans/08_turn_output_contract_and_goal_execution.md) | Resolved | Stage 0A와 1~6이 구현됐으며 현재 turn/runtime 계약의 상세 구현 기록이다. |
+| [`drafts/react_remediation_plans/09_durable_session_persistence.md`](./drafts/react_remediation_plans/09_durable_session_persistence.md) | Planned | checkpoint/journal과 crash recovery는 turn contract와 분리된 미착수 후속 프로젝트다. |
+| [`drafts/draft_troubleshooting_v1.md`](./drafts/draft_troubleshooting_v1.md) | Legacy | 역할 분리와 incident signal 논의는 이력으로 남기고, standalone troubleshooting 서버/package/upload/Agent 재주입 전제만 Dropped로 본다. |
+| [`drafts/draft_for_cluster-api.md`](./drafts/draft_for_cluster-api.md) | 미적용 도메인 초안 | Cluster API 확장 논의는 유지하고, 초반의 별도 MCP/troubleshooting package 전제만 Dropped로 본다. |
+| [`drafts/draft_runbook_iksv2.md`](./drafts/draft_runbook_iksv2.md) | Reference | 코드 구현 상태 대상이 아니다. 정제본은 `docs/rag/`와 `internal/guidance/runbooks/`를 기준으로 본다. |
 
 ### Reviews
 
@@ -88,8 +99,8 @@
 | stable docs와 draft 중복 | phase/guidance/mutation 계약이 stable docs와 remediation draft에 동시에 있음 | 현재는 `docs/*.md`를 계약 기준으로 보고, draft는 이력/세부 계획으로 둔다. 안정화되면 중복 draft를 통합한다. |
 | RAG 문서 | 운영 지식 문서이며 코드 레이아웃 설명이 아님 | `docs/rag`와 `docs/rag_raws`는 구현 계약/README와 분리한다. |
 | `request_processing_phases.md` legacy guide-trigger 문구 | 코드상 자동 initial guide injection은 비활성화됐고 `guidance_lookup` phase에서만 `resource_guide_lookup`을 허용함 | 현재 runtime strategy로 수정 완료. |
-| `guide_progress_and_continuation.md` anchor 순서 | 코드상 effective order는 `runtime_state` → `requirement_analysis` → `phase_step` → `guide_step` → `mutation_verification` | 문서 수정 완료. |
-| `guide_progress_and_continuation.md` guide step matching | 코드상 rendered command의 whitespace-normalized exact match만 자동 완료로 인정함 | 문서 수정 완료. |
+| `guide_progress_and_continuation.md` anchor 순서 | 코드상 effective order는 `runtime_state` → `requirement_analysis` → `execution` → `phase_step` → `guide_step` → `mutation_verification` | 문서 수정 완료. |
+| `guide_progress_and_continuation.md` guide step matching | 코드상 인식 가능한 command tool/shell wrapper에서 추출한 실행문이 rendered command와 whitespace-normalized exact match일 때만 자동 완료로 인정함 | 문서 수정 완료. |
 | runtime gate 설명 부족 | 코드상 conversation tool-call, interactive command, read-only effect classification, assistant-managed guidance tool, tool failure classification gate가 있음 | `architecture_orchestrator_react.md`, `guide_progress_and_continuation.md`, plan 06에 반영 완료. |
 | incident guidance 실행 경계 | `Analyze`는 plan을 만들지만 orchestrator가 summary만 출력하고 unsafe/incomplete command는 숨기며 ReAct에 remediation을 주입하지 않음 | `architecture_orchestrator_react.md`, plan 05에 반영 완료. |
 

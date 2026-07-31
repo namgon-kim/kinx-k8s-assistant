@@ -3,8 +3,8 @@
 > 상태: 미적용 도메인 확장 초안.
 >
 > 이 문서는 Cluster API 도메인 확장 논의 기록이다. 초반부에는 `cluster-api-server`
-> MCP, `trouble-shooting` MCP, `internal/troubleshooting/runbooks` 같은 현재 구현과
-> 맞지 않는 과거 가정이 포함되어 있다. 후반부의 "설계 재검토: 최종 권장 방안"은
+> MCP, `trouble-shooting` MCP, `internal/troubleshooting/runbooks` 같은 Dropped
+> 설계 전제가 포함되어 있다. 후반부의 "설계 재검토: 최종 권장 방안"은
 > Kubernetes 데이터 수집을 ReAct/tool loop에 두고, guidance/RAG는 보조 근거로
 > 사용하는 현재 원칙과 더 가깝다.
 

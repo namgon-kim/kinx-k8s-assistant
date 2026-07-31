@@ -216,16 +216,17 @@ k8s-assistant는 LLM이 리소스 이름만 보고 custom resource 여부를 맞
 11. Runtime admission을 통과한 action은 immutable dispatch intent와 attempt로 먼저 commit됩니다. 실행 결과를 commit하지 못한 mutation은 자동 재실행하지 않고 unknown verification 대상으로 남깁니다.
 12. state-bearing evidence가 expected state를 명시적으로 반증한 verification failure는 다른 action 또는 evidence-backed plan revision으로 이어질 수 있습니다. 실행 여부가 불확실한 unknown만 unresolved obligation으로 남아 conclusive report를 막습니다.
 13. `Forbidden`/`Unauthorized` 관찰은 대상 상태가 아니라 접근 차단을 증명합니다. 같은 명령을 반복하지 않으며, 대체 관찰이 없고 요청 달성에 RBAC 변경이 실제로 필요하면 model은 이를 별도의 `risk.risky=true` mutation으로 제안하고 runtime은 정확한 명령을 사용자에게 승인받습니다.
-14. primary Kubernetes 리소스 후보가 있을 때만 런타임이 discovery로 built-in/CRD 여부를 확인합니다.
+14. primary Kubernetes 리소스 후보가 있으면 `requirement_analysis` 수락 직후의 read-only request preparation에서 built-in/CRD 여부를 분류합니다. 이 분류는 phase plan 수락이나 guide 주입보다 먼저 끝날 수 있지만 eligibility context일 뿐입니다.
 15. CRD 확인만으로 RAG를 자동 실행하지 않습니다. model이 accepted plan의 `guidance_lookup` phase에 진입해야 합니다.
 16. 해당 phase에서만 `resource_guide_lookup`을 받아 resource guide/RAG를 조회합니다.
 17. guide 결과에 근거가 있을 때만 해당 CRD family 전용 주의사항과 nested diagnostic step을 주입합니다.
 18. 조회가 불가능하거나 결과가 없으면 guide를 가정하지 않고 일반 kubectl evidence와 model 판단으로 진행합니다.
 
-예: `tenant-a의 Cluster demo가 준비되지 않는 원인을 확인해줘`라는 요청은 먼저 Cluster와
-관련 객체의 live status를 관찰합니다. discovery가 Cluster를 CRD로 확인하고 plan이
-`guidance_lookup`으로 전진했을 때만 Cluster 계열 guide를 검색합니다. 단순히 CRD kind가
-요청에 포함됐다는 이유만으로 첫 단계에서 RAG를 호출하지 않습니다.
+예: `tenant-a의 Cluster demo가 준비되지 않는 원인을 확인해줘`라는 요청은 request
+preparation에서 Cluster의 CRD eligibility를 먼저 분류할 수 있습니다. 그래도 Cluster와
+관련 객체의 live status를 관찰하고 plan이 `guidance_lookup`으로 전진했을 때만 Cluster
+계열 guide를 검색합니다. 단순히 CRD kind가 요청에 포함됐거나 분류가 끝났다는 이유만으로
+첫 단계에서 RAG를 호출하지 않습니다.
 
 guide가 제공한 label selector, annotation, command template은 진단 컨텍스트에서 보존됩니다. Cluster API 계열 guide가 주입된 경우, 관리 클러스터의 `kubectl get node` 결과를 workload cluster node 등록/건강/providerID 판단 근거로 사용하지 않습니다. workload cluster node를 확인하려면 먼저 해당 workload cluster kubeconfig/context임을 확인해야 합니다.
 
@@ -349,7 +350,7 @@ JSON ReAct shim 사용 시 모델이 최종 답변을 JSON code block 없이 pla
 
 k8s-assistant는 runtime prompt를 section 단위로 조립합니다. core ReAct, output contract, language policy, target/scope 보존, command guideline은 항상 포함하고, read-only, guidance protocol, manifest generation, Cluster API guardrail은 현재 요청과 RAG 결과에 따라 조건부로 포함합니다.
 
-매 iteration 전송 직전에는 `runtime_state`, `requirement_analysis`, `phase_step`, `guide_step`, `mutation_verification` anchor를 prepend해 현재 control state, 원래 요청, active phase, guide progress, 변경 검증 의무가 최근 observation에 묻히지 않게 합니다.
+매 iteration 전송 직전에는 `runtime_state`, `requirement_analysis`, `execution`, `phase_step`, `guide_step`, `mutation_verification` anchor를 prepend해 현재 control state, 원래 요청, bounded goal/phase/step 실행 이력, active phase, guide progress, 변경 검증 의무가 최근 observation에 묻히지 않게 합니다.
 
 tool schema는 안전성을 위해 pruning하지 않고 등록된 전체 tool set을 유지합니다. 대신 ToolProfile hash를 사용해 동일한 tool schema 조합을 캐싱/참조 가능한 단위로 관리합니다.
 

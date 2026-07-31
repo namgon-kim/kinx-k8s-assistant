@@ -15,7 +15,7 @@ The runtime addresses both without relying only on prompt memory. Compact anchor
 
 ## Iteration anchors
 
-`Loop.buildIterationSendContent` prepends compact anchor messages before whatever the current iteration is sending. Because each anchor is prepended, the model sees them in this effective order: `runtime_state`, `requirement_analysis`, `phase_step`, `guide_step`, `mutation_verification`, then the latest observations. `runtime_state` comes first so required/forbidden next outputs are visible before the model reads the older diagnostic context.
+`Loop.buildIterationSendContent` prepends compact anchor messages before whatever the current iteration is sending. Because each anchor is prepended, the model sees them in this effective order: `runtime_state`, `requirement_analysis`, `execution`, `phase_step`, `guide_step`, `mutation_verification`, then the latest observations. `runtime_state` comes first so required/forbidden next outputs are visible before the model reads the older diagnostic context; `execution` carries the bounded goal/phase/step contract and attempt/observation ledger before the more immediate phase and obligation anchors.
 
 ### requirement_analysis anchor
 
@@ -24,8 +24,15 @@ Re-emits the accepted `requirement_analysis` JSON (and the derived `request_cont
 The anchor explicitly tells the model:
 
 - Do not silently switch `target.category` or `resource_candidates`.
-- If live evidence implies a different operational focus on the same target family, use `resource_guide_lookup` instead of pivoting the diagnosis target.
+- If live evidence requires a different active/remaining route, use the accepted plan transition or an evidence-backed `phase_plan_revision`; emit `resource_guide_lookup` only after the plan reaches `guidance_lookup`.
 - Before emitting `action`, verify it advances this analysis.
+
+### execution anchor
+
+Re-emits a bounded projection of the stable goal, active phase/step contract, request-fixed budgets,
+recent active-step attempts, prior phase outcomes, and recent observation IDs. The full in-memory
+ledger remains authoritative; the prompt receives only the bounded view needed to avoid repeating
+failed work and to preserve lineage across plan revisions.
 
 ### phase_step anchor (L1)
 
@@ -39,7 +46,11 @@ The `phase_step` anchor should include:
 - current phase completion condition;
 - completed phase indices;
 - allowed next phase names;
-- compact CRD/resource-family eligibility context when runtime discovery has confirmed it after observation.
+- compact built-in/CRD/unknown eligibility context produced by accepted-request preparation.
+
+That classification may exist before the phase plan is accepted. It is eligibility context only:
+the model still needs relevant live observation and must advance the plan to `guidance_lookup`
+before `resource_guide_lookup` is legal.
 
 The model completes a phase with `phase_progress`. Runtime must not use `guide_progress` to complete a top-level phase.
 
@@ -278,7 +289,11 @@ used as a substitute for the runtime obligation.
 - The aggregate root's `RuntimeControlState` represents the next runtime obligation; phase and step status do not replace it.
 - An accepted phase plan populates phase state and `GoalExecutionState`; its current phase remains separate from nested guide or verification steps.
 - Actions are bound to the runtime's single active step. Step and phase completion require the corresponding `step_result`/`phase_progress` transition unless the declared lightweight read-only bundle is closed by its successful observation.
-- Evidence-backed `phase_plan_revision` may replace the active and remaining graph, but it preserves completed history, mandatory obligations, phase/step lineage, and request-fixed attempt/revision budgets.
+- Evidence-backed `phase_plan_revision` may replace the active and remaining graph, but it preserves
+  completed history, mandatory obligations, direct replacement phase lineage, explicitly mapped
+  replacement-step lineage, and request-fixed attempt/revision budgets. An unmapped genuinely new
+  step receives a new lineage; runtime does not decide whether two differently worded goals are
+  semantically identical.
 - Active guide progress is valid only under the `guided_diagnosis` phase and is cleared when that parent phase or request ends.
 - `another_guide` must re-enter guidance through a declared phase path; it must not inject guide steps directly into an unrelated phase.
 - A successful mutation opens one direct verification under the same attempt. Ordered chains activate one distinct check at a time, and await-state rechecks retain the same verification ID. Single and chain procedures use separate evidence/result controls. Once active evidence is collected, control requires exactly one `mutation_verification_result` before progression.
@@ -300,7 +315,6 @@ are tracked in [`../bug.md`](../bug.md):
 - `phase_progress` does not yet reject `evidence_useful=false` or every failed/blocked latest observation (`BUG-8`).
 - standalone `__guide_progress__` does not verify that the latest observation succeeded (`BUG-12`).
 - `another_guide` rewind and `different_approach` continuation still have re-entry/branching risks (`BUG-1`, `BUG-13`).
-- shim structured acknowledgements for guide and mutation results still use native `FunctionCallResult` history (`BUG-5`).
 
 ## Remaining Contract Hardening
 

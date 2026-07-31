@@ -1,6 +1,6 @@
 # Plan 04: Namespace and Scope Invariant
 
-> 상태: 부분 구현됨.
+> 상태: Active.
 >
 > request context namespace와 mutating kubectl command/action target의 namespace
 > invariant는 구현되어 있다. `kubectl apply -f ...` manifest 내부 namespace 검증은

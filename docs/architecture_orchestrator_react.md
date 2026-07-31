@@ -278,9 +278,10 @@ step/criterion/observation ID를 제출한다. Runtime은 reference와 절차를
 재판단하지 않는다. `lightweight_lookup`은 성공한 단일 read-only observation 수신만 확인해 implicit
 step과 phase를 자동 완료한다.
 
-Plan revision은 기존 attempt를 지우지 않는다. Replacement step은 이전 `GoalLineageID`와
-`MaxAttempts`를 상속하므로 step/phase 이름이나 ID를 바꿔도 같은 goal의 누적 attempt budget이
-초기화되지 않는다. Completed/skipped/superseded history와 accepted revision은 session에 유지하고 prompt에는
+Plan revision은 기존 attempt를 지우지 않는다. 같은 goal을 계속하는 replacement step은
+`step_lineage_mappings`를 선언해야 하며, 이 mapping이 유효하면 이전 `GoalLineageID`와
+`MaxAttempts`를 상속한다. Runtime은 명시된 mapping은 검증하지만, mapping이 없는 새 step이
+의미상 이전 goal과 같은지까지 판별하지는 않는다. Completed/skipped/superseded history와 accepted revision은 session에 유지하고 prompt에는
 현재 remaining graph와 최근 revision projection만 bounded runtime data로 넣는다. Tool observation뿐
 아니라 resource-guide/external-state 및 사용자가 선택한 continuation도 typed evidence record로 남기며,
 action과 직접 연결되지 않은 최근 evidence까지 bounded projection에 포함해 revision이 실제 stable ID를

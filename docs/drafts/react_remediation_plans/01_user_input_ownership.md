@@ -1,6 +1,6 @@
 # Plan 01: User Input Ownership
 
-> 상태: 구현됨.
+> 상태: Resolved.
 >
 > `RuntimeSnapshot.Control` 기반 input dispatch와 orchestrator의 incident guidance
 > choice-gating이 반영되어 있다. ReAct-owned free text/approval/choice 입력은

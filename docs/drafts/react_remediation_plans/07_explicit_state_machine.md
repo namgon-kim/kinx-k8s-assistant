@@ -1,6 +1,6 @@
 # Plan 07: Explicit State Machine
 
-> 상태: 구현됨.
+> 상태: Resolved.
 >
 > 현재 enum/event/effect/structured contract는 `internal/react/contract`, mutable state는
 > `internal/react/session`, 실행 조정은 `internal/react/coordinator`로 분리됐다.
@@ -611,7 +611,8 @@ anchor := snapshot.AnchorText()
   `AwaitingContinuationChoice`로 이동하며 request/lineage/budget을 유지한다.
 - package-local test fixture도 같은 `runtimeState` root를 사용하며 별도 hydrate/dual-write 경로가 없다.
 
-아래 Step 1-7은 모두 반영된 migration 순서다. `pendingResponseDirective`는 model 유도용
+아래 Step 1-7은 모두 반영된 historical migration 순서이며 더 이상 실행할 작업 목록이 아니다.
+`pendingResponseDirective`는 model 유도용
 context이며 control source of truth로 사용하지 않는다. `coordinator/iteration.go`에 integration
 helper가 남아 있는 것은 I/O orchestration 경계이며 mutable state mirror를 뜻하지 않는다.
 

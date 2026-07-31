@@ -1,6 +1,6 @@
 # Plan 09: Durable Session Persistence and Recovery
 
-> 상태: Plan 08에서 파생된 상세 구현 계획. 아직 구현되지 않음.
+> 상태: Planned. Plan 08에서 파생된 별도 구현 계획이며 아직 착수하지 않음.
 >
 > 선행 계획: [`08_turn_output_contract_and_goal_execution.md`](./08_turn_output_contract_and_goal_execution.md)
 >

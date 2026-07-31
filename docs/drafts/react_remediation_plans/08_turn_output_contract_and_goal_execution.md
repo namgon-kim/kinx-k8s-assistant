@@ -1,6 +1,6 @@
 # Plan 08: Turn Output Contract and Goal-Driven Execution
 
-> 상태: Stage 0A와 Stage 1~6 코드 구현 완료.
+> 상태: Resolved. Stage 0A와 Stage 1~6 코드 구현 완료.
 >
 > 관련 이슈: [#13 ReAct loop: consume/enforce가 섞인 gate pipeline에 output lock 도입](https://github.com/namgon-kim/kinx-k8s-assistant/issues/13)
 >

@@ -1,6 +1,6 @@
 # Plan 02: Phase Plan Runtime Contract
 
-> 상태: 구현됨.
+> 상태: Resolved.
 >
 > `phase_plan` 수용 전 schema/graph validation, mutation verification phase requirement,
 > guided diagnosis lookup requirement, CRD guidance eligibility gate가 적용되어 있다.

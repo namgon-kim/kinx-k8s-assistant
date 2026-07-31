@@ -1,6 +1,6 @@
 # Plan 05: RAG Boundary
 
-> 상태: 구현됨.
+> 상태: Resolved.
 >
 > Resource guide는 `internal/react/flow/guidance` 규칙과 coordinator의
 > `guidance_lookup` phase/CRD discovery gate를

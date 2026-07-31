@@ -27,7 +27,8 @@ The runtime must not decide the phase sequence from natural-language keywords. R
 - validate safety, schema shape, tool-call consistency, and read-only policy;
 - record observations and pass them back to the model;
 - accept the model's phase-completion report when it is structurally valid and not contradicted by blocked/declined/internal-error observations;
-- after observation phases, run runtime discovery to confirm whether the relevant resource is CRD-backed before allowing guide lookup.
+- after `requirement_analysis` is accepted, perform read-only request preparation that classifies the accepted primary resource as built-in, CRD-backed, or unknown;
+- use that classification only as guide eligibility context, while still requiring the accepted plan to reach `guidance_lookup` after relevant observation before lookup runs.
 
 The model owns:
 
@@ -45,20 +46,20 @@ In particular:
 - Do not block useful multi-resource observation just because it is not a single `kubectl -n <namespace> get <kind> <name> -o yaml` command.
 - Do not treat logs as ordinary Kubernetes resource observation. Resource observation is API-object evidence: status, conditions, spec, metadata, events, owner/dependent references, and related Kubernetes objects.
 - Use logs only for explicit log/log-analysis requests, or after user input, live evidence, or guide context identifies a concrete log-bearing Pod, container, or controller.
-- Use RAG only when the accepted phase plan reaches a guidance phase, observed evidence exists, and runtime discovery confirms the relevant guide-supported resource family.
+- Use RAG only when the accepted phase plan reaches a guidance phase, observed evidence exists, and the request-preparation classification confirms the relevant guide-supported resource family.
 
 ## Current Runtime Strategy
 
 The current implementation uses the phase-owned guide entry path:
 
 1. `requirement_analysis` classifies intent, target, scope, and operational focus.
-2. The model emits a `phase_plan` made of ordered `phase_step` entries.
-3. Runtime stores the accepted phase plan, projects it to stable goal/phase/step/criterion IDs, fixes the request budget profile, and injects only the active execution anchor on each iteration.
-4. The model emits one action or one response for the active step. Runtime binds actions to the single active step. Command tools must declare `risk.risky`; only `risky=true` requires exact human approval. Accepted actions become immutable dispatch intents before execution and their attempts/observations remain under that lineage.
-5. The model reports `step_result` with existing observation IDs and criterion results when a non-lightweight step reaches `achieved`, `blocked`, or `replan_required`.
-6. Runtime accepts `phase_progress` only after the active phase's execution steps are achieved, then advances to a declared next phase.
-7. Runtime discovery classifies the accepted primary resource as built-in, CRD-backed, or unknown and exposes that eligibility to the model.
-8. The model decides whether to enter a guidance phase. Runtime does not automatically inject RAG only because a CRD was observed.
+2. The committed `prepare_request` effect performs read-only classification of the accepted primary resource as built-in, CRD-backed, or unknown and stores only eligibility context.
+3. The model emits a `phase_plan` made of ordered `phase_step` entries.
+4. Runtime stores the accepted phase plan, projects it to stable goal/phase/step/criterion IDs, fixes the request budget profile, and injects a bounded execution anchor alongside the runtime/request/phase anchors on each iteration.
+5. The model emits one action or one response for the active step. Runtime binds actions to the single active step. Command tools must declare `risk.risky`; only `risky=true` requires exact human approval. Accepted actions become immutable dispatch intents before execution and their attempts/observations remain under that lineage.
+6. The model reports `step_result` with existing observation IDs and criterion results when a non-lightweight step reaches `achieved`, `blocked`, or `replan_required`.
+7. Runtime accepts `phase_progress` only after the active phase's execution steps are achieved, then advances to a declared next phase.
+8. After relevant live evidence, the model decides whether to enter a guidance phase. Runtime does not automatically inject RAG only because request preparation classified a CRD.
 9. If guidance is selected and injected, guide diagnostic steps become nested `guidance_step` entries inside the active `guided_diagnosis` phase.
 10. If new evidence invalidates the active or remaining graph, the model may emit one standalone `phase_plan_revision`; runtime validates its evidence reference, revision budget, lineage, history, and mandatory obligations before replacement.
 11. `final_report` closes the request after either ordinary phase completion or guided diagnosis completion.
@@ -72,7 +73,10 @@ observation -> runtime detects CRD -> runtime automatically injects RAG
 and replaces it with:
 
 ```text
-observation phase complete -> runtime confirms CRD eligibility -> model enters guidance_decision/guidance_lookup phase if useful
+requirement accepted
+  -> runtime stores read-only CRD eligibility
+  -> model plan and live observation
+  -> model enters guidance_decision/guidance_lookup phase if useful
 ```
 
 ## Phase Plan Contract
@@ -142,13 +146,16 @@ A `phase_plan_revision` must:
 - reference the current base revision and existing observation IDs;
 - replace the complete active and remaining nonterminal graph;
 - preserve completed/skipped/superseded history and mandatory guide/mutation-verification obligations;
-- preserve phase and step lineage for replacement work so renaming IDs cannot reset attempt budgets;
+- preserve phase lineage for direct phase replacements and provide `step_lineage_mappings` whenever
+  a replacement step continues the same goal, so its existing attempt budget is retained;
 - stay within the request-fixed plan revision budget.
 
 Runtime validates structure and procedure, not whether the model's diagnosis is factually correct.
 The model decides whether evidence justifies a new hypothesis and states the revised goals and
 completion criteria. The runtime checks that the cited evidence exists and that the transition is
-legal, then applies the accepted revision atomically.
+legal, then applies the accepted revision atomically. Runtime validates every declared step mapping
+but cannot infer that an unmapped, newly worded step is semantically the same goal; the model
+contract, bounded attempt history, and plan-revision budget cover that semantic boundary.
 
 The model must report phase completion explicitly, for example:
 
@@ -255,7 +262,7 @@ Guidance-related work must be classified under the top-level phase workflow.
 | `context_resolution` | Resolve previous target/scope/focus. | No | May prepare evidence needs for later phases. |
 | `observation_planning` | Plan the next observation needed before guide eligibility. | No | May mention that guide may be considered later, but no guide lookup yet. |
 | `observation_execution` | Execute live observation. | No | Raw observation is stored as phase evidence. |
-| `observation_completion` | Model reports whether observation goals are complete. | No | Runtime may run CRD discovery after this phase if relevant. |
+| `observation_completion` | Model reports whether observation goals are complete. | No | Request-preparation classification may already indicate CRD eligibility, but live observation still determines whether guidance is useful. |
 | `guidance_decision` | Model decides whether guide lookup is useful. Runtime only confirms eligibility. | No | The output may be direct response, further observation, or `guidance_lookup`. |
 | `guidance_lookup` | Perform resource/incident/remediation guide search and inject context. | No | For CRD-backed primary targets, this phase must emit `resource_guide_lookup` before kubectl actions or `phase_progress`. It produces guide context or records lookup unavailability, but has no diagnostic guide steps yet. |
 | `guided_diagnosis` | Execute injected guide diagnostic procedure. | Yes | Each guide diagnostic instruction is a nested `guidance_step`; progress is tracked with `guide_progress`. |
@@ -284,21 +291,22 @@ The important distinction is that `guidance_step` is procedural content from a r
 
 The phase-owned guidance flow is implemented in this order:
 
-1. `phase_plan` and `phase_progress` are accepted by shim parsing and function-call conversion.
-2. Runtime stores the accepted `phase_plan`, completed phase indices, active phase, and stable goal execution contract.
-3. Runtime injects bounded phase/step/attempt/observation anchors on every iteration after requirement analysis is accepted.
-4. Native and shim outputs use the same typed output policy before domain consumers run.
-5. Prompts require `phase_plan` before ordinary actions, `step_result` for explicit step closure, and `phase_progress` only after the phase's execution steps are achieved.
-6. Evidence-backed `phase_plan_revision` can atomically replace the active and remaining graph while preserving lineage and request-fixed budgets.
-7. CRD discovery is exposed as eligibility context for the next model turn, not as automatic guide injection.
-8. Runtime-driven initial guide injection paths are disabled.
-9. Top-level `resource_guide_lookup` is allowed only as the model-selected action inside the `guidance_lookup` phase.
-10. Nested guide progress is scoped under `guided_diagnosis`, and nested guide completion requires parent `phase_progress`.
-11. Final-report prompting distinguishes completed `phase_step` entries and nested `guidance_step` entries conceptually.
-12. Tool invocation uses a committed dispatch intent and canonical payload hash; reconciliation failure cannot recreate the same mutation as an unapproved pending action.
-13. RBAC observations remain in history as access blockers and cannot satisfy or keep waiting a mutation verification. A general RBAC failure returns to the current phase for permitted alternative evidence; when an RBAC change is genuinely required, the model must propose a separate risky mutating action that receives exact user approval and direct verification.
-14. Max-iteration closure produces a validated `continuation_handoff`; resuming retains request lineage, ledger, and safety counters.
-15. A state-bearing `failed` verification closes that attempt and permits a materially different action or evidence-backed plan revision. Only unknown execution/verification outcomes remain mandatory unresolved obligations that force an inconclusive report. An active verification blocks plan replacement; an already-closed unknown obligation stays outside the replaceable plan graph, so a revision may change the remaining strategy but cannot remove that obligation or make the final report conclusive.
+1. After `requirement_analysis` is accepted, the `prepare_request` effect resets the accepted-request chat and performs read-only classification of the primary resource.
+2. That built-in/CRD/unknown classification is stored as eligibility context; it does not inject or fetch a guide.
+3. `phase_plan` and `phase_progress` are accepted by shim parsing and function-call conversion.
+4. Runtime stores the accepted `phase_plan`, completed phase indices, active phase, and stable goal execution contract.
+5. Runtime injects bounded phase/step/attempt/observation anchors on every iteration after requirement analysis is accepted.
+6. Native and shim outputs use the same typed output policy before domain consumers run.
+7. Prompts require `phase_plan` before ordinary actions, `step_result` for explicit step closure, and `phase_progress` only after the phase's execution steps are achieved.
+8. Evidence-backed `phase_plan_revision` can atomically replace the active and remaining graph while preserving lineage and request-fixed budgets.
+9. Runtime-driven initial guide injection paths are disabled.
+10. Top-level `resource_guide_lookup` is allowed only as the model-selected action inside the `guidance_lookup` phase.
+11. Nested guide progress is scoped under `guided_diagnosis`, and nested guide completion requires parent `phase_progress`.
+12. Final-report prompting distinguishes completed `phase_step` entries and nested `guidance_step` entries conceptually.
+13. Tool invocation uses a committed dispatch intent and canonical payload hash; reconciliation failure cannot recreate the same mutation as an unapproved pending action.
+14. RBAC observations remain in history as access blockers and cannot satisfy or keep waiting a mutation verification. A general RBAC failure returns to the current phase for permitted alternative evidence; when an RBAC change is genuinely required, the model must propose a separate risky mutating action that receives exact user approval and direct verification.
+15. Max-iteration closure produces a validated `continuation_handoff`; resuming retains request lineage, ledger, and safety counters.
+16. A state-bearing `failed` verification closes that attempt and permits a materially different action or evidence-backed plan revision. Only unknown execution/verification outcomes remain mandatory unresolved obligations that force an inconclusive report. An active verification blocks plan replacement; an already-closed unknown obligation stays outside the replaceable plan graph, so a revision may change the remaining strategy but cannot remove that obligation or make the final report conclusive.
 
 Remaining hardening should focus on stricter semantic validation of phase completion, not on adding another guide-entry path.
 
@@ -313,6 +321,8 @@ Remaining hardening should focus on stricter semantic validation of phase comple
 | `observation_planning` | Model declares what evidence must be collected before answering or guide lookup. | One next kubectl/tool diagnostic action. |
 | `observation_execution` | Execute the approved observation action. | Raw tool observation. |
 | `observation_completion` | Model reports whether enough observation exists for the request's next step. | Continue observation, synthesize answer, or consider guidance. |
+| `mutation_execution` | Execute one concrete mutation and close its direct verification under the same attempt. | Approved mutation, read-only direct evidence, `mutation_verification_result`, then `phase_progress`. |
+| `mutation_verification` | Verify the original user-visible outcome after the mutation target's direct effect is established. | Independent read-only outcome observation and step/phase completion. |
 | `response_synthesis` | Answer directly from observation or prior context when guidance is unnecessary. | User-facing summary, explanation, lookup result, or final report. |
 | `guidance_decision` | Model decides whether resource/incident/remediation guide lookup is warranted after observation. Runtime confirms guide eligibility. | Skip guidance, continue observation, answer directly, or advance to `guidance_lookup` with `phase_progress`. |
 | `guidance_lookup` | Search and inject guide context. | Resource-guide observation or unavailable-guide observation. |
@@ -331,7 +341,7 @@ The exact path depends on request type. Not every request needs every phase.
 | Diagnosis | `requirement_analysis -> context_resolution -> observation_planning -> observation_execution -> observation_completion -> guidance_decision(optional) -> final_report` |
 | Follow-up diagnosis | `requirement_analysis -> context_resolution -> observation_planning -> observation_execution -> observation_completion -> guidance_decision(optional) -> final_report` |
 | Explanation | `requirement_analysis -> response_synthesis`, unless live state is required. |
-| Mutation/remediation | `requirement_analysis -> safety_policy -> approval(if risk.risky=true) -> execution -> verification_observation -> mutation_verification_result -> phase_progress/final_report` |
+| Mutation/remediation | `requirement_analysis -> safety_policy -> mutation_execution -> approval(if risk.risky=true) -> direct verification_observation -> mutation_verification_result -> phase_progress -> mutation_verification(original outcome when distinct) -> response_synthesis/final_report` |
 | Configuration/meta request | Runtime-specific handler when possible; otherwise `requirement_analysis -> response_synthesis`. |
 
 ## Observation Roles
@@ -391,7 +401,7 @@ Important cases:
 
 - `kubectl get cluster -A` for a named cluster without namespace is usually `target_resolution`, not completed diagnosis.
 - `kubectl -n <namespace> get cluster <name> -o yaml` is usually `primary_status` and can complete the minimum observation because it captures the primary object's metadata, spec, status, and conditions.
-- For an explicitly named resource diagnosis, do not inspect nodes, related resources, events, or logs before `primary_status` has observed the primary object. Complete the observation phase after primary status when it is sufficient so runtime can expose CRD discovery/classification before guidance or related-resource diagnosis.
+- For an explicitly named resource diagnosis, do not inspect nodes, related resources, events, or logs before `primary_status` has observed the primary object. Request preparation may already have classified the primary resource family, but that classification does not replace live primary-status evidence.
 - A multi-resource command can complete observation when the resources are related to the accepted target or operational focus.
 - An observation with runtime/internal errors, approval decline, blocked execution, or malformed schema is not diagnostic evidence.
 - Kubernetes `NotFound` can be state-bearing evidence when absence directly answers the request.
@@ -408,7 +418,7 @@ Important cases:
 Guide lookup is allowed when all of these are true:
 
 - The request intent benefits from procedural guidance, such as diagnosis, remediation planning, or non-trivial operational workflow.
-- Runtime discovery, performed after observation when needed, confirms the relevant resource family is CRD-backed or otherwise guide-supported.
+- Request preparation has classified the relevant resource family as CRD-backed or otherwise guide-supported.
 - Observed evidence exists and is relevant to the active target/focus.
 - The query can include the original request, accepted request context, operational focus, and compact observed evidence.
 
@@ -462,7 +472,7 @@ RAG is useful when the assistant needs procedural operating knowledge beyond the
 - `operational_focus` is a diagnostic angle, not an execution target and not a guide lookup command.
 - Runtime validation should steer correction, not act as the main planning engine.
 - Runtime disables automatic initial guide injection paths; guide lookup is entered through model-selected phase flow.
-- Runtime should expose CRD discovery results as evidence or eligibility context for the model's `guidance_decision`, not as an automatic transition.
+- Runtime exposes request-preparation CRD classification as eligibility context for the model's later `guidance_decision`, not as an automatic transition or as a substitute for live evidence.
 - Runtime may maintain compact observation state, but should avoid storing full YAML/logs in persistent conversation memory.
 - Guide progress begins only after a guide is injected and only inside the `guided_diagnosis` `phase_step`. Before that, observations belong to the default request-processing pipeline and are completed with `phase_progress`.
 - `resource guide injected...` style messages are internal logs, not user-facing output.

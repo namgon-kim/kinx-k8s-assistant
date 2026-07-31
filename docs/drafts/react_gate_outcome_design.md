@@ -1,7 +1,11 @@
 # ReAct Runtime Renewal 계획 기준 문서
 
-> 상태: Gate/phase/step 구현 이력을 보존하는 superseded 설계 문서다. 현재 구현 계약으로
-> 사용하지 않는다.
+> 상태: Resolved. `GateOutcome`, retry/correction/branch contract, stable phase/step
+> reference와 scoped correction state가 현재 `flow/gate`, `contract`, `session`,
+> `coordinator` 경계에 적용됐다.
+>
+> 본문의 package split 이전 N차 실행 순서와 구현 요청 템플릿은 완료된 migration
+> 이력이다. 현재 구현 계약은 architecture 문서와 Plan 08을 우선한다.
 >
 > 현재 package 대응은 `contract`(enum/ref/outcome payload), `session`(revisioned aggregate와
 > execution ledger), `flow/gate`(outcome/correction rule), `coordinator`(package-private
@@ -1854,9 +1858,10 @@ context compaction은 phase/step을 바꾸는 작업이 아니다. compaction �
 | presentation | translation/formatting은 runtime state를 변경하지 않는다 |
 | 테스트 명령 | 사용자가 직접 요청하기 전에는 Go test/build를 실행하지 않고 명령만 제시한다 |
 
-## 다음 구현 요청 템플릿
+## 과거 구현 요청 템플릿
 
-이후 작업은 아래 형식으로 요청하면 된다.
+아래 템플릿과 권장 순서는 package split 이전 점진 migration에 사용한 이력이다.
+`GateOutcome` 계약은 적용 완료됐으므로 현재 신규 구현 요청의 기준은 아니다.
 
 ```text
 리뉴얼 N차를 구현해.

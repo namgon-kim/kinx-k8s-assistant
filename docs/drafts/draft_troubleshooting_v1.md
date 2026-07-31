@@ -1,6 +1,8 @@
 # 로그 분석 및 트러블슈팅 기능 개발 초안
 
-> 상태: Legacy 초안.
+> 상태: Legacy 초안. Standalone `trouble_shooting` MCP/server,
+> `internal/troubleshooting`, `troubleshooting-upload`, kubectl-ai Agent 재주입을
+> 전제로 한 구조는 Dropped 상태다.
 >
 > 이 문서는 현재 구현 기준 문서가 아니다. 본문에는 `trouble_shooting` MCP/server,
 > `internal/troubleshooting`, `troubleshooting-upload`, kubectl-ai Agent 재주입 흐름처럼

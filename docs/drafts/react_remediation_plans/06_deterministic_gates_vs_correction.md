@@ -1,6 +1,6 @@
 # Plan 06: Deterministic Gates vs LLM Correction
 
-> 상태: 구현됨.
+> 상태: Resolved.
 >
 > `GateOutcome`, `RetryScope`, `CorrectionMode`, `BranchPolicy`가 공통 gate 모델로
 > 적용되어 있다. Turn-entry output policy와 code/scope별 correction counter도

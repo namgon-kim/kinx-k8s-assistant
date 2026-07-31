@@ -1,6 +1,6 @@
 # Plan 03: Mutation Lifecycle
 
-> 상태: 구현됨. 일반 kubectl failure 분류 정밀화와 manifest 기반 target/namespace 검증은
+> 상태: Resolved. 일반 kubectl failure 분류 정밀화와 manifest 기반 target/namespace 검증은
 > Plan 06 및 TODO의 독립 후속 범위다.
 >
 > 현재 코드는 성공한 mutating command 이후 `pendingMutationVerification`을 만들고,
